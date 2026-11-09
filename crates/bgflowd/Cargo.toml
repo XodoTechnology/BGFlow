@@ -1,0 +1,25 @@
+[package]
+name = "bgflowd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bgflow-types = { workspace = true }
+bgflow-store = { workspace = true }
+bgflow-netflow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+zstd = { workspace = true }
+crc32fast = { workspace = true }
+clap = { workspace = true }
+maxminddb = { workspace = true }
+axum = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }

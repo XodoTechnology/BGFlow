@@ -1,0 +1,109 @@
+# BGFlow example configuration — copy to /etc/bgflow/bgflow.toml
+# Docs: README.md | Install: INSTALL.md
+
+[server]
+# HTTP API + embedded UI listen address.
+http_listen = "0.0.0.0:8080"
+# Optional basic auth for UI/API: "user:password"
+# auth = "admin:change-me"
+# Allow cross-origin API access (UI is same-origin; off by default)
+# cors = false
+
+[storage]
+# Data directory for .bfs segments + org string table.
+data_dir = "/var/lib/bgflow"
+# Flush a raw-flow segment after this many rows ...
+segment_rows = 100000
+# ... or after this many seconds.
+segment_interval_secs = 60
+# Ingest channel buffer (records). Increase for very high flow rates.
+channel_capacity = 65536
+# Retention: raw flows kept this long; rollups (1-min aggregates) longer.
+raw_retention_days = 7
+rollup_retention_days = 90
+# How often retention sweeps run.
+retention_interval_secs = 300
+
+[geoip]
+# MaxMind GeoLite2 databases (optional). Download from maxmind.com.
+# Leave empty to disable MMDB enrichment.
+asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"
+country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
+
+# --- Flow inputs -------------------------------------------------------------
+# One [[inputs]] block per listen socket. protocol = auto detects
+# NetFlow v5/v9, IPFIX, and sFlow per datagram.
+
+[[inputs]]
+listen = "0.0.0.0:2055"
+protocol = "auto"
+# Optional exporter allowlist:
+# allowed_exporters = ["10.0.0.1", "10.0.0.2"]
+
+# [[inputs]]
+# listen = "0.0.0.0:6343"
+# protocol = "sflow"
+
+# --- HTTP enrichment backends ------------------------------------------------
+# Query external whois/RDAP/IRR services for prefixes/IPs not covered by MMDB.
+# Results are cached per prefix (IPv4 /24, IPv6 /48) and applied to later flows.
+#
+# {ip}     -> the flow's IP address
+# {prefix} -> cache prefix, e.g. 1.2.3.0/24 or 2001:db8::/48
+#
+# Field mapping uses JSON dot-paths into the response.
+
+[[enrichers]]
+type = "http"
+name = "irrd3"
+url = "https://irrd3.net/api/lookup?ip={ip}"
+timeout_ms = 2000
+cache_ttl_secs = 86400
+[enrichers.fields]
+asn = "$.asn"
+org = "$.org"
+country = "$.country"
+# Any extra fields are queryable via /api/v1/lookup?ip=
+# handle = "$.handle"
+# irr_as_set = "$.as_set"
+
+# [[enrichers]]
+# type = "http"
+# name = "local-rdap"
+# url = "http://rdap.internal.example/lookup/{ip}"
+# timeout_ms = 1000
+# cache_ttl_secs = 43200
+# [enrichers.fields]
+# asn = "$.asn"
+# org = "$.name"
+# country = "$.country"
+
+# --- Label rules -------------------------------------------------------------
+# First matching rule wins; label_id is stored on the flow and shown in the UI.
+# All specified fields must match (AND). Omit a field to wildcard it.
+#
+# Match fields: proto, src_port, dst_port, src_ip, dst_ip (CIDR),
+# src_asn, dst_asn, src_country, dst_country (alpha-2), exporter, org (substring).
+
+[[rules]]
+name = "google"
+dst_asn = 15169
+dst_port = 443
+
+[[rules]]
+name = "cloudflare"
+dst_asn = 13335
+
+[[rules]]
+name = "dns"
+dst_port = 53
+
+# [[rules]]
+# name = "internal"
+# src_ip = "10.0.0.0/8"
+# dst_ip = "10.0.0.0/8"
+
+# [[rules]]
+# name = "backup-window"
+# dst_port = 873          # rsync
+# exporter = "10.0.0.1"

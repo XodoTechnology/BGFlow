@@ -1,0 +1,20 @@
+[Unit]
+Description=BGFlow flow analyzer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bgflow
+Group=bgflow
+ExecStart=/usr/local/bin/bgflowd --config /etc/bgflow/bgflow.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bgflow
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

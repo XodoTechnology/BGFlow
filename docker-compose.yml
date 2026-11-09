@@ -1,0 +1,17 @@
+services:
+  bgflowd:
+    build: .
+    image: bgflow:latest
+    container_name: bgflowd
+    restart: unless-stopped
+    ports:
+      - "8080:8080"        # UI + API
+      - "2055:2055/udp"    # flow input (add more as needed)
+    volumes:
+      - bgflow-data:/var/lib/bgflow
+      - ./bgflow.toml:/etc/bgflow/bgflow.toml:ro
+    environment:
+      - RUST_LOG=info
+
+volumes:
+  bgflow-data:

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bgflow-types",
+    "crates/bgflow-store",
+    "crates/bgflow-netflow",
+    "crates/bgflowd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/XodoTechnology/BGFlow"
+
+[workspace.dependencies]
+bgflow-types = { path = "crates/bgflow-types" }
+bgflow-store = { path = "crates/bgflow-store" }
+bgflow-netflow = { path = "crates/bgflow-netflow" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+zstd = "0.13"
+crc32fast = "1"
+clap = { version = "4", features = ["derive"] }
+maxminddb = "0.24"
+axum = "0.7"
+toml = "0.8"
+tower-http = { version = "0.5", features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

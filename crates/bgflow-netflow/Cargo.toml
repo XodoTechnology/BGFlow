@@ -1,0 +1,10 @@
+[package]
+name = "bgflow-netflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bgflow-types = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
