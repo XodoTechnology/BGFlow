@@ -341,24 +341,38 @@ fn agg_add(a: &mut Agg, b: &Agg) {
 /// re-sorting yields the exact global top-`limit` without materializing
 /// or sorting the full key space.
 fn shard_top<K>(
-    shards: Vec<HashMap<K, Agg>>,
+    shards: Vec<query::ShardMap<K, Agg>>,
     limit: usize,
-) -> Vec<(K, Agg)> {
+) -> Vec<(K, Agg)>
+where
+    K: Send,
+{
     if limit == 0 {
         return Vec::new();
     }
     let cmp = |a: &(K, Agg), b: &(K, Agg)| {
         b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
     };
-    let mut cand: Vec<(K, Agg)> = Vec::new();
-    for map in shards {
-        let mut v: Vec<(K, Agg)> = map.into_iter().collect();
-        if v.len() > limit {
-            v.select_nth_unstable_by(limit - 1, cmp);
-            v.truncate(limit);
-        }
-        cand.extend(v);
-    }
+    // Per-shard select+truncate+sort in parallel — each shard's candidate
+    // list is independent.
+    let per_shard: Vec<Vec<(K, Agg)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = shards
+            .into_iter()
+            .map(|map| {
+                s.spawn(move || {
+                    let mut v: Vec<(K, Agg)> = map.into_iter().collect();
+                    if v.len() > limit {
+                        v.select_nth_unstable_by(limit - 1, cmp);
+                        v.truncate(limit);
+                    }
+                    v.sort_by(cmp);
+                    v
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut cand: Vec<(K, Agg)> = per_shard.into_iter().flatten().collect();
     cand.sort_by(cmp);
     cand.truncate(limit);
     cand
@@ -482,7 +496,8 @@ async fn overview(
         to,
         &needed,
         &f,
-        bgflow_store::scan_threads(),
+        // 4 shards per worker keeps mutex convoying rare on big maps.
+        bgflow_store::scan_threads() * 4,
         |r, out| {
             for (i, d) in TOP_DIMS_OV.iter().enumerate() {
                 out.push((
@@ -629,7 +644,8 @@ async fn matrix(
         to,
         &needed,
         &f,
-        bgflow_store::scan_threads(),
+        // 4 shards per worker keeps mutex convoying rare on big maps.
+        bgflow_store::scan_threads() * 4,
         |r, out| {
             out.push((
                 (query::dim_key(sd, r), query::dim_key(dd, r)),
@@ -751,7 +767,8 @@ async fn top(
         to,
         &needed,
         &f,
-        bgflow_store::scan_threads(),
+        // 4 shards per worker keeps mutex convoying rare on big maps.
+        bgflow_store::scan_threads() * 4,
         |r, out| {
             out.push((
                 query::dim_key(by, r),
@@ -804,7 +821,8 @@ async fn conversations(
         to,
         &needed,
         &f,
-        bgflow_store::scan_threads(),
+        // 4 shards per worker keeps mutex convoying rare on big maps.
+        bgflow_store::scan_threads() * 4,
         |r, out| {
             out.push((
                 (
@@ -906,7 +924,8 @@ async fn anomalies(
         to,
         &needed,
         &f,
-        bgflow_store::scan_threads(),
+        // 4 shards per worker keeps mutex convoying rare on big maps.
+        bgflow_store::scan_threads() * 4,
         |r, out| {
             out.push((
                 (query::dim_key(by, r), r.bucket_ms()),

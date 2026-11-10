@@ -668,6 +668,10 @@ where
     Ok(out)
 }
 
+/// Shard map type used by `rollup_scan_sharded` — FxHash keeps per-row
+/// hashing ~5x cheaper than SipHash on multi-million-row scans.
+pub type ShardMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
+
 /// Parallel rollup aggregation for HIGH-cardinality groupings (e.g.
 /// conversations, top-N over IPs). Like `rollup_scan_par`, segments are
 /// decoded on worker threads — but instead of each worker building a
@@ -698,7 +702,7 @@ pub fn rollup_scan_sharded<K, V, B>(
     bounded_init: impl Fn() -> B + Sync,
     bounded_add: impl Fn(&mut B, &RollupRow) + Sync,
     bounded_merge: impl Fn(&mut B, B),
-) -> Result<(Vec<HashMap<K, V>>, B)>
+) -> Result<(Vec<ShardMap<K, V>>, B)>
 where
     K: Eq + std::hash::Hash + Send,
     V: Send,
@@ -722,8 +726,9 @@ where
     let shards = shards.max(1);
     let chunk_size = idx.len().div_ceil(nth).max(1);
     let ncols = RollupRecord::schema().columns.len();
-    let maps: Vec<std::sync::Mutex<HashMap<K, V>>> =
-        (0..shards).map(|_| std::sync::Mutex::new(HashMap::new())).collect();
+    let maps: Vec<std::sync::Mutex<ShardMap<K, V>>> = (0..shards)
+        .map(|_| std::sync::Mutex::new(ShardMap::default()))
+        .collect();
 
     let scan_res: Result<B> = std::thread::scope(|s| {
         let mut handles = Vec::new();
@@ -740,7 +745,7 @@ where
             handles.push(s.spawn(move || -> Result<B> {
                 // Per-shard buffers: flushed into the shared maps in
                 // batches so lock hold time stays tiny.
-                const FLUSH_AT: usize = 2048;
+                const FLUSH_AT: usize = 8192;
                 let mut bstate = bounded_init();
                 let mut tmp: Vec<(K, V)> = Vec::with_capacity(8);
                 let mut bufs: Vec<Vec<(K, V)>> =
@@ -786,7 +791,7 @@ where
                         tmp.clear();
                         extract(&row, &mut tmp);
                         for (k, v) in tmp.drain(..) {
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            let mut h = rustc_hash::FxHasher::default();
                             k.hash(&mut h);
                             let si = (h.finish() as usize) % shards;
                             bufs[si].push((k, v));
