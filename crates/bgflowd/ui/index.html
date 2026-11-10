@@ -166,6 +166,7 @@ setInterval(()=>{const el=$('#upd');if(el&&state.updated)el.textContent='updated
 
 // ---------- views ----------
 async function load(silent){
+  const keepScroll=silent?content.scrollTop:0;
   if(!silent)content.innerHTML='<div class="hint">Loading…</div>';
   try{
     if(state.view==='overview')await vOverview();
@@ -173,12 +174,13 @@ async function load(silent){
     else if(state.view==='top')await vTop();
     else if(state.view==='countries')await vCountries();
     else if(state.view==='conv')await vConv();
-    else if(state.view==='flowmap')await vFlowmap();
+    else if(state.view==='flowmap'){if(silent)await drawMap();else await vFlowmap()}
     else if(state.view==='anomalies')await vAnomalies();
     else if(state.view==='exporters')await vExporters();
     else if(state.view==='labels')await vLabels();
     else if(state.view==='metrics')await vMetrics();
     state.updated=Date.now();
+    if(silent)content.scrollTop=keepScroll;
   }catch(e){content.innerHTML='<div class="err">Error: '+esc(e.message)+'</div>'}
 }
 
@@ -486,11 +488,22 @@ async function vFlowmap(){
    <div class="panel"><h3>Flow Map — <span id="m_lbl"></span> <span class="muted" style="text-transform:none">(hover a node to isolate its flows)</span></h3><canvas id="sankey" style="height:540px"></canvas></div>
    <div class="panel"><h3>Top Pairs</h3><div id="ptbl"></div></div>`;
   state.msrc=$('#m_src').value;state.mdst=$('#m_dst').value;state.mlim=+$('#m_lim').value;state.granularity=$('#m_gran').value;
+  // changing any control redraws immediately — no need for the Draw button
+  ['m_src','m_dst','m_lim','m_gran'].forEach(id=>{const el=$('#'+id);if(el)el.onchange=()=>{syncMapCtl();drawMap()}});
+  bindSankeyHover();
   await drawMap();
 }
+function syncMapCtl(){
+  const g=id=>$('#'+id)?.value;
+  if(g('m_src'))state.msrc=g('m_src');
+  if(g('m_dst'))state.mdst=g('m_dst');
+  if(g('m_lim'))state.mlim=+g('m_lim');
+  if(g('m_gran'))state.granularity=g('m_gran');
+}
 async function drawMap(){
+  syncMapCtl();
   const data=await api('/api/v1/matrix?'+q({src_dim:state.msrc,dst_dim:state.mdst,limit:state.mlim}));
-  state.mapData=data;state.mapHover=-1;
+  state.mapData=data;state.mapHoverNode=null;
   $('#m_lbl').textContent=`${state.msrc} → ${state.mdst}`;
   drawSankey(data.items||[]);bindSankeyHover();
   const max=(data.items||[])[0]?.bytes||1;
@@ -565,7 +578,7 @@ function drawSankey(items){
     let s=k;
     if(dim.includes('country'))s=flag(k)+k;
     else if(dim.includes('asn'))s='AS'+k;
-    return String(s).slice(0,18);
+    return String(s).slice(0,Math.max(8,Math.floor(lblW/6.5)));
   };
   // ribbons
   pairs.forEach(p=>{
