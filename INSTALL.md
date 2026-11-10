@@ -114,14 +114,27 @@ bgflowd --demo 127.0.0.1:2055 --demo-pps 20 --demo-secs 300
 
 ASN/org/country lookup works out of the box for flows whose exporter
 provides the fields, plus HTTP enrichers (e.g. `irrd3.net`) and table
-dumps. For **MMDB-backed enrichment of everything else**, drop any
-MaxMind-compatible `.mmdb` at the paths in `[geoip]`:
+dumps. For **MMDB-backed enrichment of everything else**, the easiest
+path is the built-in downloader:
+
+```sh
+bgflowd geoip-update                    # DB-IP Lite → /usr/share/GeoIP
+bgflowd geoip-update --source github    # per-family GeoLite2, no MaxMind key
+```
+
+Both print the `[geoip]` config snippet to paste into `bgflow.toml`.
+`asn_db`/`country_db` accept a single path **or a list** — the GitHub
+source ships separate IPv4/IPv6 files and the list form lets lookups
+pick the right database per address family. Manual installs work too —
+drop any MaxMind-compatible `.mmdb` at the configured paths:
 
 - **DB-IP Lite** — free, no account:
   `https://db-ip.com/db/download/ip-to-asn-mmdb.html` and
   `https://db-ip.com/db/download/ip-to-country-mmdb.html`
   (monthly updates; gunzip into `/usr/share/GeoIP/`)
 - **MaxMind GeoLite2** — free account + license key from maxmind.com
+- **ip-database/mmdb** — community mirror of DB-IP + GeoLite2 as
+  per-family `.mmdb.gz` files: https://github.com/ip-database/mmdb
 
 Then `systemctl reload bgflow` (or restart) — the log shows
 `geoip enrichment enabled` when the DBs load.

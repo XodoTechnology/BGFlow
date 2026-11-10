@@ -46,6 +46,7 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   build version.
 - **Ops** — `bgflowd doctor` (segment CRC verification), `bgflowd backup`
   (CRC-verified data-dir snapshots), `bgflowd config-check`,
+  `bgflowd geoip-update` (downloads free MMDB GeoIP databases),
   `bgflowd hash-password`, `POST /api/v1/admin/reload`, deep `/health`,
   SIGHUP config reload, optional TLS, UDP buffer sizing, TCP conn limits.
 - **Low resource use** — a few % CPU and tens of MB RAM at moderate rates.
@@ -175,6 +176,8 @@ rollup_retention_days = 90      # rollup retention (long-range queries)
 [geoip]
 asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"      # optional — any MaxMind MMDB
 country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"  # (DB-IP Lite works too)
+# each also accepts a list for per-family DBs: asn_db = ["...-ipv4.mmdb", "...-ipv6.mmdb"]
+# `bgflowd geoip-update` fetches free DBs and prints this config.
 
 [[inputs]]
 listen = "0.0.0.0:2055"

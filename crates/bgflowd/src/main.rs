@@ -8,6 +8,7 @@ mod backup;
 mod config;
 mod demo;
 mod enrich;
+mod geoip;
 mod ingest;
 mod metrics;
 mod qcache;
@@ -45,6 +46,16 @@ enum Commands {
         /// Password to hash (prefer stdin to keep it out of shell history).
         #[arg(long)]
         password: Option<String>,
+    },
+    /// Download GeoIP MMDB databases (DB-IP Lite or the ip-database/mmdb
+    /// mirror with GeoLite2). Prints the [geoip] config to use.
+    GeoipUpdate {
+        /// Source: dbip (default, combined files) or github (per-family).
+        #[arg(long, default_value = "dbip")]
+        source: String,
+        /// Install directory (default: /usr/share/GeoIP).
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -86,9 +97,15 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // hash-password needs no config — handle before loading.
+    // hash-password and geoip-update need no config — handle before loading.
     if let Some(Commands::HashPassword { password }) = &args.command {
         return hash_password_cmd(password.clone());
+    }
+    if let Some(Commands::GeoipUpdate { source, dir }) = &args.command {
+        let dir = dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/usr/share/GeoIP"));
+        return geoip::run(source, &dir).await;
     }
 
     let cfg = config::load(args.config.as_ref())?;
@@ -111,9 +128,6 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::default());
     let orgs = Arc::new(StringTable::open(cfg.storage.data_dir.join("orgs.txt"))?);
     let geo = Arc::new(MmdbGeo::open(&cfg.geoip, orgs.clone(), metrics.clone()));
-    if geo.enabled() {
-        tracing::info!("geoip enrichment enabled");
-    }
     let http_enrich = Arc::new(HttpEnrichers::new(
         &cfg.enrichers,
         metrics.clone(),
@@ -433,8 +447,10 @@ fn config_check(cfg: &config::Config) -> Result<()> {
         ("geoip.asn_db", &cfg.geoip.asn_db),
         ("geoip.country_db", &cfg.geoip.country_db),
     ] {
-        if !p.is_empty() && !std::path::Path::new(p).exists() {
-            warn(format!("{} not found: {} (geo enrichment for this DB disabled)", name, p));
+        for path in p.paths() {
+            if !path.is_empty() && !std::path::Path::new(path).exists() {
+                warn(format!("{} not found: {} (geo enrichment for this DB disabled)", name, path));
+            }
         }
     }
 

@@ -1152,7 +1152,16 @@ async fn lookup(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let s = q.get("ip").ok_or_else(|| err("missing ip"))?;
     let ip: IpAddr = s.parse().map_err(|_| err("bad ip"))?;
-    Ok(Json(st.http_enrich.lookup_ip(ip)))
+    let mut v = st.http_enrich.lookup_ip(ip);
+    if let Some(det) = st.geo.lookup_detail(ip) {
+        if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
+            arr.insert(
+                0,
+                serde_json::json!({"backend": "mmdb", "type": "mmdb", "result": det}),
+            );
+        }
+    }
+    Ok(Json(v))
 }
 
 // ---------------------------------------------------------------------------

@@ -109,13 +109,37 @@ pub struct StorageConfig {
     pub coarse_retention_days: u32,
 }
 
+/// One MMDB path or several (e.g. separate IPv4/IPv6 databases — lookups
+/// try each in order). Serializes back as a plain string when single.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DbPaths {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for DbPaths {
+    fn default() -> Self {
+        DbPaths::One(String::new())
+    }
+}
+
+impl DbPaths {
+    pub fn paths(&self) -> Vec<&str> {
+        match self {
+            DbPaths::One(s) => vec![s.as_str()],
+            DbPaths::Many(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GeoIpConfig {
-    /// MaxMind ASN database path (mmdb). Empty disables.
-    pub asn_db: String,
-    /// MaxMind Country database path (mmdb). Empty disables.
-    pub country_db: String,
+    /// MaxMind ASN database path(s) (mmdb). Empty disables.
+    pub asn_db: DbPaths,
+    /// MaxMind Country database path(s) (mmdb). Empty disables.
+    pub country_db: DbPaths,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -294,8 +318,8 @@ impl Default for StorageConfig {
 impl Default for GeoIpConfig {
     fn default() -> Self {
         GeoIpConfig {
-            asn_db: "/usr/share/GeoIP/GeoLite2-ASN.mmdb".into(),
-            country_db: "/usr/share/GeoIP/GeoLite2-Country.mmdb".into(),
+            asn_db: DbPaths::One("/usr/share/GeoIP/GeoLite2-ASN.mmdb".into()),
+            country_db: DbPaths::One("/usr/share/GeoIP/GeoLite2-Country.mmdb".into()),
         }
     }
 }

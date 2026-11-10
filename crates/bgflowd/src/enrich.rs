@@ -7,7 +7,7 @@
 //! subsequent flows for the same prefix are enriched. This keeps ingest
 //! latency flat regardless of backend speed.
 
-use crate::config::{EnricherConfig, GeoIpConfig};
+use crate::config::{DbPaths, EnricherConfig, GeoIpConfig};
 use crate::metrics::Metrics;
 use bgflow_types::{country_pack, country_str, ip_string, ip_to_u128, is_v4_mapped, u128_to_ip, FlowRecord};
 use serde::Deserialize;
@@ -118,6 +118,10 @@ struct AsnRecord {
 struct CountryRecord {
     country: Option<CountryCode>,
     registered_country: Option<CountryCode>,
+    /// DB-IP flat schema (the ip-database/mmdb "city" files use
+    /// `country_code` at top level instead of nested `country.iso_code`).
+    #[serde(rename = "country_code")]
+    country_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,54 +130,136 @@ struct CountryCode {
     iso_code: Option<String>,
 }
 
+impl CountryRecord {
+    fn iso_code(&self) -> &str {
+        self.country
+            .as_ref()
+            .or(self.registered_country.as_ref())
+            .and_then(|cc| cc.iso_code.as_deref())
+            .or(self.country_code.as_deref())
+            .unwrap_or("")
+    }
+}
+
+/// An open MMDB plus its declared IP version. Family-specific databases
+/// (e.g. the ip-database/mmdb IPv4/IPv6 split files) must never see
+/// cross-family queries: the crate happily walks the wrong tree and
+/// returns *plausible-looking garbage* instead of an error.
+struct GeoReader {
+    r: maxminddb::Reader<Vec<u8>>,
+    /// `metadata.ip_version` — 4 or 6. IPv6 databases also contain the
+    /// IPv4 space, so they answer both families.
+    ip_version: u16,
+}
+
+impl GeoReader {
+    /// May this database answer a query for `ip`?
+    fn serves(&self, ip: &IpAddr) -> bool {
+        match ip {
+            // v4 queries are safe against any tree (v4 DBs directly, v6
+            // DBs via their embedded v4 section).
+            IpAddr::V4(_) => true,
+            // v6 queries only against v6 trees — a v4 tree misinterprets
+            // the address bits and returns wrong data.
+            IpAddr::V6(_) => self.ip_version == 6,
+        }
+    }
+}
+
 pub struct MmdbGeo {
-    asn: Option<maxminddb::Reader<Vec<u8>>>,
-    country: Option<maxminddb::Reader<Vec<u8>>>,
+    /// One reader per configured path — split IPv4/IPv6 databases are
+    /// tried in order; first hit wins.
+    asn: Vec<GeoReader>,
+    country: Vec<GeoReader>,
     orgs: Arc<StringTable>,
     metrics: Arc<Metrics>,
 }
 
 impl MmdbGeo {
     pub fn open(cfg: &GeoIpConfig, orgs: Arc<StringTable>, metrics: Arc<Metrics>) -> Self {
-        let asn = if cfg.asn_db.is_empty() {
-            None
-        } else {
-            match maxminddb::Reader::open_readfile(&cfg.asn_db) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::warn!("geoip: cannot open ASN db {}: {}", cfg.asn_db, e);
-                    None
-                }
-            }
+        let open_all = |paths: DbPaths| -> Vec<GeoReader> {
+            paths
+                .paths()
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| match maxminddb::Reader::open_readfile(p) {
+                    Ok(r) => {
+                        let ip_version = r.metadata.ip_version;
+                        Some(GeoReader { r, ip_version })
+                    }
+                    Err(e) => {
+                        tracing::warn!("geoip: cannot open {}: {}", p, e);
+                        None
+                    }
+                })
+                .collect()
         };
-        let country = if cfg.country_db.is_empty() {
-            None
+        let asn = open_all(cfg.asn_db.clone());
+        let country = open_all(cfg.country_db.clone());
+        if asn.is_empty() && country.is_empty() {
+            tracing::info!("geoip: no MMDB databases loaded");
         } else {
-            match maxminddb::Reader::open_readfile(&cfg.country_db) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::warn!(
-                        "geoip: cannot open country db {}: {}",
-                        cfg.country_db,
-                        e
-                    );
-                    None
-                }
-            }
-        };
+            tracing::info!(
+                "geoip enrichment enabled ({} asn db(s), {} country db(s))",
+                asn.len(),
+                country.len()
+            );
+        }
         MmdbGeo { asn, country, orgs, metrics }
     }
 
     pub fn enabled(&self) -> bool {
-        self.asn.is_some() || self.country.is_some()
+        !self.asn.is_empty() || !self.country.is_empty()
+    }
+
+    /// Per-IP detail for the /api/v1/lookup endpoint — same field shape as
+    /// the HTTP/table backends so results merge cleanly.
+    pub fn lookup_detail(&self, ip: IpAddr) -> Option<serde_json::Value> {
+        if !self.enabled() {
+            return None;
+        }
+        // v4-mapped v6 input (::ffff:a.b.c.d) is really a v4 lookup.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            v => v,
+        };
+        let mut asn_v = serde_json::Value::Null;
+        let mut org_v = serde_json::Value::Null;
+        let mut country_v = serde_json::Value::Null;
+        for g in self.asn.iter().filter(|g| g.serves(&ip)) {
+            if let Ok(Some(a)) = g.r.lookup::<Option<AsnRecord>>(ip) {
+                self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
+                if let Some(n) = a.asn {
+                    asn_v = serde_json::json!(n);
+                }
+                if let Some(o) = a.organization {
+                    org_v = serde_json::json!(o);
+                }
+                break;
+            }
+        }
+        for g in self.country.iter().filter(|g| g.serves(&ip)) {
+            if let Ok(Some(c)) = g.r.lookup::<Option<CountryRecord>>(ip) {
+                self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
+                let code = c.iso_code();
+                if !code.is_empty() {
+                    country_v = serde_json::json!(code);
+                }
+                break;
+            }
+        }
+        if asn_v.is_null() && org_v.is_null() && country_v.is_null() {
+            return None;
+        }
+        Some(serde_json::json!({"asn": asn_v, "org": org_v, "country": country_v}))
     }
 
     /// Enrich one IP's fields in the record. Only fills fields that are
     /// still unset (0), so exporter-provided values win.
     fn enrich_ip(&self, ip_u128: u128, is_src: bool, rec: &mut FlowRecord) {
         let ip = u128_to_ip(ip_u128);
-        if let Some(r) = &self.asn {
-            if let Ok(Some(a)) = r.lookup::<Option<AsnRecord>>(ip) {
+        for g in self.asn.iter().filter(|g| g.serves(&ip)) {
+            if let Ok(Some(a)) = g.r.lookup::<Option<AsnRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let asn = a.asn.unwrap_or(0) as u32;
                 let org = a.organization.map(|o| self.orgs.intern(&o)).unwrap_or(0);
@@ -192,18 +278,13 @@ impl MmdbGeo {
                         rec.dst_org = org;
                     }
                 }
+                break;
             }
         }
-        if let Some(r) = &self.country {
-            if let Ok(Some(c)) = r.lookup::<Option<CountryRecord>>(ip) {
+        for g in self.country.iter().filter(|g| g.serves(&ip)) {
+            if let Ok(Some(c)) = g.r.lookup::<Option<CountryRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let code = c
-                    .country
-                    .as_ref()
-                    .or(c.registered_country.as_ref())
-                    .and_then(|cc| cc.iso_code.as_deref())
-                    .unwrap_or("");
-                let packed = country_pack(code);
+                let packed = country_pack(c.iso_code());
                 if packed != 0 {
                     if is_src && rec.src_country == 0 {
                         rec.src_country = packed;
@@ -211,6 +292,7 @@ impl MmdbGeo {
                         rec.dst_country = packed;
                     }
                 }
+                break;
             }
         }
     }
