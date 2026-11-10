@@ -59,12 +59,10 @@ fn rollup_filter(q: &Q) -> Result<RollupFilter, (StatusCode, Json<serde_json::Va
         f.dst_asn = Some(s.parse().map_err(|_| err("bad dst_asn"))?);
     }
     if let Some(s) = q.get("src_ip") {
-        let (base, _) = query::parse_ip_filter(s).ok_or_else(|| err("bad src_ip"))?;
-        f.src_ip = Some(base);
+        f.src_ip = Some(query::parse_ip_filter(s).ok_or_else(|| err("bad src_ip"))?);
     }
     if let Some(s) = q.get("dst_ip") {
-        let (base, _) = query::parse_ip_filter(s).ok_or_else(|| err("bad dst_ip"))?;
-        f.dst_ip = Some(base);
+        f.dst_ip = Some(query::parse_ip_filter(s).ok_or_else(|| err("bad dst_ip"))?);
     }
     if let Some(s) = q.get("src_port") {
         f.src_port = Some(s.parse().map_err(|_| err("bad src_port"))?);
@@ -139,19 +137,10 @@ async fn flows(
         ..Default::default()
     };
     if let Some(s) = q.get("src") {
-        let (base, bits) = query::parse_ip_filter(s).ok_or_else(|| err("bad src"))?;
-        // Prefix filters on raw flows: exact match only for now unless /0.
-        if bits == 0 {
-            // match-all: leave unset
-        } else {
-            fq.src = Some(base);
-        }
+        fq.src = Some(query::parse_ip_filter(s).ok_or_else(|| err("bad src"))?);
     }
     if let Some(s) = q.get("dst") {
-        let (base, bits) = query::parse_ip_filter(s).ok_or_else(|| err("bad dst"))?;
-        if bits != 0 {
-            fq.dst = Some(base);
-        }
+        fq.dst = Some(query::parse_ip_filter(s).ok_or_else(|| err("bad dst"))?);
     }
     if let Some(s) = q.get("proto") {
         fq.proto = Some(parse_proto(s)?);

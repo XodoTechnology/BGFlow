@@ -12,8 +12,10 @@ pub struct Rule {
     proto: Option<u8>,
     src_port: Option<u16>,
     dst_port: Option<u16>,
-    src_net: Option<(u128, u8)>,
-    dst_net: Option<(u128, u8)>,
+    /// (masked base, mask) — see crate::query::parse_ip_filter for why the
+    /// mask is precomputed (v4 lives in the low 32 bits of the u128).
+    src_net: Option<(u128, u128)>,
+    dst_net: Option<(u128, u128)>,
     src_asn: Option<u32>,
     dst_asn: Option<u32>,
     src_country: Option<u16>,
@@ -26,30 +28,13 @@ pub struct Ruleset {
     rules: Vec<Rule>,
 }
 
-fn parse_prefix(s: &str) -> Option<(u128, u8)> {
-    let (addr, len) = s.split_once('/')?;
-    let ip: IpAddr = addr.parse().ok()?;
-    let bits: u8 = len.parse().ok()?;
-    let v = ip_to_u128(&ip);
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    if bits > max {
-        return None;
-    }
-    let mask = if bits == 0 {
-        0u128
-    } else {
-        u128::MAX << (128 - bits)
-    };
-    Some((v & mask, bits))
+/// Parse "a.b.c.d/n" or "addr" into (masked_base, mask). mask=0 matches all.
+fn parse_prefix(s: &str) -> Option<(u128, u128)> {
+    crate::query::parse_ip_filter(s)
 }
 
-fn ip_in_net(ip: u128, net: (u128, u8)) -> bool {
-    let (base, bits) = net;
-    if bits == 0 {
-        return true;
-    }
-    let mask = u128::MAX << (128 - bits);
-    (ip & mask) == (base & mask)
+fn ip_in_net(ip: u128, net: (u128, u128)) -> bool {
+    (ip & net.1) == net.0
 }
 
 impl Ruleset {

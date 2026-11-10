@@ -6,7 +6,7 @@ use crate::rules::Ruleset;
 use crate::writer::SegmentIndex;
 use anyhow::Result;
 use bgflow_store::{for_each_segment_info, Record};
-use bgflow_types::{ip_string, ip_to_u128, u128_to_ip, country_str, protocol_name, FlowRecord, RollupRecord};
+use bgflow_types::{ip_string, ip_to_u128, country_str, protocol_name, FlowRecord, RollupRecord};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -64,8 +64,9 @@ pub fn default_range() -> (u64, u64) {
 pub struct FlowQuery {
     pub from_ms: u64,
     pub to_ms: u64,
-    pub src: Option<u128>,
-    pub dst: Option<u128>,
+    /// (masked base, mask) — mask=0 matches everything. See parse_ip_filter.
+    pub src: Option<(u128, u128)>,
+    pub dst: Option<(u128, u128)>,
     pub proto: Option<u8>,
     pub sport: Option<u16>,
     pub dport: Option<u16>,
@@ -79,13 +80,13 @@ pub struct FlowQuery {
 
 impl FlowQuery {
     fn matches(&self, f: &FlowRecord) -> bool {
-        if let Some(v) = self.src {
-            if f.src_ip != v {
+        if let Some((base, mask)) = self.src {
+            if (f.src_ip & mask) != base {
                 return false;
             }
         }
-        if let Some(v) = self.dst {
-            if f.dst_ip != v {
+        if let Some((base, mask)) = self.dst {
+            if (f.dst_ip & mask) != base {
                 return false;
             }
         }
@@ -199,8 +200,9 @@ pub struct RollupFilter {
     pub proto: Option<u8>,
     pub src_asn: Option<u32>,
     pub dst_asn: Option<u32>,
-    pub src_ip: Option<u128>,
-    pub dst_ip: Option<u128>,
+    /// (masked base, mask) — mask=0 matches everything. See parse_ip_filter.
+    pub src_ip: Option<(u128, u128)>,
+    pub dst_ip: Option<(u128, u128)>,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     pub src_country: Option<u16>,
@@ -229,13 +231,13 @@ impl RollupFilter {
                 return false;
             }
         }
-        if let Some(v) = self.src_ip {
-            if r.src_ip != v {
+        if let Some((base, mask)) = self.src_ip {
+            if (r.src_ip & mask) != base {
                 return false;
             }
         }
-        if let Some(v) = self.dst_ip {
-            if r.dst_ip != v {
+        if let Some((base, mask)) = self.dst_ip {
+            if (r.dst_ip & mask) != base {
                 return false;
             }
         }
@@ -355,22 +357,97 @@ pub fn format_key(by: &str, key: u128) -> serde_json::Value {
     }
 }
 
-/// Parse an IP filter param (plain IP or CIDR prefix -> exact/prefix match).
-/// Returns (addr, prefix_bits); prefix_bits=128/32 means exact.
-pub fn parse_ip_filter(s: &str) -> Option<(u128, u8)> {
-    if let Some((a, l)) = s.split_once('/') {
-        let ip: std::net::IpAddr = a.parse().ok()?;
-        let bits: u8 = l.parse().ok()?;
-        let max = if ip.is_ipv4() { 32 } else { 128 };
-        if bits > max {
-            return None;
-        }
-        let v = ip_to_u128(&ip);
-        let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
-        Some((v & mask, bits))
+/// Parse an IP filter param (plain IP or CIDR) into (masked_base, mask).
+///
+/// IMPORTANT: `ip_to_u128` stores IPv4 in the LOW 32 bits (::ffff:a.b.c.d),
+/// so v4 prefix masks apply to the low word, not the top bits of the u128.
+/// We precompute the mask here so matching is a single AND+compare per row.
+/// mask=0 matches everything ("0.0.0.0/0" or "::/0").
+pub fn parse_ip_filter(s: &str) -> Option<(u128, u128)> {
+    let (addr, bits) = match s.split_once('/') {
+        Some((a, l)) => (a, Some(l.parse::<u8>().ok()?)),
+        None => (s, None),
+    };
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let bits = bits.unwrap_or(max);
+    if bits > max {
+        return None;
+    }
+    let base = ip_to_u128(&ip);
+    let mask = if bits == 0 {
+        0
+    } else if ip.is_ipv4() {
+        // Keep the top `bits` of the low 32 bits (plus the constant
+        // ::ffff: marker region, which is identical for all v4 addrs).
+        0xFFFF_FFFFu128 << (32 - bits)
     } else {
-        let ip: std::net::IpAddr = s.parse().ok()?;
-        Some((ip_to_u128(&ip), if ip.is_ipv4() { 32 } else { 128 }))
+        u128::MAX << (128 - bits)
+    };
+    Some((base & mask, mask))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bgflow_types::ip_to_u128;
+    use std::net::IpAddr;
+
+    fn matches(flt: (u128, u128), ip: &str) -> bool {
+        let ip: IpAddr = ip.parse().unwrap();
+        (ip_to_u128(&ip) & flt.1) == flt.0
+    }
+
+    #[test]
+    fn v4_prefixes() {
+        let f8 = parse_ip_filter("10.0.0.0/8").unwrap();
+        assert!(matches(f8, "10.1.2.3"));
+        assert!(matches(f8, "10.255.255.255"));
+        assert!(!matches(f8, "11.0.0.1"));
+        assert!(!matches(f8, "100.64.0.1"));
+        assert!(!matches(f8, "172.16.0.1"));
+
+        let f24 = parse_ip_filter("192.168.1.0/24").unwrap();
+        assert!(matches(f24, "192.168.1.250"));
+        assert!(!matches(f24, "192.168.2.1"));
+        assert!(!matches(f24, "10.0.0.1"));
+
+        // Plain IP = exact match
+        let exact = parse_ip_filter("10.1.2.3").unwrap();
+        assert!(matches(exact, "10.1.2.3"));
+        assert!(!matches(exact, "10.1.2.4"));
+
+        // /32 exact, /0 match-all
+        let f32 = parse_ip_filter("1.2.3.4/32").unwrap();
+        assert!(matches(f32, "1.2.3.4") && !matches(f32, "1.2.3.5"));
+        let all = parse_ip_filter("0.0.0.0/0").unwrap();
+        assert!(matches(all, "8.8.8.8"));
+    }
+
+    #[test]
+    fn v6_prefixes() {
+        let f = parse_ip_filter("2001:db8::/32").unwrap();
+        assert!(matches(f, "2001:db8::1"));
+        assert!(matches(f, "2001:db8:ffff::dead:beef"));
+        assert!(!matches(f, "2001:db9::1"));
+        assert!(!matches(f, "::1"));
+
+        let exact6 = parse_ip_filter("2001:db8::1").unwrap();
+        assert!(matches(exact6, "2001:db8::1"));
+        assert!(!matches(exact6, "2001:db8::2"));
+
+        // v4 must not match v6 filters and vice versa
+        let v6f = parse_ip_filter("::ffff:10.0.0.0/104").unwrap();
+        assert!(matches(v6f, "10.1.2.3")); // v4-mapped IS ::ffff:a.b.c.d
+        assert!(!matches(v6f, "2001:db8::1"));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert!(parse_ip_filter("not-an-ip").is_none());
+        assert!(parse_ip_filter("10.0.0.0/33").is_none());
+        assert!(parse_ip_filter("2001:db8::/129").is_none());
+        assert!(parse_ip_filter("10.0.0.0/abc").is_none());
     }
 }
 
