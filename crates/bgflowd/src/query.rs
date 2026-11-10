@@ -9,8 +9,53 @@ use bgflow_store::encode::ColumnData;
 use bgflow_store::schema::rollup_idx;
 use bgflow_store::{for_each_segment_info, Record};
 use bgflow_types::{ip_string, ip_to_u128, is_v4_mapped, country_str, protocol_name, FlowRecord, RollupRecord};
+use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+/// Friendly exporter names from `[exporter_names]` config — bidirectional
+/// lookup so filters accept either IPs or names. Swapped on SIGHUP reload.
+#[derive(Default)]
+pub struct ExporterNames {
+    by_ip: HashMap<u128, String>,
+    by_name: HashMap<String, u128>,
+}
+
+impl ExporterNames {
+    pub fn build(map: &std::collections::BTreeMap<String, String>) -> Self {
+        let mut e = ExporterNames::default();
+        for (ip_s, name) in map {
+            if let Ok(ip) = ip_s.trim().parse::<std::net::IpAddr>() {
+                let u = ip_to_u128(&ip);
+                e.by_ip.insert(u, name.clone());
+                e.by_name.insert(name.trim().to_lowercase(), u);
+            }
+        }
+        e
+    }
+
+    pub fn name_of(&self, ip: u128) -> Option<&str> {
+        self.by_ip.get(&ip).map(|s| s.as_str())
+    }
+
+    /// Resolve a filter token: IP literal, "name (ip)" display form, or
+    /// configured name (case-insensitive).
+    pub fn resolve(&self, token: &str) -> Option<u128> {
+        let t = token.trim();
+        if let Ok(ip) = t.parse::<std::net::IpAddr>() {
+            return Some(ip_to_u128(&ip));
+        }
+        // Display form "name (ip)" → use the parenthesized IP.
+        if let (Some(start), Some(end)) = (t.rfind('('), t.rfind(')')) {
+            if end == t.len() - 1 {
+                if let Ok(ip) = t[start + 1..end].trim().parse::<std::net::IpAddr>() {
+                    return Some(ip_to_u128(&ip));
+                }
+            }
+        }
+        self.by_name.get(&t.to_lowercase()).copied()
+    }
+}
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -20,6 +65,7 @@ pub struct Ctx {
     pub hourly_index: SegmentIndex,
     pub orgs: Arc<StringTable>,
     pub rules: Arc<Ruleset>,
+    pub exporter_names: Arc<RwLock<ExporterNames>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -627,7 +673,13 @@ pub fn format_key(ctx: &Ctx, by: &str, key: u128) -> serde_json::Value {
         "src_port" => serde_json::json!(key as u16),
         "dst_port" => serde_json::json!(key as u16),
         "proto" | "protocol" => serde_json::json!(protocol_name(key as u8)),
-        "exporter" => serde_json::json!(ip_string(key)),
+        "exporter" => {
+            let g = ctx.exporter_names.read().unwrap();
+            match g.name_of(key) {
+                Some(n) => serde_json::json!(format!("{} ({})", n, ip_string(key))),
+                None => serde_json::json!(ip_string(key)),
+            }
+        }
         "src_country" => {
             let s = country_str(key as u16);
             serde_json::json!(if s.is_empty() { "-" } else { s.as_str() })

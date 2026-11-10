@@ -149,10 +149,21 @@ async function load(silent){
   }catch(e){content.innerHTML='<div class="err">Error: '+esc(e.message)+'</div>'}
 }
 
+// click-safe filter: value rides in data-k (esc handles HTML), JS reads it back
+function topTbl(items, fk){
+  return `<table><tr><th></th><th>Key</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${
+    (items||[]).map((t,i)=>`<tr><td class="num muted">${i+1}</td>
+      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${esc(t.key)}</td>
+      <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`).join('')
+    ||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table>`;
+}
+
 async function vOverview(){
-  const [sum,ts,top,st]=await Promise.all([
+  const [sum,ts,s,d,sa,da,dp,st]=await Promise.all([
     api('/api/v1/summary?'+q()),api('/api/v1/timeseries?'+q({bucket:state.bucket})),
-    api('/api/v1/top?'+q({by:'src_ip',limit:8})),api('/api/v1/status')]);
+    api('/api/v1/top?'+q({by:'src_ip',limit:8})),api('/api/v1/top?'+q({by:'dst_ip',limit:8})),
+    api('/api/v1/top?'+q({by:'src_asn',limit:8})),api('/api/v1/top?'+q({by:'dst_asn',limit:8})),
+    api('/api/v1/top?'+q({by:'dst_port',limit:8})),api('/api/v1/status')]);
   const cards=`<div class="cards">
     <div class="card"><div class="lbl">Flows</div><div class="val">${fmtN(sum.flows)}</div><div class="sub">${esc(trangeLabel())}</div></div>
     <div class="card"><div class="lbl">Bytes</div><div class="val">${fmtB(sum.bytes)}</div><div class="sub">${fmtN(sum.packets)} packets</div></div>
@@ -160,12 +171,19 @@ async function vOverview(){
     <div class="card"><div class="lbl">Stored</div><div class="val">${fmtB(st.status.flow_bytes+st.status.rollup_bytes+st.status.hourly_bytes)}</div><div class="sub">${fmtN(st.status.flow_rows+st.status.rollup_rows+st.status.hourly_rows)} rows · ${st.status.uptime_secs}s up</div></div>
   </div>`;
   const protos=(sum.by_protocol||[]).slice(0,6).map(p=>`<tr><td>${esc(p.name)}</td><td class="num">${fmtN(p.flows)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.packets)}</td></tr>`).join('');
-  const tops=(top.items||[]).map((t,i)=>`<tr><td class="num muted">${i+1}</td><td class="clickable" onclick="setFilter('src','${esc(t.key)}')">${esc(t.key)}</td><td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`).join('');
   content.innerHTML=activeChips()+cards+
    `<div class="panel"><h3>Traffic — ${esc(state.bucket)}</h3><canvas id="chart"></canvas></div>
     <div class="grid2">
-      <div class="panel"><h3>Top Source IPs</h3><table><tr><th></th><th>IP</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${tops||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table></div>
+      <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click to filter)</span></h3>${topTbl(s.items,'src')}</div>
+      <div class="panel"><h3>Top Destinations</h3>${topTbl(d.items,'dst')}</div>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h3>Top Source ASNs</h3>${topTbl(sa.items,'src_asn')}</div>
+      <div class="panel"><h3>Top Destination ASNs</h3>${topTbl(da.items,'dst_asn')}</div>
+    </div>
+    <div class="grid2">
       <div class="panel"><h3>By Protocol</h3><table><tr><th>Proto</th><th class="num">Flows</th><th class="num">Bytes</th><th class="num">Packets</th></tr>${protos||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table></div>
+      <div class="panel"><h3>Top Destination Ports</h3>${topTbl(dp.items,'dport')}</div>
     </div>`;
   drawChart(ts.series||[]);
 }
@@ -201,7 +219,7 @@ function filterBar(extra=''){
     <select id="f_proto"><option value="">proto</option>${['','tcp','udp','icmp','icmpv6','gre','esp'].map(p=>`<option ${F.proto===p?'selected':''}>${p||'any'}</option>`).join('')}</select>
     <input id="f_sport" placeholder="sport" value="${esc(F.sport||'')}">
     <input id="f_dport" placeholder="dport" value="${esc(F.dport||'')}">
-    <input id="f_exporter" placeholder="exporter(s)" value="${esc(F.exporter||'')}">
+    <input id="f_exporter" placeholder="exporter ip/name(s)" value="${esc(F.exporter||'')}">
     <input id="f_asn" placeholder="asn" value="${esc(F.src_asn||'')}">
     <select id="f_sipv"><option value="">src ipver</option>${['','4','6'].map(v=>`<option value="${v}" ${F.src_ipver===v?'selected':''}>${v?v==='4'?'IPv4':'IPv6':'any'}</option>`).join('')}</select>
     <select id="f_dipv"><option value="">dst ipver</option>${['','4','6'].map(v=>`<option value="${v}" ${F.dst_ipver===v?'selected':''}>${v?v==='4'?'IPv4':'IPv6':'any'}</option>`).join('')}</select>
@@ -243,21 +261,29 @@ async function vFlows(){
     <td class="muted">AS${f.src_asn||'-'} → AS${f.dst_asn||'-'}</td>
     <td>${esc(f.src_org||f.src_country||'')} → ${esc(f.dst_org||f.dst_country||'')}</td>
     <td>${f.label?`<span class="tag clickable" onclick="setFilter('label','${esc(f.label)}')">${esc(f.label)}</span>`:'<span class="muted">-</span>'}</td>
-    <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')">${esc(f.exporter)}</td></tr>`).join('');
+    <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td></tr>`).join('');
   $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th></tr>${rows||'<tr><td colspan=10 class=muted>No flows</td></tr>'}</table>
    <div class="hint">${data.count} flows · <a href="#" onclick="dlCsv();return false">download CSV</a></div>`;
 }
 async function dlCsv(){const r=await fetch('/api/v1/flows?'+q({limit:10000,format:'csv'}));const d=await r.json();const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([d.csv],{type:'text/csv'}));a.download='bgflow-flows.csv';a.click()}
 
 async function vTop(){
-  content.innerHTML=`<div class="filters">
+  content.innerHTML=`<div class="filters" id="dimchips">
     ${presetBar()}
-    <select id="t_by">${TOP_DIMS.map(d=>`<option value="${d}" ${state.topby===d?'selected':''}>${d}</option>`).join('')}</select>
+    ${TOP_DIMS.map(d=>`<span class="chip ${state.topby===d?'on':''}" data-d="${d}">${d}</span>`).join('')}
     <select id="t_n"><option>10</option><option selected>15</option><option>25</option><option>50</option></select>
     <select id="t_gran"><option value="minute" ${state.granularity==='minute'?'selected':''}>minute</option><option value="hourly" ${state.granularity==='hourly'?'selected':''}>hourly</option></select>
     <button class="btn" onclick="load()">Apply</button></div>
    <div class="panel"><h3>Top <span id="t_lbl"></span> <span class="muted" style="text-transform:none">(click a key to filter)</span></h3><div id="tbl"></div></div>`;
-  state.topby=$('#t_by').value;state.topn=+$('#t_n').value;state.granularity=$('#t_gran').value;
+  document.querySelectorAll('#dimchips .chip[data-d]').forEach(c=>c.onclick=()=>{
+    state.topby=c.dataset.d;
+    document.querySelectorAll('#dimchips .chip[data-d]').forEach(x=>x.classList.toggle('on',x===c));
+    loadTopData();
+  });
+  state.topn=+$('#t_n').value;state.granularity=$('#t_gran').value;
+  await loadTopData();
+}
+async function loadTopData(){
   $('#t_lbl').textContent=state.topby;
   const data=await api('/api/v1/top?'+q({by:state.topby,limit:state.topn}));
   const max=data.items?.[0]?.bytes||1;
@@ -320,9 +346,14 @@ async function vAnomalies(){
   $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Key</th><th></th><th class="num">Z</th><th class="num">Bytes</th></tr>${rows||'<tr><td colspan=5 class=muted>No anomalies — widen the range or lower sigma</td></tr>'}</table>`;
 }
 
+let expNames={};
+async function loadExpNames(){try{const d=await api('/api/v1/exporters');expNames={};(d.items||[]).forEach(e=>{if(e.name)expNames[e.ip]=e.name})}catch(e){}}
+function expLabel(ip){return expNames[ip]?`${expNames[ip]} (${ip})`:ip}
+
 async function vExporters(){
   const [ex,st]=await Promise.all([api('/api/v1/exporters'),api('/api/v1/status')]);
-  const rows=(ex.items||[]).map(e=>`<tr><td class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${esc(e.ip)}</td><td class="num">${fmtN(e.datagrams)}</td><td class="num">${fmtN(e.records)}</td><td class="num">${fmtB(e.bytes_in)}</td><td class="muted">${ago(e.last_seen_ms)}</td></tr>`).join('');
+  loadExpNames();
+  const rows=(ex.items||[]).map(e=>`<tr><td class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${e.name?`<b>${esc(e.name)}</b> <span class="muted">${esc(e.ip)}</span>`:esc(e.ip)}</td><td class="num">${fmtN(e.datagrams)}</td><td class="num">${fmtN(e.records)}</td><td class="num">${fmtB(e.bytes_in)}</td><td class="muted">${ago(e.last_seen_ms)}</td></tr>`).join('');
   content.innerHTML=filterBar()+`<div class="cards">
     <div class="card"><div class="lbl">Exporters</div><div class="val">${(ex.items||[]).length}</div></div>
     <div class="card"><div class="lbl">Uptime</div><div class="val">${Math.floor(st.status.uptime_secs/60)}m</div></div>
@@ -357,7 +388,7 @@ async function vMetrics(){
 }
 
 fetch('/api/v1/status').then(r=>r.json()).then(d=>{$('#ver').textContent='uptime '+Math.floor(d.status.uptime_secs/60)+'m'}).catch(()=>{});
-startAuto();load();
+loadExpNames();startAuto();load();
 </script>
 </body>
 </html>

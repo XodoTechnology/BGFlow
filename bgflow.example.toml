@@ -171,6 +171,13 @@ dst_port = 53
 # group_by = "src_country"
 # min_change_pct = 200     # only fire on >2x jump vs previous window
 
+# --- Exporter names -------------------------------------------------------------
+# Friendly names shown in the UI/API instead of bare exporter IPs.
+# Filters accept either the IP or the name.
+# [exporter_names]
+# "10.0.0.1" = "edge-rtr-1"
+# "10.0.0.2" = "core-rtr"
+
 # --- Demo traffic -------------------------------------------------------------
 # Send synthetic NetFlow v5 + IPFIX(IPv6) to the first input — handy for
 # trying the UI. Traffic is spread across loopback exporter IPs

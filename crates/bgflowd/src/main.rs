@@ -125,6 +125,10 @@ async fn main() -> Result<()> {
     );
 
     // --- HTTP API + UI ---
+    let exporter_names =
+        Arc::new(std::sync::RwLock::new(query::ExporterNames::build(
+            &cfg.exporter_names,
+        )));
     let app_state = Arc::new(AppState {
         ctx: query::Ctx {
             flow_index: shared.flow_index.clone(),
@@ -132,6 +136,7 @@ async fn main() -> Result<()> {
             hourly_index: shared.hourly_index.clone(),
             orgs: orgs.clone(),
             rules: rules.clone(),
+            exporter_names: exporter_names.clone(),
         },
         status: shared.status.clone(),
         metrics: metrics.clone(),
@@ -153,6 +158,7 @@ async fn main() -> Result<()> {
         let cfg_path = config::resolve_path(args.config.as_ref());
         let rules_h = rules.clone();
         let enrich_h = http_enrich.clone();
+        let names_h = exporter_names.clone();
         tokio::spawn(async move {
             let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                 Ok(s) => s,
@@ -169,7 +175,9 @@ async fn main() -> Result<()> {
                         if let Err(e) = enrich_h.reload(&new_cfg.enrichers) {
                             tracing::warn!("enricher reload failed: {}", e);
                         }
-                        tracing::info!("config reloaded (rules + enrichers)");
+                        *names_h.write().unwrap() =
+                            query::ExporterNames::build(&new_cfg.exporter_names);
+                        tracing::info!("config reloaded (rules + enrichers + exporter names)");
                     }
                     Err(e) => tracing::warn!("config reload failed: {}", e),
                 }

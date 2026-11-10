@@ -18,6 +18,9 @@ pub struct Config {
     pub demo: DemoConfig,
     /// Threshold alerting over rollup data.
     pub alerts: AlertsConfig,
+    /// Friendly names for exporters, keyed by exporter IP:
+    /// [exporter_names] "10.0.0.1" = "edge-rtr"
+    pub exporter_names: std::collections::BTreeMap<String, String>,
 }
 
 /// Synthetic demo traffic (NetFlow v5) — for trying out the UI.
@@ -233,6 +236,7 @@ impl Default for Config {
             rules: vec![],
             demo: DemoConfig::default(),
             alerts: AlertsConfig::default(),
+            exporter_names: Default::default(),
         }
     }
 }

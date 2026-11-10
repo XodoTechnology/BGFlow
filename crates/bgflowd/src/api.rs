@@ -79,13 +79,13 @@ fn rollup_filter(
 ) -> Result<RollupFilter, (StatusCode, Json<serde_json::Value>)> {
     let mut f = RollupFilter::default();
     if let Some(s) = q.get("exporter") {
-        // Comma-separated allowlist: exporter=1.2.3.4,5.6.7.8
+        // Comma-separated allowlist: IPs or configured exporter names.
+        let names = ctx.exporter_names.read().unwrap();
         for part in s.split(',') {
-            let ip: IpAddr = part
-                .trim()
-                .parse()
-                .map_err(|_| err("bad exporter"))?;
-            f.exporters.push(ip_to_u128(&ip));
+            match names.resolve(part) {
+                Some(u) => f.exporters.push(u),
+                None => return Err(err(format!("bad exporter '{}'", part.trim()))),
+            }
         }
     }
     if let Some(s) = q.get("proto") {
@@ -227,9 +227,12 @@ async fn flows(
     }
     if let Some(s) = q.get("exporter") {
         // Comma-separated allowlist, same as rollup_filter.
+        let names = st.ctx.exporter_names.read().unwrap();
         for part in s.split(',') {
-            let ip: IpAddr = part.trim().parse().map_err(|_| err("bad exporter"))?;
-            fq.exporters.push(ip_to_u128(&ip));
+            match names.resolve(part) {
+                Some(u) => fq.exporters.push(u),
+                None => return Err(err(format!("bad exporter '{}'", part.trim()))),
+            }
         }
     }
     if let Some(s) = q.get("src_ipver") {
@@ -502,11 +505,14 @@ async fn conversations(
 
 async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let map = st.metrics.exporters.lock().unwrap();
+    let names = st.ctx.exporter_names.read().unwrap();
     let items: Vec<_> = map
         .iter()
         .map(|(ip, e)| {
+            let u = ip_to_u128(ip);
             serde_json::json!({
                 "ip": ip.to_string(),
+                "name": names.name_of(u),
                 "datagrams": e.datagrams,
                 "records": e.records,
                 "bytes_in": e.bytes_in,

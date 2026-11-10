@@ -27,6 +27,8 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   prefix→ASN/org/country dumps (BGP/IRR-scale, exact LPM, file or URL).
 - **Label rules** — TOML-defined rules tag flows (ASN, port, prefix, org, …)
   for filtering and classification; hot-reloadable via SIGHUP.
+- **Exporter names** — `[exporter_names]` maps exporter IPs to friendly
+  names shown across the UI/API; filters accept IPs or names.
 - **Threshold alerts** — rate-based rules over rollups (bytes/packets/flows/
   mbps per window, optional group-by + fold-change), log + metric + webhook.
 - **Analytics** — top-N by 15 dimensions (IP, ASN, org, port, protocol,
