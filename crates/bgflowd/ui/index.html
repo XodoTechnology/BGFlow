@@ -80,7 +80,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 <div id="main">
   <div id="topbar">
     <div class="title" id="viewtitle">Overview</div>
-    <span class="chip on" data-r="-15m">15m</span>
+    <span class="chip" data-r="-15m">15m</span>
     <span class="chip" data-r="-1h">1h</span>
     <span class="chip" data-r="-6h">6h</span>
     <span class="chip on" data-r="-24h">24h</span>
@@ -323,7 +323,7 @@ async function vAnomalies(){
 async function vExporters(){
   const [ex,st]=await Promise.all([api('/api/v1/exporters'),api('/api/v1/status')]);
   const rows=(ex.items||[]).map(e=>`<tr><td class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${esc(e.ip)}</td><td class="num">${fmtN(e.datagrams)}</td><td class="num">${fmtN(e.records)}</td><td class="num">${fmtB(e.bytes_in)}</td><td class="muted">${ago(e.last_seen_ms)}</td></tr>`).join('');
-  content.innerHTML=filterBar()+'<div class="cards">
+  content.innerHTML=filterBar()+`<div class="cards">
     <div class="card"><div class="lbl">Exporters</div><div class="val">${(ex.items||[]).length}</div></div>
     <div class="card"><div class="lbl">Uptime</div><div class="val">${Math.floor(st.status.uptime_secs/60)}m</div></div>
     <div class="card"><div class="lbl">Flow segments</div><div class="val">${st.status.flow_segments}</div><div class="sub">${fmtB(st.status.flow_bytes)}</div></div>
