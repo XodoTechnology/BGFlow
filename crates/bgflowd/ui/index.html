@@ -510,97 +510,112 @@ function pairFilter(el){F[el.dataset.dim]=el.dataset.k;load()}
 
 // Sankey renderer: left nodes = src dim, right = dst dim, ribbons ∝ bytes.
 function nodeColor(id){let h=0;for(const ch of id)h=(h*31+ch.charCodeAt(0))>>>0;return `hsl(${h%360},65%,55%)`}
+const SANK_MAXN=40;
 function drawSankey(items){
   const c=$('#sankey');if(!c)return;
   const dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
   c.width=W*dpr;c.height=H*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);
   x.clearRect(0,0,W,H);
-  if(!items.length)return;
-  // node totals
-  const L={},R={};
-  items.forEach(p=>{L[p.src]=(L[p.src]||0)+p.bytes;R[p.dst]=(R[p.dst]||0)+p.bytes});
-  const padL=8,padR=8,padT=20,padB=20,nodeW=9,gap=3,midX=W/2;
-  const total=Math.max(Object.values(L).reduce((a,b)=>a+b,0),1);
-  const scale=(H-padT-padB-nodeW*Math.max(Object.keys(L).length,Object.keys(R).length,gap*2))/total;
-  // layout helper: stack nodes vertically, proportional to value
+  state._sankey=null;
+  if(!items||!items.length)return;
+  // cap distinct nodes per side; overflow folds into "Other"
+  const totals=(arr,f)=>{const o={};arr.forEach(p=>{const k=f(p);o[k]=(o[k]||0)+p.bytes});return o};
+  const keepSet=(o)=>{const ks=Object.keys(o);if(ks.length<=SANK_MAXN)return null;
+    return new Set(ks.sort((a,b)=>o[b]-o[a]).slice(0,SANK_MAXN))};
+  const kL=keepSet(totals(items,p=>p.src)),kR=keepSet(totals(items,p=>p.dst));
+  const mk=(k,keep)=>keep?(keep.has(k)?k:'Other'):k;
+  const pm=new Map();
+  items.forEach(p=>{
+    const s=mk(p.src,kL),d=mk(p.dst,kR),key=s+' '+d;
+    const e=pm.get(key)||{src:s,dst:d,bytes:0};e.bytes+=p.bytes;pm.set(key,e);
+  });
+  const pairs=[...pm.values()].sort((a,b)=>b.bytes-a.bytes);
+  const L=totals(pairs,p=>p.src),R=totals(pairs,p=>p.dst);
+  // vertical layout: node height ∝ bytes, stacked with small gaps
+  const padT=14,padB=8,gap=2,nodeW=10;
+  const sumL=Object.values(L).reduce((a,b)=>a+b,0),sumR=Object.values(R).reduce((a,b)=>a+b,0);
+  const n=Math.max(Object.keys(L).length,Object.keys(R).length);
+  const availH=Math.max(40,H-padT-padB-gap*Math.max(0,n-1));
+  const scale=availH/Math.max(sumL,sumR,1);
   function layout(nodes){
     const keys=Object.keys(nodes).sort((a,b)=>nodes[b]-nodes[a]);
-    const out={};let y=padT;const h={};
-    keys.forEach(k=>{const v=Math.max(2,nodes[k]*scale);h[k]=v;out[k]={y0:y,y1:y+v,c:y+v/2};y+=v+gap});
-    return{keys,h,pos:out,total:y-padT};
+    const pos={};let y=padT;
+    keys.forEach((k,i)=>{const h=Math.max(2.5,nodes[k]*scale);pos[k]={y0:y,y1:y+h};y+=h+(i<keys.length-1?gap:0)});
+    return{keys,pos};
   }
   const layL=layout(L),layR=layout(R);
-  // assign each ribbon a sub-span inside both endpoint nodes (stacked order)
-  const ribbons=items.map(p=>{
-    const s=layL.pos[p.src],d=layR.pos[p.dst];
-    return{p,s,d};
-  });
-  // cumulative offsets within each node, ordered by pair bytes desc
+  // label columns sit beside the bars so text never crosses ribbons
+  const lblW=W<640?80:115;
+  const xBarL=10,xLabL=xBarL+nodeW+6,xRibL=xLabL+lblW+8;
+  const xRBar=W-10-nodeW-lblW-6,xRibR=xRBar-5;
+  const midX=(xRibL+xRibR)/2;
+  if(xRibR<=xRibL+30){x.fillStyle='#8b949e';x.font='12px sans-serif';x.fillText('canvas too narrow',20,H/2);state._sankey=null;return}
+  // ribbon spans: cumulative offsets inside each endpoint node
   const sOff={},dOff={};
-  ribbons.sort((a,b)=>b.p.bytes-a.p.bytes).forEach(r=>{
-    const w=Math.max(1.5,r.p.bytes*scale);
-    const so=sOff[r.p.src]??0,do2=dOff[r.p.dst]??0;
-    sOff[r.p.src]=so+w;dOff[r.p.dst]=do2+w;
-    r.w=w;
-    r.s0=r.s.y0+so;r.s1=r.s.y0+so+w;
-    r.d0=r.d.y0+do2;r.d1=r.d.y0+do2+w;
-    r.sC=(r.s0+r.s1)/2;r.dC=(r.d0+r.d1)/2;
+  pairs.forEach(p=>{
+    const sl=layL.pos[p.src],dl=layR.pos[p.dst];
+    const w=p.bytes*scale;
+    const so=sOff[p.src]||0,dd=dOff[p.dst]||0;
+    sOff[p.src]=so+w;dOff[p.dst]=dd+w;
+    p._r={s0:sl.y0+so,s1:sl.y0+so+w,d0:dl.y0+dd,d1:dl.y0+dd+w};
   });
-  // hover state: node label -> isolate
-  const hov=state.mapHover>=0?state.mapHover:-2;
-  const hovLabel=hov>=0?(ribbons[hov]?.p.src??null):null;
-  const isNodeHov = hovLabel===null&&state.mapHoverNode;
-  // draw ribbons
-  const x1=midX-nodeW/2-30,x2=midX+nodeW/2+30;
-  ribbons.forEach((r,i)=>{
-    const connected=isNodeHov?(r.p.src===state.mapHoverNode||r.p.dst===state.mapHoverNode):true;
-    const alpha=connected?.4:.05;
-    const col=nodeColor(r.p.src);
+  const hov=state.mapHoverNode;
+  const hovSide=hov?hov.side:null,hovKey=hov?hov.key:null;
+  const nodeLabel=(dim,k)=>{
+    let s=k;
+    if(dim.includes('country'))s=flag(k)+k;
+    else if(dim.includes('asn'))s='AS'+k;
+    return String(s).slice(0,18);
+  };
+  // ribbons
+  pairs.forEach(p=>{
+    const r=p._r,connected=!hov||(hovSide==='L'?p.src===hovKey:p.dst===hovKey);
     x.beginPath();
-    x.moveTo(x1,r.s0);
-    x.bezierCurveTo(midX,r.s0,midX,r.d0,x2,r.d0);
-    x.lineTo(x2,r.d1);
-    x.bezierCurveTo(midX,r.d1,midX,r.s1,x1,r.s1);
+    x.moveTo(xRibL,r.s0);
+    x.bezierCurveTo(midX,r.s0,midX,r.d0,xRibR,r.d0);
+    x.lineTo(xRibR,r.d1);
+    x.bezierCurveTo(midX,r.d1,midX,r.s1,xRibL,r.s1);
     x.closePath();
-    x.fillStyle=col;x.globalAlpha=alpha;x.fill();x.globalAlpha=1;
+    x.fillStyle=nodeColor(p.src);x.globalAlpha=connected?.38:.05;x.fill();x.globalAlpha=1;
   });
-  // draw nodes
-  function drawNodes(lay,side){
-    const xs=side==='L'?[padL+2,x1-nodeW]:[x2,x2+nodeW];
+  // nodes: bar + accent edge + labels (only when tall enough)
+  function drawSide(lay,nodes,side){
+    const bx=side==='L'?xBarL:xRBar,dim=side==='L'?state.msrc:state.mdst;
     lay.keys.forEach(k=>{
-      const nd=lay.pos[k],h=nd.y1-nd.y0;
-      const hovN=state.mapHoverNode===k;
-      x.fillStyle=hovN?'#3b82f6':'#1d2534';
-      x.fillRect(xs[0],nd.y0,nodeW,h);
-      x.fillStyle='#e6edf3';x.font='10px ui-monospace,monospace';
-      const sdim=side==='L'?state.msrc:state.mdst;
-      const label=(sdim.includes('country')?flag(k):'')+String(k).slice(0,16);
-      x.fillText(label,xs[1]+3,nd.y0+h/2+3);
-      const v=side==='L'?L[k]:R[k];
-      x.fillStyle='#8b949e';
-      x.fillText(fmtB(v),xs[1]+3,nd.y0+h/2+15>H-6?H-6:nd.y0+h/2+15);
+      const nd=lay.pos[k],h=nd.y1-nd.y0,cy=nd.y0+h/2;
+      const isHov=hovSide===side&&hovKey===k;
+      x.fillStyle=isHov?'#3b82f6':'#1d2534';
+      x.fillRect(bx,nd.y0,nodeW,h);
+      x.fillStyle=nodeColor(k);x.globalAlpha=.9;
+      x.fillRect(bx,nd.y0,2.5,h);x.globalAlpha=1;
+      if(h<11)return;
+      x.font='10px ui-monospace,monospace';
+      x.fillStyle=isHov?'#fff':'#e6edf3';
+      x.fillText(nodeLabel(dim,k),bx+nodeW+5,cy+3);
+      if(h>=26){x.fillStyle='#8b949e';x.font='9px ui-monospace,monospace';x.fillText(fmtB(nodes[k]),bx+nodeW+5,cy+14)}
     });
   }
-  drawNodes(layL,'L');drawNodes(layR,'R');
-  state._sankey={ribbons,layL,layR,x1,x2,nodeW,padL,padR,W,H};
+  drawSide(layL,L,'L');drawSide(layR,R,'R');
+  state._sankey={layL,layR,L,R,pairs,xBarL,xRBar,nodeW,lblW,W,H};
 }
 function bindSankeyHover(){
   const c=$('#sankey');if(!c)return;
   c.onmousemove=e=>{
     const sk=state._sankey;if(!sk)return;
     const r=c.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
-    // node hit-test first
     let hit=null;
-    for(const side of['layL','layR']){
-      for(const k of sk[side].keys){
-        const nd=sk[side].pos[k];
-        const x0=side==='layL'?sk.padL+2:sk.x2, x1=x0+sk.nodeW+70;
-        if(mx>=x0-4&&mx<=x1&&my>=nd.y0&&my<=nd.y1){hit=k;break}
+    for(const side of['L','R']){
+      const lay=side==='L'?sk.layL:sk.layR,x0=side==='L'?sk.xBarL:sk.xRBar,x1=x0+sk.nodeW+sk.lblW+12;
+      for(const k of lay.keys){
+        const nd=lay.pos[k];
+        if(mx>=x0-3&&mx<=Math.min(x1,sk.W-2)&&my>=nd.y0-1&&my<=nd.y1+1){hit={side,key:k};break}
       }
       if(hit)break;
     }
     const nn=hit||null;
-    if(nn!==state.mapHoverNode){state.mapHoverNode=nn;if(state.mapData)drawSankey(state.mapData.items||[])}
+    if(nn?.key!==state.mapHoverNode?.key||nn?.side!==state.mapHoverNode?.side){
+      state.mapHoverNode=nn;if(state.mapData)drawSankey(state.mapData.items||[])
+    }
   };
   c.onmouseleave=()=>{state.mapHoverNode=null;if(state.mapData)drawSankey(state.mapData.items||[])};
 }
