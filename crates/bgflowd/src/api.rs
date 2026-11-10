@@ -18,7 +18,6 @@ use axum::{
 use bgflow_types::ip_to_u128;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
 
 pub struct AppState {
@@ -365,6 +364,12 @@ fn shard_top<K>(
     cand
 }
 
+/// No-op bounded accumulator for `rollup_scan_sharded` callers that only
+/// need the key/value maps.
+fn unit_init() -> () {}
+fn unit_add(_: &mut (), _: &query::RollupRow) {}
+fn unit_merge(_: &mut (), _: ()) {}
+
 /// Merge one worker's `HashMap<K, Agg>` partial into the combined map.
 fn merge_agg_map<K>(a: &mut HashMap<K, Agg>, b: HashMap<K, Agg>)
 where
@@ -375,14 +380,15 @@ where
     }
 }
 
-/// Overview endpoint accumulator — totals + protocol + timeseries + the
-/// five top-dim maps, merged from per-worker partials.
+/// Overview endpoint bounded accumulator — totals + protocol +
+/// timeseries. The top-dim maps are NOT here: they go through the
+/// key-sharded maps so per-worker memory stays flat regardless of IP
+/// cardinality. Merged from per-worker partials.
 #[derive(Default)]
 struct OvAcc {
     total: Agg,
     by_proto: HashMap<u8, Agg>,
     series: HashMap<u64, Agg>,
-    tops: HashMap<&'static str, HashMap<u128, Agg>>,
 }
 
 impl OvAcc {
@@ -390,9 +396,6 @@ impl OvAcc {
         agg_add(&mut self.total, &o.total);
         merge_agg_map(&mut self.by_proto, o.by_proto);
         merge_agg_map(&mut self.series, o.series);
-        for (d, m) in o.tops {
-            merge_agg_map(self.tops.entry(d).or_default(), m);
-        }
     }
 }
 
@@ -468,23 +471,33 @@ async fn overview(
     const TOP_DIMS_OV: [&str; 5] = ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"];
     let needed = query::rollup_needed(&f, &["proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]);
 
-    let acc = query::rollup_scan_par(
+    // One sharded scan: bounded state (totals/proto/series) accumulates
+    // per worker; each top dim emits (dim_idx, key) pairs routed into
+    // disjoint shard maps — exact top-N at one-map memory cost even for
+    // the high-cardinality IP dims.
+    let (shards, acc) = query::rollup_scan_sharded(
         &st.ctx,
         set,
         from,
         to,
         &needed,
-        || OvAcc {
-            tops: TOP_DIMS_OV
-                .iter()
-                .map(|d| (*d, HashMap::new()))
-                .collect(),
-            ..Default::default()
-        },
-        |acc, r| {
-            if !f.matches(r) {
-                return;
+        &f,
+        bgflow_store::scan_threads(),
+        |r, out| {
+            for (i, d) in TOP_DIMS_OV.iter().enumerate() {
+                out.push((
+                    (i as u8, query::dim_key(d, r)),
+                    Agg {
+                        bytes: r.bytes(),
+                        packets: r.packets(),
+                        flows: r.flows(),
+                    },
+                ));
             }
+        },
+        |a: &mut Agg, b: Agg| agg_add(a, &b),
+        || OvAcc::default(),
+        |acc: &mut OvAcc, r: &query::RollupRow| {
             acc.total.bytes += r.bytes();
             acc.total.packets += r.packets();
             acc.total.flows += r.flows();
@@ -497,22 +510,14 @@ async fn overview(
             s.bytes += r.bytes();
             s.packets += r.packets();
             s.flows += r.flows();
-            for d in TOP_DIMS_OV {
-                let k = query::dim_key(d, r);
-                let a = acc.tops.get_mut(d).unwrap().entry(k).or_default();
-                a.bytes += r.bytes();
-                a.packets += r.packets();
-                a.flows += r.flows();
-            }
         },
-        |a, b| a.merge(b),
+        |a: &mut OvAcc, b: OvAcc| a.merge(b),
     )
     .map_err(|e| err(e.to_string()))?;
     let OvAcc {
         total,
         by_proto,
         series,
-        tops,
     } = acc;
 
     let mut protos: Vec<_> = by_proto
@@ -538,11 +543,30 @@ async fn overview(
         .collect();
     ts_rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
 
+    // Partition shard entries by dimension index, then exact top-N per
+    // dim via select_nth (no full sort of the IP-sized key spaces).
+    let mut dim_rows: Vec<Vec<(u128, Agg)>> =
+        (0..TOP_DIMS_OV.len()).map(|_| Vec::new()).collect();
+    for map in shards {
+        for ((di, k), a) in map {
+            dim_rows[di as usize].push((k, a));
+        }
+    }
+    let cmp = |a: &(u128, Agg), b: &(u128, Agg)| {
+        b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
+    };
     let mut top_out = serde_json::Map::new();
-    for (d, map) in tops {
-        let mut rows: Vec<(u128, Agg)> = map.into_iter().collect();
-        rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows)));
-        rows.truncate(limit);
+    for (i, &d) in TOP_DIMS_OV.iter().enumerate() {
+        let mut rows = std::mem::take(&mut dim_rows[i]);
+        if limit > 0 {
+            if rows.len() > limit {
+                rows.select_nth_unstable_by(limit - 1, cmp);
+            }
+            rows.truncate(limit);
+            rows.sort_by(cmp);
+        } else {
+            rows.clear();
+        }
         top_out.insert(
             d.to_string(),
             serde_json::json!(rows
@@ -598,7 +622,7 @@ async fn matrix(
     let needed = query::rollup_needed(&f, &[sd, dd]);
     // Pair map can be large — key-sharded parallel aggregation keeps
     // memory at one global map's size while decoding in parallel.
-    let shards = query::rollup_scan_sharded(
+    let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
         from,
@@ -606,17 +630,20 @@ async fn matrix(
         &needed,
         &f,
         bgflow_store::scan_threads(),
-        |r| {
-            Some((
+        |r, out| {
+            out.push((
                 (query::dim_key(sd, r), query::dim_key(dd, r)),
                 Agg {
                     bytes: r.bytes(),
                     packets: r.packets(),
                     flows: r.flows(),
                 },
-            ))
+            ));
         },
         |a: &mut Agg, b: Agg| agg_add(a, &b),
+        unit_init,
+        unit_add,
+        unit_merge,
     )
     .map_err(|e| err(e.to_string()))?;
 
@@ -717,7 +744,7 @@ async fn top(
     // Full-cardinality dim map (ports/IPs can be huge) — key-sharded
     // parallel aggregation: memory stays at one map's size.
     let needed = query::rollup_needed(&f, &[by]);
-    let shards = query::rollup_scan_sharded(
+    let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
         from,
@@ -725,17 +752,20 @@ async fn top(
         &needed,
         &f,
         bgflow_store::scan_threads(),
-        |r| {
-            Some((
+        |r, out| {
+            out.push((
                 query::dim_key(by, r),
                 Agg {
                     bytes: r.bytes(),
                     packets: r.packets(),
                     flows: r.flows(),
                 },
-            ))
+            ));
         },
         |a: &mut Agg, b: Agg| agg_add(a, &b),
+        unit_init,
+        unit_add,
+        unit_merge,
     )
     .map_err(|e| err(e.to_string()))?;
 
@@ -767,7 +797,7 @@ async fn conversations(
     // Key-sharded parallel aggregation: each key lives in exactly one
     // shard, so memory equals a single map (not one per worker).
     let needed = query::rollup_needed(&f, &["src_ip", "dst_ip", "src_port", "dst_port", "proto"]);
-    let shards = query::rollup_scan_sharded(
+    let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
         from,
@@ -775,8 +805,8 @@ async fn conversations(
         &needed,
         &f,
         bgflow_store::scan_threads(),
-        |r| {
-            Some((
+        |r, out| {
+            out.push((
                 (
                     r.src_ip(),
                     r.dst_ip(),
@@ -789,9 +819,12 @@ async fn conversations(
                     packets: r.packets(),
                     flows: r.flows(),
                 },
-            ))
+            ));
         },
         |a: &mut Agg, b: Agg| agg_add(a, &b),
+        unit_init,
+        unit_add,
+        unit_merge,
     )
     .map_err(|e| err(e.to_string()))?;
 
@@ -863,22 +896,40 @@ async fn anomalies(
     let top_n: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(100);
     let needed = query::rollup_needed(&f, &[by]);
 
-    // key -> bucket -> bytes. Nested per-key series can be large —
-    // sequential aggregate.
-    let mut series: HashMap<u128, HashMap<u64, u64>> = HashMap::new();
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        let k = query::dim_key(by, r);
-        *series
-            .entry(k)
-            .or_default()
-            .entry(r.bucket_ms())
-            .or_insert(0) += r.bytes();
-        ControlFlow::Continue(())
-    })
+    // key -> bucket -> bytes. Flattened to (key, bucket) pairs so the
+    // scan can run key-sharded in parallel; regrouped below. Each pair's
+    // complete aggregate lives in exactly one shard.
+    let (shards, _) = query::rollup_scan_sharded(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        &f,
+        bgflow_store::scan_threads(),
+        |r, out| {
+            out.push((
+                (query::dim_key(by, r), r.bucket_ms()),
+                Agg {
+                    bytes: r.bytes(),
+                    packets: r.packets(),
+                    flows: r.flows(),
+                },
+            ));
+        },
+        |a: &mut Agg, b: Agg| agg_add(a, &b),
+        unit_init,
+        unit_add,
+        unit_merge,
+    )
     .map_err(|e| err(e.to_string()))?;
+
+    let mut series: HashMap<u128, HashMap<u64, u64>> = HashMap::new();
+    for map in shards {
+        for ((k, b), a) in map {
+            *series.entry(k).or_default().entry(b).or_insert(0) += a.bytes;
+        }
+    }
 
     struct Anom {
         key: u128,

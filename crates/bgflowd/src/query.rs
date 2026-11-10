@@ -677,11 +677,15 @@ where
 /// shard: total memory equals a single sequential map, while decode and
 /// aggregation both run in parallel.
 ///
-/// `extract` maps a row to `(key, value)` (or `None` to skip); `add`
-/// merges a buffered value into the shard's entry for that key. Workers
-/// buffer per-shard batches so mutex acquisitions stay rare. Returns the
-/// shard maps — keys are partitioned, never duplicated across shards.
-pub fn rollup_scan_sharded<K, V>(
+/// `extract` pushes `(key, value)` pairs for a row into `out` (usually
+/// one; overview pushes one per top dimension); `add` merges a buffered
+/// value into the shard's entry for that key. `bounded_*` accumulate a
+/// small caller-defined state per worker (merged at the end) for
+/// aggregates that don't fit the key/value map — pass no-ops for `()`.
+/// Workers buffer per-shard batches so mutex acquisitions stay rare.
+/// Returns the shard maps (keys partitioned, never duplicated) plus the
+/// merged bounded state.
+pub fn rollup_scan_sharded<K, V, B>(
     ctx: &Ctx,
     set: RollupSet,
     from_ms: u64,
@@ -689,12 +693,16 @@ pub fn rollup_scan_sharded<K, V>(
     needed: &[usize],
     filter: &RollupFilter,
     shards: usize,
-    extract: impl Fn(&RollupRow) -> Option<(K, V)> + Sync,
+    extract: impl Fn(&RollupRow, &mut Vec<(K, V)>) + Sync,
     add: impl Fn(&mut V, V) + Sync,
-) -> Result<Vec<HashMap<K, V>>>
+    bounded_init: impl Fn() -> B + Sync,
+    bounded_add: impl Fn(&mut B, &RollupRow) + Sync,
+    bounded_merge: impl Fn(&mut B, B),
+) -> Result<(Vec<HashMap<K, V>>, B)>
 where
     K: Eq + std::hash::Hash + Send,
     V: Send,
+    B: Send,
 {
     use std::hash::Hasher;
 
@@ -717,7 +725,7 @@ where
     let maps: Vec<std::sync::Mutex<HashMap<K, V>>> =
         (0..shards).map(|_| std::sync::Mutex::new(HashMap::new())).collect();
 
-    let scan_res: Result<()> = std::thread::scope(|s| {
+    let scan_res: Result<B> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for chunk in idx.chunks(chunk_size) {
             let infos = Arc::clone(&infos);
@@ -727,13 +735,17 @@ where
             let filter = filter;
             let extract = &extract;
             let add = &add;
-            handles.push(s.spawn(move || -> Result<()> {
+            let bounded_init = &bounded_init;
+            let bounded_add = &bounded_add;
+            handles.push(s.spawn(move || -> Result<B> {
                 // Per-shard buffers: flushed into the shared maps in
                 // batches so lock hold time stays tiny.
                 const FLUSH_AT: usize = 2048;
+                let mut bstate = bounded_init();
+                let mut tmp: Vec<(K, V)> = Vec::with_capacity(8);
                 let mut bufs: Vec<Vec<(K, V)>> =
                     (0..shards).map(|_| Vec::new()).collect();
-                let mut flush = |bufs: &mut Vec<Vec<(K, V)>>| {
+                let flush = |bufs: &mut Vec<Vec<(K, V)>>| {
                     for (si, buf) in bufs.iter_mut().enumerate() {
                         if buf.is_empty() {
                             continue;
@@ -770,7 +782,10 @@ where
                         if !filter.matches(&row) {
                             continue;
                         }
-                        if let Some((k, v)) = extract(&row) {
+                        bounded_add(&mut bstate, &row);
+                        tmp.clear();
+                        extract(&row, &mut tmp);
+                        for (k, v) in tmp.drain(..) {
                             let mut h = std::collections::hash_map::DefaultHasher::new();
                             k.hash(&mut h);
                             let si = (h.finish() as usize) % shards;
@@ -782,21 +797,26 @@ where
                     }
                 }
                 flush(&mut bufs);
-                Ok(())
+                Ok(bstate)
             }));
         }
+        let mut bstate = bounded_init();
         for h in handles {
-            h.join()
+            let partial = h
+                .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("rollup scan worker panicked")))?;
+            bounded_merge(&mut bstate, partial);
         }
-        Ok(())
+        Ok(bstate)
     });
-    scan_res?;
+    let bstate = scan_res?;
 
-    Ok(maps
-        .into_iter()
-        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
-        .collect())
+    Ok((
+        maps.into_iter()
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .collect(),
+        bstate,
+    ))
 }
 
 // ---------------------------------------------------------------------------
