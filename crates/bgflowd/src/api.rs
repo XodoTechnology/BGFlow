@@ -1,21 +1,23 @@
 //! HTTP API (axum) + embedded UI serving.
 
+use crate::admin::AdminShared;
+use crate::auth::AuthState;
 use crate::config::Config;
 use crate::enrich::{HttpEnrichers, MmdbGeo};
 use crate::metrics::Metrics;
 use crate::query::{self, Ctx, FlowQuery, RollupFilter, RollupSet};
 use crate::writer::StatusSnapshot;
 use axum::{
-    extract::{Query, State},
-    http::{header, StatusCode},
+    extract::{ConnectInfo, Query, State},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use bgflow_types::ip_to_u128;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
 
@@ -26,6 +28,8 @@ pub struct AppState {
     pub http_enrich: Arc<HttpEnrichers>,
     pub geo: Arc<MmdbGeo>,
     pub config: Arc<Config>,
+    pub auth: Arc<AuthState>,
+    pub admin: Arc<AdminShared>,
 }
 
 type Q = HashMap<String, String>;
@@ -177,11 +181,19 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
 
 async fn status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let s = st.status.read().unwrap().clone();
+    let system = crate::sys::sample(&st.config.storage.data_dir);
     Json(serde_json::json!({
+        "version": env!("BGFLOW_VERSION_DISPLAY"),
+        "git": env!("BGFLOW_GIT_DESCRIBE"),
+        "system": system,
         "status": s,
         "orgs": st.ctx.orgs.len(),
         "rules": st.ctx.rules.len(),
         "inputs": st.config.inputs.iter().map(|i| i.listen.to_string()).collect::<Vec<_>>(),
+        "auth": {
+            "enabled": !st.auth.is_open(),
+            "users": st.auth.user_count(),
+        },
     }))
 }
 
@@ -829,6 +841,28 @@ async fn config_view(State(st): State<Arc<AppState>>) -> Json<serde_json::Value>
         if srv.contains_key("auth") {
             srv.insert("auth".into(), serde_json::json!("***"));
         }
+        if srv.contains_key("session_secret") {
+            srv.insert("session_secret".into(), serde_json::json!("***"));
+        }
+    }
+    // [[users]] password hashes must never leave the process.
+    if let Some(users) = v.get_mut("users").and_then(|u| u.as_array_mut()) {
+        for u in users.iter_mut() {
+            if let Some(o) = u.as_object_mut() {
+                if o.contains_key("password_hash") {
+                    o.insert("password_hash".into(), serde_json::json!("***"));
+                }
+            }
+        }
+    }
+    // Alert webhook URLs can embed tokens.
+    if let Some(url) = v
+        .get_mut("alerts")
+        .and_then(|a| a.get_mut("webhook_url"))
+    {
+        if !url.is_null() {
+            *url = serde_json::json!("***");
+        }
     }
     if let Some(arr) = v.get_mut("enrichers").and_then(|e| e.as_array_mut()) {
         for e in arr.iter_mut() {
@@ -898,7 +932,11 @@ fn openapi_spec() -> serde_json::Value {
             "/api/v1/lookup": {"get": {"summary": "Manual enrichment lookup", "parameters": [
                 {"name": "ip", "in": "query"},
             ]}},
-            "/api/v1/config": {"get": {"summary": "Effective config (redacted)"}},
+            "/api/v1/config": {"get": {"summary": "Effective config (redacted, admin only)"}},
+            "/api/v1/auth/login": {"post": {"summary": "Login → session cookie", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string"}}}}}}}},
+            "/api/v1/auth/logout": {"post": {"summary": "Logout (clears session cookie)"}},
+            "/api/v1/auth/me": {"get": {"summary": "Current identity or 401"}},
+            "/api/v1/admin/reload": {"post": {"summary": "Hot-reload rules/enrichers/users/alerts (admin)"}},
             "/metrics": {"get": {"summary": "Prometheus metrics"}},
         }
     })
@@ -914,6 +952,222 @@ async fn lookup(
 }
 
 // ---------------------------------------------------------------------------
+// Auth + admin endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+/// POST /api/v1/auth/login — JSON {username, password} → session cookie.
+async fn auth_login(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    let ip = peer.ip();
+    match st.auth.login(ip, &body.username, &body.password) {
+        Some(role) => {
+            let user = body.username.clone();
+            let token = st.auth.issue_token(&user, role);
+            let cookie = format!(
+                "bgflow_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+                token,
+                st.auth.session_ttl()
+            ) + if st.auth.secure_cookie { "; Secure" } else { "" };
+            (
+                StatusCode::OK,
+                [
+                    (header::SET_COOKIE, cookie),
+                    (header::CONTENT_TYPE, "application/json".to_string()),
+                ],
+                Json(serde_json::json!({"ok": true, "user": user, "role": role.as_str()})),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid credentials"})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/auth/logout — expire the session cookie.
+async fn auth_logout(State(st): State<Arc<AppState>>) -> Response {
+    let cookie = format!(
+        "bgflow_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        if st.auth.secure_cookie { "; Secure" } else { "" }
+    );
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({"ok": true})),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/auth/me — current identity. Exempt from middleware so the UI
+/// can probe auth state: {"auth":true,...} when logged in,
+/// {"auth":false,"open":true} when no auth is configured at all.
+async fn auth_me(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if st.auth.is_open() {
+        return Json(serde_json::json!({"auth": false, "open": true})).into_response();
+    }
+    let cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    let authz = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    match st.auth.identity_from_headers(cookie, authz) {
+        Some((user, role)) => Json(serde_json::json!({
+            "user": user, "role": role.as_str(), "auth": true,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"auth": false})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/admin/reload — hot-reload rules/enrichers/users/alerts.
+/// Admin role only (enforced by middleware path check).
+async fn admin_reload(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let rep = st.admin.reload();
+    Json(serde_json::to_value(&rep).unwrap_or(serde_json::json!({})))
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
+/// Paths reachable without authentication: health probes, metrics
+/// scrapers, the UI shell (it renders its own login form), and the auth
+/// endpoints themselves.
+fn auth_exempt(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/api/v1/health" | "/metrics" | "/api/v1/auth/login" | "/api/v1/auth/logout"
+            | "/api/v1/auth/me"
+    )
+}
+
+async fn auth_mw(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    if auth_exempt(&path) {
+        return next.run(req).await;
+    }
+    // Open mode: no users and no legacy auth configured.
+    if st.auth.is_open() {
+        return next.run(req).await;
+    }
+
+    let cookie = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let authz = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let ident = st.auth.identity_from_headers(cookie.as_deref(), authz.as_deref());
+
+    let Some((_user, role)) = ident else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"bgflow\"".to_string())],
+            Json(serde_json::json!({"error": "authentication required"})),
+        )
+            .into_response();
+    };
+
+    // Role checks: viewers are read-only; admin paths need admin.
+    let method = req.method().as_str().to_string();
+    if !AuthState::method_allowed(role, &method) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "viewer role is read-only"})),
+        )
+            .into_response();
+    }
+    if !role.is_admin() && AuthState::requires_admin(&path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin role required"})),
+        )
+            .into_response();
+    }
+
+    // CSRF hardening: mutating requests carrying a session cookie must come
+    // from our own origin (SameSite=Strict already blocks cross-site sends;
+    // this catches same-site subdomain tricks and non-browser clients that
+    // replay a stolen cookie).
+    if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+        if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            let host = req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let host_only = host.split(':').next().unwrap_or(host);
+            let origin_host = origin
+                .trim_end_matches('/')
+                .split("://")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("");
+            if !origin_host.is_empty() && !origin_host.eq_ignore_ascii_case(host_only) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "cross-origin request rejected"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    next.run(req).await
+}
+
+/// Baseline security headers on every response.
+async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    h.insert(
+        header::REFERRER_POLICY,
+        "strict-origin-when-cross-origin".parse().unwrap(),
+    );
+    // The UI is a single embedded file with inline script/style, so CSP
+    // allows 'unsafe-inline' — its real value is blocking external loads.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    res
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -921,75 +1175,6 @@ const UI_HTML: &str = include_str!("../ui/index.html");
 
 async fn index() -> Html<&'static str> {
     Html(UI_HTML)
-}
-
-/// Optional HTTP basic auth ("user:pass" in config).
-async fn auth_mw(
-    State(st): State<Arc<AppState>>,
-    req: axum::extract::Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let Some(expected) = &st.config.server.auth else {
-        return Ok(next.run(req).await);
-    };
-    // Exempt health + metrics for scrapers/monitors.
-    let path = req.uri().path();
-    if path == "/api/v1/health" || path == "/metrics" {
-        return Ok(next.run(req).await);
-    }
-    let ok = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic "))
-        .and_then(|b64| decode_b64(b64).ok())
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned() == *expected)
-        .unwrap_or(false);
-    if ok {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
-fn decode_b64(s: &str) -> Result<Vec<u8>, ()> {
-    const T: &[u8; 256] = &{
-        let mut t = [255u8; 256];
-        let mut i = 0u8;
-        while i < 26 {
-            t[b'A' as usize + i as usize] = i;
-            t[b'a' as usize + i as usize] = 26 + i;
-            i += 1;
-        }
-        let mut j = 0u8;
-        while j < 10 {
-            t[b'0' as usize + j as usize] = 52 + j;
-            j += 1;
-        }
-        t[b'+' as usize] = 62;
-        t[b'/' as usize] = 63;
-        t
-    };
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut nbits = 0u32;
-    for &b in bytes {
-        if b == b'=' || b == b'\n' || b == b'\r' {
-            continue;
-        }
-        let v = T[b as usize];
-        if v == 255 {
-            return Err(());
-        }
-        acc = (acc << 6) | v as u32;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    Ok(out)
 }
 
 pub fn router(st: Arc<AppState>) -> Router {
@@ -1011,6 +1196,10 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/label_stats", get(label_stats))
         .route("/api/v1/config", get(config_view))
         .route("/api/v1/openapi.json", get(openapi))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
+        .route("/api/v1/auth/me", get(auth_me))
+        .route("/api/v1/admin/reload", post(admin_reload))
         .route("/metrics", get(metrics_handler));
 
     let cors_enabled = st.config.server.cors;
@@ -1018,10 +1207,37 @@ pub fn router(st: Arc<AppState>) -> Router {
         .merge(api)
         .route("/", get(index))
         .with_state(st.clone())
-        .layer(middleware::from_fn_with_state(st, auth_mw));
+        // Order matters: last .layer() is outermost. security_headers wraps
+        // auth_mw so even 401/403 responses carry the baseline headers; CORS
+        // is outermost so preflights bypass auth entirely.
+        .layer(middleware::from_fn_with_state(st.clone(), auth_mw))
+        .layer(middleware::from_fn(security_headers));
 
     if cors_enabled {
-        app.layer(tower_http::cors::CorsLayer::permissive())
+        if st.config.server.cors_origins.is_empty() {
+            tracing::warn!("server.cors=true with no cors_origins — wide-open CORS (dev only!)");
+            app.layer(tower_http::cors::CorsLayer::permissive())
+        } else {
+            let origins: Vec<_> = st
+                .config
+                .server
+                .cors_origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            app.layer(
+                tower_http::cors::CorsLayer::new()
+                    .allow_origin(origins)
+                    .allow_methods([
+                        Method::GET,
+                        Method::POST,
+                        Method::OPTIONS,
+                        Method::HEAD,
+                    ])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+                    .allow_credentials(true),
+            )
+        }
     } else {
         app
     }

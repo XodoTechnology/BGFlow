@@ -64,6 +64,15 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 .err{color:var(--red)}
 #toast{position:fixed;right:18px;bottom:18px;background:#3a1520;border:1px solid var(--red);color:#fecaca;padding:10px 16px;border-radius:8px;font-size:12.5px;max-width:440px;z-index:99;opacity:0;transform:translateY(8px);transition:.25s;pointer-events:auto;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.5)}
 #toast.show{opacity:1;transform:none}
+#login{position:fixed;inset:0;background:radial-gradient(1200px 600px at 50% -10%,#16233c 0%,var(--bg) 60%);display:flex;align-items:center;justify-content:center;z-index:100}
+#login .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:34px 34px 26px;width:350px;box-shadow:0 18px 60px rgba(0,0,0,.55)}
+#login .logo{justify-content:center;margin-bottom:4px}
+#login input{width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:11px 13px;border-radius:8px;font-size:14px;margin:7px 0 4px;font-family:inherit}
+#login input:focus{outline:none;border-color:var(--accent)}
+#login .err{color:var(--red);font-size:12.5px;min-height:20px;margin:4px 0 10px}
+.userbox{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-left:auto}
+.rolebadge{padding:1px 9px;border-radius:10px;font-size:10.5px;font-weight:700;letter-spacing:.4px;background:#1d2b45;color:var(--accent2);text-transform:uppercase}
+.rolebadge.admin{background:#3b1d4e;color:#e879f9}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:#2a3345;border-radius:5px}
 </style>
@@ -83,7 +92,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <a data-v="labels">⚑ Labels &amp; Enrichment</a>
     <a data-v="metrics">∿ Metrics</a>
   </nav>
-  <div class="foot">BGFlow v0.2<br><span id="ver"></span></div>
+  <div class="foot">BGFlow<br><span id="ver"></span></div>
 </div>
 <div id="main">
   <div id="topbar">
@@ -97,6 +106,12 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <input id="fromin" placeholder="from (e.g. -1h)" style="display:none;min-width:130px">
     <input id="toin" placeholder="to" style="display:none;min-width:130px">
     <span style="flex:1"></span>
+    <span class="chip" id="syschip" style="cursor:default;font-family:var(--mono);font-size:11.5px" title="host resources">…</span>
+    <span class="userbox" id="userbox" style="display:none;margin-left:0">
+      <span class="rolebadge" id="rolebadge"></span><span id="uname"></span>
+      <button class="btn ghost" id="btnreload" style="display:none;padding:4px 10px;font-size:11.5px" title="Hot-reload config (admin)">⟳ cfg</button>
+      <button class="btn ghost" style="padding:4px 10px;font-size:11.5px" onclick="doLogout()">Logout</button>
+    </span>
     <span id="ratetick" class="muted" style="font-family:var(--mono);font-size:12px"></span>
     <span id="upd" class="muted" style="font-size:11.5px"></span>
     <select id="refsel" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:4px 8px;border-radius:6px;font-size:12px">
@@ -109,6 +124,16 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <button class="btn ghost" onclick="load()">⟳ Refresh</button>
   </div>
   <div id="content"></div>
+</div>
+<div id="login" style="display:none">
+  <div class="card">
+    <div class="logo"><span class="lg"><svg width="30" height="30" viewBox="0 0 26 26"><rect x="0.5" y="0.5" width="25" height="25" rx="7" fill="#0e1420" stroke="#232b3a"/><circle cx="6.5" cy="8.5" r="2.2" fill="#22d3ee"/><circle cx="6.5" cy="17.5" r="2.2" fill="#22d3ee"/><circle cx="19.5" cy="13" r="2.8" fill="#3b82f6"/><path d="M8.7 8.5 C13 8.5 13.5 13 16.7 13" stroke="#22d3ee" stroke-width="1.5" fill="none" opacity=".85"/><path d="M8.7 17.5 C13 17.5 13.5 13 16.7 13" stroke="#3b82f6" stroke-width="1.5" fill="none" opacity=".85"/></svg></span>BG<span>Flow</span></div>
+    <div class="muted" style="text-align:center;font-size:12.5px;margin:2px 0 16px">Sign in to continue</div>
+    <input id="lu" placeholder="Username" autocomplete="username">
+    <input id="lp" type="password" placeholder="Password" autocomplete="current-password">
+    <div class="err" id="lerr"></div>
+    <button class="btn" style="width:100%" onclick="doLogin()">Sign in</button>
+  </div>
 </div>
 <script>
 "use strict";
@@ -124,15 +149,57 @@ function fmtN(n){if(n==null)return'-';return Number(n).toLocaleString()}
 function fmtT(ms){const d=new Date(ms);return d.toLocaleTimeString()+ ' '+d.toLocaleDateString()}
 function ago(ms){if(!ms)return'-';const s=(Date.now()-ms)/1000;if(s<60)return Math.floor(s)+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'}
 const API_TIMEOUT=20000;
+let ME=null; // {user,role,auth} or {open:true}
+function showLogin(){$('#login').style.display='flex';setTimeout(()=>$('#lu')?.focus(),50)}
 async function api(p){
   const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),API_TIMEOUT);
   let r;
   try{r=await fetch(p,{signal:ctl.signal})}
   catch(e){clearTimeout(to);throw new Error(e.name==='AbortError'?'request timed out ('+API_TIMEOUT/1000+'s)':e.message)}
   clearTimeout(to);
+  if(r.status===401&&ME&&!ME.open){showLogin();throw new Error('authentication required')}
   if(!r.ok)throw new Error(await r.text());
   return r.json();
 }
+async function probeAuth(){
+  try{
+    const r=await fetch('/api/v1/auth/me',{signal:AbortSignal.timeout(8000)});
+    const d=await r.json();
+    if(d.auth){ME=d;showUser();loadExpNames();startAuto();load()}
+    else if(d.open){ME={open:true};loadExpNames();startAuto();load()}
+    else showLogin();
+  }catch(e){showLogin()}
+}
+function showUser(){
+  $('#userbox').style.display='flex';
+  $('#uname').textContent=ME.user||'';
+  const rb=$('#rolebadge');rb.textContent=ME.role||'';rb.className='rolebadge'+(ME.role==='admin'?' admin':'');
+  if(ME.role==='admin')$('#btnreload').style.display='';
+}
+async function doLogin(){
+  const u=$('#lu').value.trim(),p=$('#lp').value,lerr=$('#lerr');
+  lerr.textContent='';
+  try{
+    const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p}),signal:AbortSignal.timeout(15000)});
+    if(!r.ok){const d=await r.json().catch(()=>({}));lerr.textContent=d.error||('login failed ('+r.status+')');return}
+    const d=await r.json();ME=d;$('#login').style.display='none';showUser();loadExpNames();startAuto();load();
+  }catch(e){lerr.textContent='request failed: '+e.message}
+}
+async function doLogout(){
+  try{await fetch('/api/v1/auth/logout',{method:'POST',signal:AbortSignal.timeout(8000)})}catch(e){}
+  location.reload();
+}
+async function doReload(){
+  try{
+    const r=await fetch('/api/v1/admin/reload',{method:'POST',signal:AbortSignal.timeout(20000)});
+    const d=await r.json();
+    toast(d.ok?('Config reloaded: '+d.rules+' rules, '+d.enrichers+' enrichers, '+d.users+' users, '+d.alert_rules+' alerts')
+             :('Reload errors: '+(d.errors||[]).join('; ')),d.ok?5000:9000);
+  }catch(e){toast('Reload failed: '+e.message)}
+}
+$('#lp')?.addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
+$('#lu')?.addEventListener('keydown',e=>{if(e.key==='Enter')$('#lp').focus()});
+$('#btnreload')?.addEventListener('click',doReload);
 function toast(msg,ms=9000){
   let t=$('#toast');
   if(!t){t=document.createElement('div');t.id='toast';document.body.appendChild(t);
@@ -663,8 +730,27 @@ async function vMetrics(){
   content.innerHTML=`<div class="panel"><h3>Prometheus Metrics</h3><pre>${esc(t)}</pre></div>`;
 }
 
-fetch('/api/v1/status').then(r=>r.json()).then(d=>{$('#ver').textContent='uptime '+Math.floor(d.status.uptime_secs/60)+'m'}).catch(()=>{});
-loadExpNames();startAuto();load();
+function fmtUp(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h'}
+function refreshSys(){
+  fetch('/api/v1/status',{signal:AbortSignal.timeout(8000)}).then(r=>r.json()).then(d=>{
+    const el=$('#syschip');if(!el)return;
+    const sy=d.system||{};
+    if(!sy.ok){el.textContent='sys n/a';el.title='system stats unavailable on this platform';return}
+    const cpu=sy.cpu_pct==null?'—':sy.cpu_pct.toFixed(0)+'%';
+    const mem=sy.mem_pct==null?'—':sy.mem_pct.toFixed(0)+'%';
+    const dsk=sy.disk_pct==null?'—':sy.disk_pct.toFixed(0)+'%';
+    el.textContent=`CPU ${cpu} · MEM ${mem} · DSM ${dsk}`;
+    const st=d.status||{};
+    const stored=fmtB((st.flow_bytes||0)+(st.rollup_bytes||0)+(st.hourly_bytes||0));
+    el.title=`cpu ${cpu} of ${sy.cpu_count||'?'} cores · load ${sy.load1?.toFixed(2)??'—'}/${sy.load5?.toFixed(2)??'—'}/${sy.load15?.toFixed(2)??'—'}\n`
+      +`mem ${fmtB((sy.mem_used_mb||0)*1048576)} / ${fmtB((sy.mem_total_mb||0)*1048576)}\n`
+      +`disk ${sy.disk_path||''}: ${sy.disk_avail_gb??'?'}G free of ${sy.disk_total_gb??'?'}G\n`
+      +`bgflow stored: ${stored} (${st.flow_segments||0}f/${st.rollup_segments||0}r/${st.hourly_segments||0}h segs)`;
+    const ver=$('#ver');if(ver&&d.version){ver.textContent=`${d.version} · up ${fmtUp(st.uptime_secs||0)}`;ver.title='git: '+(d.git||'')}
+  }).catch(()=>{});
+}
+setInterval(refreshSys,10000);refreshSys();
+probeAuth();
 </script>
 </body>
 </html>

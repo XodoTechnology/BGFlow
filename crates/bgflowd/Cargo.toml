@@ -26,3 +26,9 @@ reqwest = { workspace = true }
 socket2 = "0.5"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.8"
+libc = "0.2.191"

@@ -89,20 +89,32 @@ fn op_holds(op: &str, value: f64, threshold: f64) -> bool {
 }
 
 /// Spawn the evaluation loop. Runs until the process exits.
-pub async fn run(cfg: AlertsConfig, ctx: Ctx, metrics: Arc<Metrics>) {
-    if cfg.items.is_empty() {
-        return;
+/// `cfg` is shared so admin reload / SIGHUP can swap rules live; the loop
+/// re-reads it every tick (1s granularity, eval gated by eval_secs).
+pub async fn run(cfg: Arc<std::sync::RwLock<AlertsConfig>>, ctx: Ctx, metrics: Arc<Metrics>) {
+    let n = cfg.read().unwrap().items.len();
+    if n == 0 {
+        tracing::info!("alerts: no rules configured (reloadable via SIGHUP/admin API)");
+    } else {
+        tracing::info!("alerts: {} rule(s) configured", n);
     }
-    tracing::info!("alerts: {} rule(s), eval every {}s", cfg.items.len(), cfg.eval_secs);
     let fired: Arc<Mutex<FiredMap>> = Arc::new(Mutex::new(HashMap::new()));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_default();
-    let mut tick = tokio::time::interval(Duration::from_secs(cfg.eval_secs.max(10)));
+    let mut last_run = 0u64;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
-        evaluate(&cfg, &ctx, &metrics, &fired, &client).await;
+        let snap = cfg.read().unwrap().clone();
+        let iv = snap.eval_secs.max(10) * 1000;
+        let now = now_ms();
+        if now.saturating_sub(last_run) < iv {
+            continue;
+        }
+        last_run = now;
+        evaluate(&snap, &ctx, &metrics, &fired, &client).await;
     }
 }
 

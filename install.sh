@@ -124,6 +124,8 @@ Group=$USER_NAME
 ExecStart=$BINDIR/bgflowd --config $SYSCONFDIR/bgflow.toml
 Restart=on-failure
 RestartSec=5
+# SIGHUP reloads rules/enrichers/users/alerts without dropping ingest.
+ExecReload=/bin/kill -HUP \$MAINPID
 LimitNOFILE=1048576
 # Hardening
 NoNewPrivileges=true

@@ -4,12 +4,42 @@
 [server]
 # HTTP API + embedded UI listen address.
 http_listen = "0.0.0.0:8080"
-# Optional basic auth for UI/API: "user:password"
+# --- Authentication ---------------------------------------------------------
+# Two ways to protect the UI/API:
+#
+# 1) Multi-user (recommended): [[users]] entries with PBKDF2 password hashes
+#    and roles (admin | viewer). Generate a hash with:
+#        bgflowd hash-password        # prompts on stdin, prints the hash
+#    Then:
+#        [[users]]
+#        name = "admin"
+#        password_hash = "pbkdf2-sha256$600000$...."
+#        role = "admin"
+#    Viewers get read-only access to all data endpoints; admins additionally
+#    get /api/v1/config, /api/v1/enrichers, and POST /api/v1/admin/reload.
+#    The UI shows a login page; API clients can use the session cookie or
+#    HTTP Basic auth with the same credentials.
+#
+# 2) Legacy single credential (everything = admin):
+#    auth = "admin:change-me"
+#
 # auth = "admin:change-me"
-# Allow cross-origin API access (UI is same-origin; off by default)
+#
+# Session cookies: HttpOnly + SameSite=Strict (+ Secure when TLS is on).
+# session_secret signs session tokens — leave unset for a random per-boot
+# key (sessions die on restart, which is usually what you want); set a long
+# random string to keep sessions across restarts.
+# session_secret = "change-me-long-random"
+# session_ttl_secs = 86400
+#
+# Allow cross-origin API access (UI is same-origin; off by default).
+# cors = true plus cors_origins restricts CORS to those origins (credentials
+# allowed). cors = true with no origins = wide open (dev only!).
 # cors = false
+# cors_origins = ["https://flows.example.com"]
 # TLS: serve HTTPS directly (both required; otherwise plain HTTP).
-# tls_cert = "/etc/bgflow/tls.crt"
+# Strongly recommended when auth is enabled — passwords and session
+# cookies are plaintext over HTTP. tls_cert = "/etc/bgflow/tls.crt"
 # tls_key  = "/etc/bgflow/tls.key"
 
 [storage]
@@ -177,6 +207,16 @@ dst_port = 53
 # [exporter_names]
 # "10.0.0.1" = "edge-rtr-1"
 # "10.0.0.2" = "core-rtr"
+
+# [[users]]
+# name = "admin"
+# password_hash = "pbkdf2-sha256$600000$<salt_b64>$<hash_b64>"
+# role = "admin"          # admin | viewer (viewer = read-only)
+#
+# [[users]]
+# name = "noc-viewer"
+# password_hash = "pbkdf2-sha256$600000$<salt_b64>$<hash_b64>"
+# role = "viewer"
 
 # --- Demo traffic -------------------------------------------------------------
 # Send synthetic NetFlow v5 + IPFIX(IPv6) to the first input — handy for

@@ -35,11 +35,18 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   country, label, IP version, exporter), per-label stats, z-score anomaly
   detection, country heat view, CSV export, OpenAPI spec.
 - **Prometheus metrics** at `/metrics` (incl. per-exporter stats).
+- **Multi-user auth** — `[[users]]` with PBKDF2 password hashes, `admin`/
+  `viewer` roles, session-cookie login UI, HTTP Basic for API clients,
+  per-IP login throttling, security headers. Legacy `server.auth` basic
+  auth still supported.
 - **Embedded UI** — dark, Elastiflow-style SPA: dashboard, flow explorer with
   click-to-filter, top talkers, country heatmap with flags, **Sankey flow
   map**, conversations, anomalies, exporters, labels, metrics, saved filter
-  presets, live auto-refresh.
-- **Ops** — `bgflowd doctor` (segment CRC verification), deep `/health`,
+  presets, live auto-refresh, login page, host CPU/RAM/disk stats, git
+  build version.
+- **Ops** — `bgflowd doctor` (segment CRC verification), `bgflowd backup`
+  (CRC-verified data-dir snapshots), `bgflowd config-check`,
+  `bgflowd hash-password`, `POST /api/v1/admin/reload`, deep `/health`,
   SIGHUP config reload, optional TLS, UDP buffer sizing, TCP conn limits.
 - **Low resource use** — a few % CPU and tens of MB RAM at moderate rates.
 
@@ -73,6 +80,60 @@ Verify stored segment integrity at any time:
 bgflowd doctor    # CRC-checks every .bfs segment under data_dir
 ```
 
+### Authentication & users
+
+Protect the UI/API with `[[users]]` — PBKDF2-SHA256 password hashes and
+roles. Generate a hash first:
+
+```bash
+bgflowd hash-password        # prompts for the password on stdin
+# or: bgflowd hash-password --password 'secret'
+```
+
+```toml
+[[users]]
+name = "admin"
+password_hash = "pbkdf2-sha256$600000$...."
+role = "admin"               # admin | viewer
+```
+
+- **admin** — everything, including `/api/v1/config`,
+  `/api/v1/enrichers`, and `POST /api/v1/admin/reload`.
+- **viewer** — read-only access to all data endpoints (GET/HEAD only).
+- The UI shows a login page when auth is configured; API clients can use
+  the session cookie **or** HTTP Basic auth with the same credentials.
+- Login attempts are throttled per source IP (5 failures → lockout).
+- Session cookies are `HttpOnly` + `SameSite=Strict` (+ `Secure` under TLS).
+  `server.session_secret` pins the signing key across restarts; unset =
+  random per boot.
+- Legacy single-credential mode still works: `server.auth = "user:pass"`
+  (always admin). Prefer `[[users]]` for anything beyond a toy deployment.
+- `/api/v1/health` and `/metrics` stay unauthenticated for scrapers —
+  keep them off the public internet or front them with your proxy.
+
+**Public deployments:** set `server.tls_cert`/`tls_key` (or terminate TLS
+at a reverse proxy) — without TLS, passwords and session cookies cross the
+network in plaintext. `bgflowd` logs a loud warning when auth is enabled
+on a non-loopback address without TLS.
+
+### Backups & administration
+
+```bash
+bgflowd backup [--dest /path]   # CRC-verified copy of the data dir
+bgflowd config-check            # validate bgflow.toml without starting
+bgflowd doctor                  # verify segment integrity
+```
+
+`backup` copies all `.bfs` segments and re-verifies each one's CRC,
+retrying files caught mid-flush — safe to run while `bgflowd` is live.
+To restore, stop the daemon, point `storage.data_dir` at the backup
+(e.g. via `BGFLOW_DATA_DIR`), and start it. Rollups rebuild is *not*
+needed — segments are the source of truth.
+
+`POST /api/v1/admin/reload` (admin only) hot-reloads label rules,
+enrichers, exporter names, users, and alert rules — same as `SIGHUP`.
+The UI shows a `⟳ cfg` button for admins.
+
 ## Build from source
 
 ```bash
@@ -91,8 +152,18 @@ Requires Rust 1.88+ (developed on 1.99).
 ```toml
 [server]
 http_listen = "0.0.0.0:8080"
-# auth = "user:password"        # optional HTTP basic auth
+# Multi-user auth (recommended for anything beyond localhost):
+# [[users]]
+# name = "admin"
+# password_hash = "pbkdf2-sha256$600000$...."   # bgflowd hash-password
+# role = "admin"                                # admin | viewer
+# Legacy single credential (admin-only):
+# auth = "user:password"
 # cors = true                   # optional CORS for API access
+# cors_origins = ["https://flows.example.com"]  # restrict + credentials
+# session_secret = "long-random-string"         # pin session keys
+# tls_cert = "/etc/bgflow/tls.crt"              # HTTPS
+# tls_key  = "/etc/bgflow/tls.key"
 
 [storage]
 data_dir = "/var/lib/bgflow"
@@ -167,11 +238,15 @@ Rule match fields (all ANDed): `proto`, `src_port`, `dst_port`, `src_ip`,
 | `GET /api/v1/labels` | Configured label rules |
 | `GET /api/v1/enrichers` | Enricher backends + cache/table stats |
 | `GET /api/v1/lookup?ip=` | Cached enrichment detail for an IP |
-| `GET /api/v1/config` | Effective config (secrets redacted) |
+| `GET /api/v1/config` | Effective config (secrets redacted, admin only) |
 | `GET /api/v1/openapi.json` | OpenAPI 3.0 spec |
-| `GET /api/v1/status` | Daemon/storage status |
-| `GET /api/v1/health` | Deep health: writer liveness, buffers, flush age |
-| `GET /metrics` | Prometheus exposition |
+| `GET /api/v1/status` | Daemon/storage status + version + host CPU/RAM/disk |
+| `GET /api/v1/health` | Deep health: writer liveness, buffers, flush age (unauthenticated) |
+| `POST /api/v1/auth/login` | Login → session cookie (throttled per IP) |
+| `POST /api/v1/auth/logout` | Clear session cookie |
+| `GET /api/v1/auth/me` | Current identity / auth state probe |
+| `POST /api/v1/admin/reload` | Hot-reload rules/enrichers/users/alerts (admin) |
+| `GET /metrics` | Prometheus exposition (unauthenticated) |
 
 Rollup-backed endpoints (`summary`, `timeseries`, `top`, `conversations`,
 `anomalies`, `label_stats`) accept `granularity=hourly` to query the coarse

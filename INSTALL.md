@@ -99,7 +99,7 @@ flow monitor BM
 
 ```bash
 curl http://localhost:8080/api/v1/health        # ok
-curl http://localhost:8080/api/v1/status       # storage stats
+curl http://localhost:8080/api/v1/status       # storage + host stats
 curl http://localhost:8080/metrics | head      # prometheus
 open http://localhost:8080                     # UI
 ```
@@ -109,6 +109,46 @@ Try the built-in demo while learning the UI:
 ```bash
 bgflowd --demo 127.0.0.1:2055 --demo-pps 20 --demo-secs 300
 ```
+
+## Securing a public deployment
+
+If the UI/API will be reachable beyond localhost, **set up auth before
+exposing it** — `bgflowd` logs a warning when it detects this:
+
+```bash
+# 1. Create users (prompts for password on stdin):
+bgflowd hash-password
+
+# 2. Paste the printed hash into /etc/bgflow/bgflow.toml:
+sudoedit /etc/bgflow/bgflow.toml
+#   [[users]]
+#   name = "admin"
+#   password_hash = "pbkdf2-sha256$600000$...."
+#   role = "admin"
+
+# 3. Reload without restart (as an existing admin, or via SIGHUP):
+sudo systemctl reload bgflowd     # or: sudo kill -HUP $(pidof bgflowd)
+#    — or use the UI's "⟳ cfg" button / POST /api/v1/admin/reload
+```
+
+Then terminate TLS — either directly (`server.tls_cert`/`tls_key`) or at
+your reverse proxy (Caddy/nginx/Traefik). Without TLS, passwords and
+session cookies are plaintext on the wire.
+
+## Backups
+
+```bash
+# Live-safe, CRC-verified snapshot of the data dir:
+bgflowd backup --dest /mnt/backups/bgflow
+# or: bgflowd backup            # ./bgflow-backup-<timestamp>
+
+# Validate the config any time:
+bgflowd config-check --config /etc/bgflow/bgflow.toml
+```
+
+Restore: stop `bgflowd`, point `storage.data_dir` (or `BGFLOW_DATA_DIR`)
+at the backup directory, start it. Segments are self-describing — no
+rebuild step needed.
 
 ## Uninstall
 
