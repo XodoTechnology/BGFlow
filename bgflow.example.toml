@@ -40,6 +40,11 @@ protocol = "auto"
 # transport = "udp"        # udp | tcp | both  (tcp = IPFIX stream only)
 # Optional exporter allowlist:
 # allowed_exporters = ["10.0.0.1", "10.0.0.2"]
+# UDP receive buffer bytes — raise for busy routers (OS default ~200KB
+# drops bursts). 4-16MB recommended on real deployments:
+# udp_buffer_bytes = 8388608
+# Max concurrent TCP connections (tcp/both only; 0 = unlimited):
+# max_connections = 1024
 
 # IPFIX over TCP example:
 # [[inputs]]
@@ -73,6 +78,9 @@ country = "$.country"
 # Any extra fields are queryable via /api/v1/lookup?ip=
 # handle = "$.handle"
 # irr_as_set = "$.as_set"
+# Optional auth/API-key headers for private backends:
+# [enrichers.headers]
+# Authorization = "Bearer your-token"
 
 # [[enrichers]]
 # type = "http"

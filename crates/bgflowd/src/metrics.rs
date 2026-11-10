@@ -47,6 +47,12 @@ impl Metrics {
         self.records.fetch_add(records as u64, Ordering::Relaxed);
         self.bytes_in.fetch_add(payload_len as u64, Ordering::Relaxed);
         let mut map = self.exporters.lock().unwrap();
+        // Bound per-exporter cardinality: spoofed UDP sources must not grow
+        // this map (and the /metrics label set) without limit.
+        const MAX_EXPORTERS: usize = 10_000;
+        if !map.contains_key(&src) && map.len() >= MAX_EXPORTERS {
+            return;
+        }
         let e = map.entry(src).or_default();
         e.datagrams += 1;
         e.records += records as u64;

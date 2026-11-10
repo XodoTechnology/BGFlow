@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 pub struct IngestShared {
     pub geo: Arc<MmdbGeo>,
@@ -95,11 +95,26 @@ async fn run_udp(
     shared: IngestShared,
 ) -> anyhow::Result<()> {
     let hint: ProtoHint = proto_hint(&cfg.protocol);
-    let sock = UdpSocket::bind(cfg.listen).await?;
+    let sock = if cfg.udp_buffer_bytes > 0 {
+        // Flow exports can arrive in bursts far above the OS default
+        // (~200KB) socket buffer — give the kernel room to absorb them.
+        let s = socket2::Socket::new(
+            socket2::Domain::for_address(cfg.listen),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        s.set_recv_buffer_size(cfg.udp_buffer_bytes)?;
+        s.bind(&cfg.listen.into())?;
+        s.set_nonblocking(true)?;
+        UdpSocket::from_std(s.into())?
+    } else {
+        UdpSocket::bind(cfg.listen).await?
+    };
     tracing::info!(
-        "ingest: udp listening on {} (protocol={})",
+        "ingest: udp listening on {} (protocol={}, rcvbuf={}B)",
         cfg.listen,
-        cfg.protocol
+        cfg.protocol,
+        if cfg.udp_buffer_bytes > 0 { cfg.udp_buffer_bytes } else { 0 }
     );
 
     let mut buf = vec![0u8; 65535];
@@ -146,6 +161,13 @@ async fn run_tcp(
     let listener = TcpListener::bind(cfg.listen).await?;
     tracing::info!("ingest: tcp listening on {} (ipfix)", cfg.listen);
     let allowed: Vec<IpAddr> = cfg.allowed_exporters.clone();
+    // Bound concurrent connections so a hostile/buggy peer can't exhaust
+    // tasks+memory. 0 = unlimited.
+    let conn_sem = Arc::new(Semaphore::new(if cfg.max_connections == 0 {
+        usize::MAX
+    } else {
+        cfg.max_connections
+    }));
 
     loop {
         let (sock, peer) = match listener.accept().await {
@@ -159,9 +181,15 @@ async fn run_tcp(
             drop(sock);
             continue;
         }
+        // try_acquire: shed load instantly rather than queueing accepts.
+        let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+            tracing::warn!("tcp {}: connection limit reached, dropping {}", cfg.listen, peer);
+            continue;
+        };
         let tx = tx.clone();
         let sh = shared.clone_sh();
         tokio::spawn(async move {
+            let _permit = permit; // held until the connection task ends
             if let Err(e) = handle_tcp_conn(sock, peer.ip(), tx, sh).await {
                 tracing::debug!("tcp conn {} ended: {}", peer, e);
             }

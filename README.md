@@ -50,6 +50,12 @@ bgflowd --demo 127.0.0.1:2055 --demo-secs 60
 # then browse http://localhost:8080
 ```
 
+Verify stored segment integrity at any time:
+
+```bash
+bgflowd doctor    # CRC-checks every .bfs segment under data_dir
+```
+
 ## Build from source
 
 ```bash
@@ -85,7 +91,16 @@ country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
 [[inputs]]
 listen = "0.0.0.0:2055"
 protocol = "auto"               # auto|netflow5|netflow9|ipfix|sflow
+# transport = "udp"             # udp | tcp | both (tcp = IPFIX only)
 # allowed_exporters = ["10.0.0.1"]
+# udp_buffer_bytes = 8388608    # SO_RCVBUF — raise for busy routers
+# max_connections = 1024        # TCP conn cap (tcp/both only)
+
+# IPFIX over TCP:
+# [[inputs]]
+# listen = "0.0.0.0:4739"
+# protocol = "ipfix"
+# transport = "tcp"
 
 # --- HTTP enrichment backends (whois/RDAP/IRR, e.g. irrd3.net) ---
 [[enrichers]]
@@ -99,6 +114,9 @@ asn = "$.asn"
 org = "$.org"
 country = "$.country"
 handle = "$.handle"             # extra fields -> lookup API
+# Optional auth/API-key headers for private backends:
+# [enrichers.headers]
+# Authorization = "Bearer token"
 
 # --- Label rules (first match wins) ---
 [[rules]]
@@ -119,7 +137,7 @@ Rule match fields (all ANDed): `proto`, `src_port`, `dst_port`, `src_ip`,
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/flows` | Raw flows — `from,to,src,dst,proto,sport,dport,exporter,src_asn,dst_asn,label,limit,order` |
+| `GET /api/v1/flows` | Raw flows — `from,to,src,dst,proto,sport,dport,exporter,src_asn,dst_asn,label,limit,offset,order` |
 | `GET /api/v1/summary` | Totals + per-protocol breakdown over rollups |
 | `GET /api/v1/timeseries` | `bucket=1m|5m|15m|1h|6h|1d` bytes/packets/flows series |
 | `GET /api/v1/top` | `by=src_ip,dst_ip,src_asn,dst_asn,src_port,dst_port,proto,exporter,src_country,dst_country` |

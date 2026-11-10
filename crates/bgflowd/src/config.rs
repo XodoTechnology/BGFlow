@@ -95,6 +95,12 @@ pub struct InputConfig {
     pub transport: String,
     /// Only accept datagrams/connections from these exporter IPs (empty = all).
     pub allowed_exporters: Vec<std::net::IpAddr>,
+    /// UDP socket receive buffer in bytes (SO_RCVBUF). 0 = OS default
+    /// (~200KB — too small for busy routers; 4-16MB recommended).
+    pub udp_buffer_bytes: usize,
+    /// Max concurrent TCP connections on this input (0 = unlimited).
+    /// Only applies to transport tcp/both.
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +122,10 @@ pub struct EnricherConfig {
     /// Dot-path into the JSON response for each field.
     /// e.g. asn = "$.data.asn", org = "$.data.org", country = "$.data.country"
     pub fields: HttpFields,
+    /// Extra HTTP headers sent with every request, e.g.
+    /// `Authorization = "Bearer ..."` or an API key header for your backend.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -137,6 +147,7 @@ impl Default for EnricherConfig {
             timeout_ms: 2000,
             cache_ttl_secs: 86400,
             fields: HttpFields::default(),
+            headers: std::collections::HashMap::new(),
         }
     }
 }
@@ -194,6 +205,8 @@ impl Default for Config {
                 protocol: "auto".into(),
                 transport: "udp".into(),
                 allowed_exporters: vec![],
+                udp_buffer_bytes: 0,
+                max_connections: 1024,
             }],
             enrichers: vec![],
             rules: vec![],
@@ -242,6 +255,8 @@ impl Default for InputConfig {
             protocol: "auto".into(),
             transport: "udp".into(),
             allowed_exporters: vec![],
+            udp_buffer_bytes: 0,
+            max_connections: 1024,
         }
     }
 }

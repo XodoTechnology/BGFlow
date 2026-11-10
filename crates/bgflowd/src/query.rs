@@ -75,6 +75,8 @@ pub struct FlowQuery {
     pub dst_asn: Option<u32>,
     pub label: Option<u32>,
     pub limit: usize,
+    /// Skip this many matching rows before collecting (pagination).
+    pub offset: usize,
     pub newest_first: bool,
 }
 
@@ -129,10 +131,12 @@ impl FlowQuery {
     }
 }
 
-/// Scan raw flows newest-first (or oldest), collecting up to `limit` matches.
+/// Scan raw flows newest-first (or oldest), collecting up to `limit` matches
+/// after skipping `offset`.
 pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<Vec<FlowRecord>> {
     let infos = ctx.flow_index.read().unwrap().clone();
     let mut out: Vec<FlowRecord> = Vec::with_capacity(q.limit.min(1024));
+    let mut skipped = 0usize;
     for_each_segment_info::<FlowRecord>(
         &infos,
         FlowRecord::schema(),
@@ -146,6 +150,10 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<Vec<FlowRecord>> {
                     continue;
                 }
                 if !q.matches(&f) {
+                    continue;
+                }
+                if skipped < q.offset {
+                    skipped += 1;
                     continue;
                 }
                 out.push(f);

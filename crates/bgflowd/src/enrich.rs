@@ -126,10 +126,11 @@ pub struct MmdbGeo {
     asn: Option<maxminddb::Reader<Vec<u8>>>,
     country: Option<maxminddb::Reader<Vec<u8>>>,
     orgs: Arc<StringTable>,
+    metrics: Arc<Metrics>,
 }
 
 impl MmdbGeo {
-    pub fn open(cfg: &GeoIpConfig, orgs: Arc<StringTable>) -> Self {
+    pub fn open(cfg: &GeoIpConfig, orgs: Arc<StringTable>, metrics: Arc<Metrics>) -> Self {
         let asn = if cfg.asn_db.is_empty() {
             None
         } else {
@@ -156,7 +157,7 @@ impl MmdbGeo {
                 }
             }
         };
-        MmdbGeo { asn, country, orgs }
+        MmdbGeo { asn, country, orgs, metrics }
     }
 
     pub fn enabled(&self) -> bool {
@@ -169,6 +170,7 @@ impl MmdbGeo {
         let ip = u128_to_ip(ip_u128);
         if let Some(r) = &self.asn {
             if let Ok(Some(a)) = r.lookup::<Option<AsnRecord>>(ip) {
+                self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let asn = a.asn.unwrap_or(0) as u32;
                 let org = a.organization.map(|o| self.orgs.intern(&o)).unwrap_or(0);
                 if is_src {
@@ -190,6 +192,7 @@ impl MmdbGeo {
         }
         if let Some(r) = &self.country {
             if let Ok(Some(c)) = r.lookup::<Option<CountryRecord>>(ip) {
+                self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let code = c
                     .country
                     .as_ref()
@@ -292,10 +295,26 @@ pub struct HttpEnricher {
 
 impl HttpEnricher {
     fn new(cfg: &EnricherConfig) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms.max(100)))
-            .user_agent("bgflowd/0.1 (+https://github.com/XodoTechnology/BGFlow)")
-            .build()?;
+            .user_agent("bgflowd/0.1 (+https://github.com/XodoTechnology/BGFlow)");
+        // Optional auth/API-key headers for private backends (irrd3.net etc).
+        if !cfg.headers.is_empty() {
+            let mut hdrs = reqwest::header::HeaderMap::new();
+            for (k, v) in &cfg.headers {
+                match (
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(v),
+                ) {
+                    (Ok(name), Ok(val)) => {
+                        hdrs.insert(name, val);
+                    }
+                    _ => tracing::warn!("enricher '{}': skipping bad header {:?}", cfg.name, k),
+                }
+            }
+            builder = builder.default_headers(hdrs);
+        }
+        let client = builder.build()?;
         Ok(HttpEnricher {
             name: cfg.name.clone(),
             url: cfg.url.clone(),
@@ -355,7 +374,10 @@ impl HttpEnricher {
         self.pending.lock().unwrap().remove(&key);
     }
 
-    async fn lookup(&self, key: PrefixKey) -> LookupResult {
+    /// Perform the backend request. Returns `None` on transport/HTTP/JSON
+    /// failure (caller counts an error and negative-caches); `Some` holds the
+    /// parsed result, which may legitimately be empty (nothing found).
+    async fn lookup(&self, key: PrefixKey) -> Option<LookupResult> {
         let ip = match key {
             PrefixKey::V4(k) => IpAddr::V4(std::net::Ipv4Addr::new(
                 (k >> 16) as u8,
@@ -380,15 +402,15 @@ impl HttpEnricher {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("enricher '{}': request failed: {}", self.name, e);
-                return out; // negative-cached by caller path
+                return None;
             }
         };
         if !resp.status().is_success() {
-            return out;
+            return None;
         }
         let json: serde_json::Value = match resp.json().await {
             Ok(v) => v,
-            Err(_) => return out,
+            Err(_) => return None,
         };
         out.asn = self
             .fields
@@ -422,7 +444,7 @@ impl HttpEnricher {
                 }
             }
         }
-        out
+        Some(out)
     }
 
     /// Apply a cached result to a record (fills only unset fields).
@@ -521,9 +543,18 @@ impl HttpEnrichers {
             let Some((idx, key)) = msg else { break };
             let e = &self.items[idx];
             self.metrics.http_lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let res = e.lookup(key).await;
-            let empty = res.asn.is_none() && res.org.is_none() && res.country.is_none() && res.extra.is_empty();
-            e.store(key, res, empty);
+            match e.lookup(key).await {
+                Some(res) => {
+                    let empty = res.asn.is_none() && res.org.is_none() && res.country.is_none() && res.extra.is_empty();
+                    e.store(key, res, empty);
+                }
+                None => {
+                    // Backend failure: count it and negative-cache briefly so
+                    // a down backend doesn't get hammered per flow.
+                    self.metrics.http_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    e.store(key, LookupResult::default(), true);
+                }
+            }
         }
     }
 

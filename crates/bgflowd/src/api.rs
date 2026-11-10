@@ -133,6 +133,7 @@ async fn flows(
             .and_then(|s| s.parse().ok())
             .unwrap_or(500)
             .min(10_000),
+        offset: q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0),
         newest_first: q.get("order").map(|s| s != "asc").unwrap_or(true),
         ..Default::default()
     };
@@ -178,7 +179,11 @@ async fn flows(
 
     let recs = query::flows(&st.ctx, &fq).map_err(|e| err(e.to_string()))?;
     let out: Vec<_> = recs.iter().map(|f| query::flow_json(&st.ctx, f)).collect();
-    Ok(Json(serde_json::json!({"count": out.len(), "flows": out})))
+    Ok(Json(serde_json::json!({
+        "count": out.len(),
+        "offset": fq.offset,
+        "flows": out,
+    })))
 }
 
 #[derive(Default)]

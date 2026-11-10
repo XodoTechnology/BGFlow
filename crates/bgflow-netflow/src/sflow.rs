@@ -555,9 +555,12 @@ fn parse_ipv6(p: &[u8]) -> Option<ParsedPacket> {
                 nexthdr = nxt;
             }
             44 => {
-                // fragment header: fixed 8 bytes
+                // fragment header: fixed 8 bytes. Field layout:
+                // [next_header u8][reserved u8][frag_off+res+M u16][id u32]
+                // offset occupies bits 3..15; bit 0 is the M (more) flag.
                 let nxt = p[off];
-                let frag_off = be16(p, off + 2) & 0xfff9; // offset*8 + res/m
+                let frag_field = be16(p, off + 2);
+                let frag_off = frag_field & 0xfff8; // offset only, NOT the M flag
                 off += 8;
                 nexthdr = nxt;
                 if frag_off != 0 {

@@ -73,6 +73,9 @@ pub async fn run(
     let mut tick = interval(Duration::from_secs(1));
     let mut last_retention = now_ms();
     let retention_iv = Duration::from_secs(cfg.retention_interval_secs.max(30));
+    // Rollup buckets only become drainable at minute boundaries — skip the
+    // full-map scan on ticks that stay inside the same minute.
+    let mut last_drain_min = u64::MAX;
 
     loop {
         tokio::select! {
@@ -87,7 +90,11 @@ pub async fn run(
                     None => {
                         // All senders gone: flush everything and exit.
                         ingest_batch(&mut pending, &mut flows, &mut agg, &metrics)?;
-                        drain_rollup(&mut agg, &mut rollups)?;
+                        // drain_all: keep the still-open minute bucket too —
+                        // its raw flows exist, so rollups shouldn't lose it.
+                        for rec in agg.drain_all() {
+                            rollups.push(&rec)?;
+                        }
                         flows.flush()?;
                         rollups.flush()?;
                         publish(&shared, &flows, &rollups, &agg, started);
@@ -97,13 +104,26 @@ pub async fn run(
             }
             _ = tick.tick() => {
                 ingest_batch(&mut pending, &mut flows, &mut agg, &metrics)?;
-                drain_rollup(&mut agg, &mut rollups)?;
+                let cur_min = bgflow_store::timeutil::minute_floor(now_ms());
+                if cur_min != last_drain_min {
+                    last_drain_min = cur_min;
+                    drain_rollup(&mut agg, &mut rollups)?;
+                }
 
                 // Periodic explicit flush + retention.
                 let fb = flows.segment_count();
                 let rb = rollups.segment_count();
+                let fbytes = flows.total_bytes();
+                let rbytes = rollups.total_bytes();
                 flows.flush()?;
                 rollups.flush()?;
+                // Metrics: count newly written segments / bytes.
+                let segs = (flows.segment_count() - fb) + (rollups.segment_count() - rb);
+                if segs > 0 {
+                    metrics.flushes.fetch_add(segs as u64, std::sync::atomic::Ordering::Relaxed);
+                    let written = (flows.total_bytes() - fbytes) + (rollups.total_bytes() - rbytes);
+                    metrics.bytes_stored.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+                }
                 if now_ms().saturating_sub(last_retention) >= retention_iv.as_millis() as u64 {
                     last_retention = now_ms();
                     retention(&mut flows, &mut rollups, &cfg, &metrics)?;

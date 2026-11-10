@@ -12,13 +12,19 @@ mod writer;
 
 use anyhow::Result;
 use api::AppState;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use enrich::{HttpEnrichers, MmdbGeo, StringTable};
 use metrics::Metrics;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use writer::WriterShared;
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Verify integrity of all stored .bfs segments (CRC check).
+    Doctor,
+}
 
 #[derive(Parser)]
 #[command(name = "bgflowd", version, about = "BGFlow flow analyzer daemon")]
@@ -42,6 +48,9 @@ struct Args {
     /// Demo flows per datagram
     #[arg(long, default_value_t = 20)]
     demo_flows: usize,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
 #[tokio::main]
@@ -55,13 +64,18 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let cfg = config::load(args.config.as_ref())?;
+
+    if matches!(args.command, Some(Commands::Doctor)) {
+        return doctor(&cfg);
+    }
+
     std::fs::create_dir_all(&cfg.storage.data_dir)?;
     tracing::info!("config loaded; data dir {}", cfg.storage.data_dir.display());
 
     // --- Shared state ---
     let metrics = Arc::new(Metrics::default());
     let orgs = Arc::new(StringTable::open(cfg.storage.data_dir.join("orgs.txt"))?);
-    let geo = Arc::new(MmdbGeo::open(&cfg.geoip, orgs.clone()));
+    let geo = Arc::new(MmdbGeo::open(&cfg.geoip, orgs.clone(), metrics.clone()));
     if geo.enabled() {
         tracing::info!("geoip enrichment enabled");
     }
@@ -157,5 +171,43 @@ async fn main() -> Result<()> {
     }
 
     serve.await?;
+    Ok(())
+}
+
+/// `bgflowd doctor`: walk the data dir and CRC-verify every segment.
+fn doctor(cfg: &config::Config) -> Result<()> {
+    let root = &cfg.storage.data_dir;
+    if !root.exists() {
+        println!("data dir {} does not exist", root.display());
+        return Ok(());
+    }
+    let segs = bgflow_store::scan_segments(root)?;
+    let mut ok = 0usize;
+    let mut bad = 0usize;
+    let mut bytes = 0u64;
+    for s in &segs {
+        bytes += s.file_size;
+        match bgflow_store::verify_crc(&s.path) {
+            Ok(true) => ok += 1,
+            Ok(false) => {
+                bad += 1;
+                println!("CORRUPT: {}", s.path.display());
+            }
+            Err(e) => {
+                bad += 1;
+                println!("UNREADABLE: {} ({})", s.path.display(), e);
+            }
+        }
+    }
+    println!(
+        "checked {} segments ({:.1} MiB): {} ok, {} bad",
+        segs.len(),
+        bytes as f64 / 1_048_576.0,
+        ok,
+        bad
+    );
+    if bad > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
