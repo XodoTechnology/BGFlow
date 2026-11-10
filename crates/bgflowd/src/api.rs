@@ -1087,9 +1087,11 @@ async fn auth_mw(
     let ident = st.auth.identity_from_headers(cookie.as_deref(), authz.as_deref());
 
     let Some((_user, role)) = ident else {
+        // No WWW-Authenticate header: advertising Basic here makes browsers
+        // pop their native credential dialog on top of the SPA login form.
+        // curl -u and friends send credentials preemptively regardless.
         return (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"bgflow\"".to_string())],
             Json(serde_json::json!({"error": "authentication required"})),
         )
             .into_response();
