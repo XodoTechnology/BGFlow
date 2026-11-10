@@ -9,7 +9,7 @@ services:
       - "2055:2055/udp"    # flow input (add more as needed)
     volumes:
       - bgflow-data:/var/lib/bgflow
-      - ./bgflow.toml:/etc/bgflow/bgflow.toml:ro
+      - ${BGFLOW_CONFIG:-./bgflow.example.toml}:/etc/bgflow/bgflow.toml:ro
     environment:
       - RUST_LOG=info
 

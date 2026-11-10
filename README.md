@@ -36,8 +36,9 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   detection, country heat view, CSV export, OpenAPI spec.
 - **Prometheus metrics** at `/metrics` (incl. per-exporter stats).
 - **Embedded UI** — dark, Elastiflow-style SPA: dashboard, flow explorer with
-  click-to-filter, top talkers, country heatmap, conversations, anomalies,
-  exporters, labels, metrics, saved filter presets, auto-refresh.
+  click-to-filter, top talkers, country heatmap with flags, **Sankey flow
+  map**, conversations, anomalies, exporters, labels, metrics, saved filter
+  presets, live auto-refresh.
 - **Ops** — `bgflowd doctor` (segment CRC verification), deep `/health`,
   SIGHUP config reload, optional TLS, UDP buffer sizing, TCP conn limits.
 - **Low resource use** — a few % CPU and tens of MB RAM at moderate rates.
@@ -81,7 +82,7 @@ cargo build --release -p bgflowd
 # binary: target/release/bgflowd
 ```
 
-Requires Rust 1.85+ (developed on 1.99).
+Requires Rust 1.88+ (developed on 1.99).
 
 ## Configuration
 
@@ -155,6 +156,8 @@ Rule match fields (all ANDed): `proto`, `src_port`, `dst_port`, `src_ip`,
 |---|---|
 | `GET /api/v1/flows` | Raw flows — `from,to,src,dst,proto,sport,dport,exporter` (comma list),`src_asn,dst_asn,src_ipver,dst_ipver,src_org,dst_org,label,limit,offset,order,format=csv` |
 | `GET /api/v1/summary` | Totals + per-protocol breakdown over rollups |
+| `GET /api/v1/overview` | Combined dashboard payload — totals, protocol, series, top dims in **one** rollup scan |
+| `GET /api/v1/matrix` | `src_dim`/`dst_dim` pair aggregation for flow maps (asn/org/country/ipver/proto/port/label) |
 | `GET /api/v1/timeseries` | `bucket=1m|5m|15m|1h|6h|1d` bytes/packets/flows series |
 | `GET /api/v1/top` | `by=` any of `src_ip,dst_ip,src_ipver,dst_ipver,src_asn,dst_asn,src_org,dst_org,src_port,dst_port,proto,exporter,src_country,dst_country,label`; filters same as summary + `granularity=minute|hourly` |
 | `GET /api/v1/conversations` | Top 5-tuple conversations |

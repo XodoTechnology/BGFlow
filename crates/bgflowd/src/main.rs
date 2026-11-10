@@ -31,7 +31,7 @@ enum Commands {
 #[command(name = "bgflowd", version, about = "BGFlow flow analyzer daemon")]
 struct Args {
     /// Path to bgflow.toml (default: ./bgflow.toml, /etc/bgflow/bgflow.toml)
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
     /// Send synthetic demo NetFlow traffic to this address (e.g. 127.0.0.1:2055)
@@ -71,6 +71,10 @@ async fn main() -> Result<()> {
     }
 
     std::fs::create_dir_all(&cfg.storage.data_dir)?;
+    // Single-instance lock: two daemons on one data dir would interleave
+    // segment writes and double-count rollups. Lock file holds the pid;
+    // staleness is detected via /proc so crashes don't wedge restarts.
+    let _instance_lock = acquire_instance_lock(&cfg.storage.data_dir)?;
     tracing::info!("config loaded; data dir {}", cfg.storage.data_dir.display());
 
     // --- Shared state ---
@@ -187,6 +191,9 @@ async fn main() -> Result<()> {
 
     let app = api::router(app_state);
     if let (Some(cert), Some(key)) = (&cfg.server.tls_cert, &cfg.server.tls_key) {
+        // rustls 0.23 panics without a process-level CryptoProvider when
+        // multiple providers are compiled in — install aws-lc-rs explicitly.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         tracing::info!("https: listening on {} (TLS)", cfg.server.http_listen);
         let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
@@ -263,4 +270,46 @@ fn doctor(cfg: &config::Config) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Acquire `<data_dir>/bgflowd.lock` containing our pid. A stale lock
+/// (dead pid) is reclaimed; a live pid means another daemon owns the dir.
+fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<std::fs::File> {
+    use std::io::Write;
+    let lock = data_dir.join("bgflowd.lock");
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(mut f) => {
+                writeln!(f, "{}", std::process::id())?;
+                return Ok(f);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let alive = std::fs::read_to_string(&lock)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|pid| {
+                        // pid == ours means a stale lock recycled our pid —
+                        // we didn't write it (create_new failed), so reclaim.
+                        pid != std::process::id() as u32
+                            && std::path::Path::new(&format!("/proc/{}/exe", pid)).exists()
+                    })
+                    .unwrap_or(false);
+                if alive {
+                    anyhow::bail!(
+                        "another bgflowd instance appears to be running \
+                         ({} exists) — refusing to share data dir {}",
+                        lock.display(),
+                        data_dir.display()
+                    );
+                }
+                let _ = std::fs::remove_file(&lock); // stale — retry
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("could not acquire instance lock {}", lock.display())
 }

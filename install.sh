@@ -7,6 +7,19 @@ set -eu
 REPO="XodoTechnology/BGFlow"
 VERSION="${BGFLOW_VERSION:-latest}"
 PREFIX="${BGFLOW_INSTALL_DIR:-/usr/local}"
+
+# --- args --------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) VERSION="$2"; shift 2 ;;
+    --version=*) VERSION="${1#*=}"; shift ;;
+    --prefix)  PREFIX="$2";  shift 2 ;;
+    --prefix=*) PREFIX="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,4p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
 BINDIR="$PREFIX/bin"
 SYSCONFDIR="/etc/bgflow"
 DATADIR="/var/lib/bgflow"
@@ -35,14 +48,31 @@ info "installing BGFlow $VERSION ($TARGET)"
 
 # --- download ----------------------------------------------------------------
 TARBALL="bgflow-${VERSION#v}-${TARGET}.tar.gz"
-URL="https://github.com/$REPO/releases/download/$VERSION/$TARBALL"
+BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+URL="$BASE_URL/$TARBALL"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 info "downloading $URL"
 curl -fsSL "$URL" -o "$TMP/$TARBALL" || \
   die "download failed — if this is a source-only release, build with: cargo build --release -p bgflowd"
+
+# --- verify checksum ---------------------------------------------------------
+if curl -fsSL "$BASE_URL/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
+  EXPECTED="$(awk -v f="$TARBALL" '$2==f{print $1}' "$TMP/SHA256SUMS")"
+  if [ -n "$EXPECTED" ]; then
+    ACTUAL="$(sha256sum "$TMP/$TARBALL" | awk '{print $1}')"
+    [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $TARBALL (expected $EXPECTED, got $ACTUAL)"
+    info "checksum verified"
+  else
+    info "warn: $TARBALL not listed in SHA256SUMS — skipping verification"
+  fi
+else
+  info "warn: SHA256SUMS not published for $VERSION — skipping verification"
+fi
+
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
+[ -f "$TMP/bgflowd" ] || die "tarball did not contain bgflowd binary"
 
 # --- install binary ----------------------------------------------------------
 mkdir -p "$BINDIR" "$SYSCONFDIR" "$DATADIR"
@@ -52,7 +82,8 @@ info "installed $BINDIR/bgflowd"
 # --- user --------------------------------------------------------------------
 if ! id "$USER_NAME" >/dev/null 2>&1; then
   useradd --system --home "$DATADIR" --shell /usr/sbin/nologin "$USER_NAME" 2>/dev/null \
-    || useradd --system --home "$DATADIR" --shell /sbin/nologin "$USER_NAME"
+    || useradd --system --home "$DATADIR" --shell /sbin/nologin "$USER_NAME" \
+    || die "could not create $USER_NAME user — create it manually and re-run"
 fi
 chown -R "$USER_NAME:$USER_NAME" "$DATADIR"
 

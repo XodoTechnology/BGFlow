@@ -45,7 +45,18 @@ docker run -d --name bgflow \
 ```
 
 The container listens on UDP 2055 (flow input) and TCP 8080 (UI/API) by
-default; override with `BGFLOW_HTTP_LISTEN` / your own config mount.
+default. `docker compose` mounts `bgflow.example.toml` read-only — create
+your own `bgflow.toml` and point at it instead:
+
+```bash
+BGFLOW_CONFIG=./bgflow.toml docker compose up -d
+```
+
+Environment overrides (applied after the config file, env wins):
+
+- `BGFLOW_HTTP_LISTEN` — e.g. `0.0.0.0:8080`
+- `BGFLOW_DATA_DIR` — e.g. `/var/lib/bgflow`
+- `RUST_LOG` — log filter (e.g. `info`, `bgflowd=debug`)
 
 ## Option 3: from source
 

@@ -398,12 +398,30 @@ pub fn resolve_path(arg: Option<&PathBuf>) -> Option<PathBuf> {
 }
 
 pub fn load(path: Option<&PathBuf>) -> Result<Config> {
-    match resolve_path(path) {
+    let mut cfg = match resolve_path(path) {
         Some(p) => {
             let text = std::fs::read_to_string(&p)
                 .with_context(|| format!("cannot read config {}", p.display()))?;
-            toml::from_str(&text).with_context(|| format!("cannot parse {}", p.display()))
+            toml::from_str(&text).with_context(|| format!("cannot parse {}", p.display()))?
         }
-        None => Ok(Config::default()),
+        None => Config::default(),
+    };
+    apply_env_overrides(&mut cfg);
+    Ok(cfg)
+}
+
+/// Environment overrides (handy for containers): BGFLOW_HTTP_LISTEN,
+/// BGFLOW_DATA_DIR. Applied after file parsing so env always wins.
+fn apply_env_overrides(cfg: &mut Config) {
+    if let Ok(v) = std::env::var("BGFLOW_HTTP_LISTEN") {
+        match v.parse::<std::net::SocketAddr>() {
+            Ok(a) => cfg.server.http_listen = a,
+            Err(_) => tracing::warn!("BGFLOW_HTTP_LISTEN '{}' is not a valid socket addr — ignored", v),
+        }
+    }
+    if let Ok(v) = std::env::var("BGFLOW_DATA_DIR") {
+        if !v.is_empty() {
+            cfg.storage.data_dir = std::path::PathBuf::from(v);
+        }
     }
 }
