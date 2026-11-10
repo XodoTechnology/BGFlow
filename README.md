@@ -44,6 +44,9 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   map**, conversations, anomalies, exporters, labels, metrics, saved filter
   presets, live auto-refresh, login page, host CPU/RAM/disk stats, git
   build version.
+- **UX** — light/dark theme, shareable URLs (view+filters in the hash),
+  SSE live status, PTR hostnames, interface names, period-over-period deltas
+  and NEW-entity badges on anomalies.
 - **Ops** — `bgflowd doctor` (segment CRC verification), `bgflowd backup`
   (CRC-verified data-dir snapshots), `bgflowd config-check`,
   `bgflowd geoip-update` (downloads free MMDB GeoIP databases),

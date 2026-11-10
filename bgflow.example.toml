@@ -79,6 +79,10 @@ coarse_retention_days = 365
 asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"
 country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
 
+# Optional: friendly interface names shown in the UI flows view.
+# [interface_names]
+# "2" = "ae0"
+
 # --- Flow inputs -------------------------------------------------------------
 # One [[inputs]] block per listen socket. protocol = auto detects
 # NetFlow v5/v9, IPFIX, and sFlow per datagram.

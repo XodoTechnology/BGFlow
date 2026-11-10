@@ -8,8 +8,13 @@
 :root{
   --bg:#0b0e14; --panel:#12161f; --panel2:#171d29; --border:#232b3a;
   --text:#e6edf3; --muted:#8b949e; --accent:#3b82f6; --accent2:#22d3ee;
-  --green:#34d399; --red:#f87171; --yellow:#fbbf24;
+  --green:#34d399; --red:#f87171; --yellow:#fbbf24; --pink:#e879f9;
   --mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+}
+[data-theme=light]{
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef1f6; --border:#d8dee7;
+  --text:#1c2330; --muted:#5d6b7f; --accent:#2563eb; --accent2:#0891b2;
+  --green:#059669; --red:#dc2626; --yellow:#d97706; --pink:#a21caf;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,'Segoe UI',Roboto,sans-serif;height:100vh;display:flex;overflow:hidden}
@@ -26,7 +31,7 @@ a{color:var(--accent);text-decoration:none}
 #topbar{display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--panel);flex-wrap:wrap}
 #topbar .title{font-size:16px;font-weight:600;margin-right:8px}
 .chip{background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:4px 11px;border-radius:14px;cursor:pointer;font-size:12.5px;user-select:none}
-.chip.on{color:var(--text);border-color:var(--accent);background:#1d2b45}
+.chip.on{color:var(--text);border-color:var(--accent);background:color-mix(in srgb,var(--accent) 16%,var(--panel2))}
 #content{flex:1;overflow-y:auto;padding:18px}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
 .panel h3{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:12px}
@@ -42,17 +47,17 @@ a{color:var(--accent);text-decoration:none}
 .btn.ghost{background:var(--panel2);border:1px solid var(--border);color:var(--text);font-weight:500}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 th{color:var(--muted);font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
-td{padding:7px 10px;border-bottom:1px solid #1a2030;font-family:var(--mono);font-size:12px;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent);font-family:var(--mono);font-size:12px;white-space:nowrap}
 tr:hover td{background:var(--panel2)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 th.num{text-align:right}
 .bar{height:6px;border-radius:3px;background:var(--accent);opacity:.75;display:inline-block;vertical-align:middle}
 .heat{height:14px;border-radius:3px;display:inline-block;vertical-align:middle;min-width:2px}
 .muted{color:var(--muted)}
-.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:#1d2b45;color:var(--accent2);font-family:var(--mono)}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:color-mix(in srgb,var(--accent2) 14%,var(--panel2));color:var(--accent2);font-family:var(--mono)}
 .pbadge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600;font-family:var(--mono);color:var(--pc);border:1px solid var(--pc);background:rgba(255,255,255,.03);min-width:34px;text-align:center}
-.vbadge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10.5px;font-weight:700;font-family:var(--mono);background:#1d2b45;color:var(--accent2)}
-.vbadge.v6{background:#3b1d4e;color:#e879f9}
+.vbadge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10.5px;font-weight:700;font-family:var(--mono);background:color-mix(in srgb,var(--accent2) 14%,var(--panel2));color:var(--accent2)}
+.vbadge.v6{background:color-mix(in srgb,#e879f9 16%,var(--panel2));color:var(--pink)}
 .flg{font-family:'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif;font-size:15px;letter-spacing:0}
 .clickable{color:var(--accent2);cursor:pointer}
 .clickable:hover{text-decoration:underline}
@@ -71,10 +76,10 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 #login input:focus{outline:none;border-color:var(--accent)}
 #login .err{color:var(--red);font-size:12.5px;min-height:20px;margin:4px 0 10px}
 .userbox{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-left:auto}
-.rolebadge{padding:1px 9px;border-radius:10px;font-size:10.5px;font-weight:700;letter-spacing:.4px;background:#1d2b45;color:var(--accent2);text-transform:uppercase}
-.rolebadge.admin{background:#3b1d4e;color:#e879f9}
+.rolebadge{padding:1px 9px;border-radius:10px;font-size:10.5px;font-weight:700;letter-spacing:.4px;background:color-mix(in srgb,var(--accent2) 14%,var(--panel2));color:var(--accent2);text-transform:uppercase}
+.rolebadge.admin{background:color-mix(in srgb,#e879f9 16%,var(--panel2));color:var(--pink)}
 ::-webkit-scrollbar{width:9px;height:9px}
-::-webkit-scrollbar-thumb{background:#2a3345;border-radius:5px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
 </style>
 </head>
 <body>
@@ -121,6 +126,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
       <option value="60000">1m</option>
       <option value="0">off</option>
     </select>
+    <button class="btn ghost" id="themebtn" title="Toggle light/dark theme" style="padding:4px 10px;font-size:13px">◐</button>
     <button class="btn ghost" onclick="load()">⟳ Refresh</button>
   </div>
   <div id="content"></div>
@@ -140,6 +146,52 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 const $=s=>document.querySelector(s), content=$('#content');
 const state={view:'overview',range:'-24h',refreshMs:15000,metric:'bytes',bucket:'5m',topby:'src_ip',topn:15,granularity:'minute',updated:0,chartSeries:null,hoverI:-1,rate:null,msrc:'src_country',mdst:'dst_country',mlim:100,mapData:null,mapHover:-1,mapHoverNode:null};
 const F={}; // active filters
+
+// ---------- theme ----------
+(function(){const t=localStorage.getItem('bgflow_theme');if(t)document.documentElement.dataset.theme=t})();
+$('#themebtn')?.addEventListener('click',()=>{
+  const cur=document.documentElement.dataset.theme==='light'?'':'light';
+  if(cur)document.documentElement.dataset.theme='light';else delete document.documentElement.dataset.theme;
+  localStorage.setItem('bgflow_theme',cur);
+  $('#themebtn').textContent=cur?'☀':'◐';
+});
+if(document.documentElement.dataset.theme==='light')$('#themebtn').textContent='☀';
+
+// ---------- shareable URL state ----------
+// Encode view/range/metric/bucket/dims/filters into location.hash so a
+// copied URL restores the exact dashboard state.
+function syncHash(){
+  const p=new URLSearchParams();
+  p.set('v',state.view);p.set('r',state.range);p.set('b',state.bucket);
+  p.set('m',state.metric);p.set('by',state.topby);p.set('n',state.topn);p.set('g',state.granularity);
+  if(state.range==='custom'){const[f,t]=trange();if(f)p.set('from',f);if(t)p.set('to',t)}
+  for(const[k,v]of Object.entries(F))p.set('f.'+k,v);
+  const h='#'+p.toString();
+  if(location.hash!==h)history.replaceState(null,'',h);
+}
+function loadHash(){
+  const h=location.hash.slice(1);if(!h)return;
+  let p;try{p=new URLSearchParams(h)}catch(e){return}
+  const v=p.get('v');
+  if(v&&[...document.querySelectorAll('#nav a')].some(a=>a.dataset.v===v)){
+    state.view=v;
+    document.querySelectorAll('#nav a').forEach(x=>{x.classList.toggle('on',x.dataset.v===v)});
+    const t=document.querySelector('#nav a[data-v="'+v+'"]');if(t)$('#viewtitle').textContent=t.textContent.trim();
+  }
+  const r=p.get('r');
+  if(r){state.range=r;
+    document.querySelectorAll('.chip[data-r]').forEach(x=>x.classList.toggle('on',x.dataset.r===r));
+    const cust=r==='custom';$('#fromin').style.display=cust?'':'none';$('#toin').style.display=cust?'':'none';
+    if(cust){if(p.get('from'))$('#fromin').value=p.get('from');if(p.get('to'))$('#toin').value=p.get('to')}
+  }
+  if(p.get('b'))state.bucket=p.get('b');
+  if(p.get('m'))state.metric=p.get('m');
+  if(p.get('by'))state.topby=p.get('by');
+  if(p.get('n'))state.topn=+p.get('n')||15;
+  if(p.get('g'))state.granularity=p.get('g');
+  for(const[k,val]of p.entries())if(k.startsWith('f.')&&val)F[k.slice(2)]=val;
+}
+loadHash();
 let timer=null;
 
 // ---------- helpers ----------
@@ -165,8 +217,8 @@ async function probeAuth(){
   try{
     const r=await fetch('/api/v1/auth/me',{signal:AbortSignal.timeout(8000)});
     const d=await r.json();
-    if(d.auth){ME=d;showUser();loadExpNames();startAuto();load()}
-    else if(d.open){ME={open:true};loadExpNames();startAuto();load()}
+    if(d.auth){ME=d;showUser();loadExpNames();loadIfNames();startAuto();load()}
+    else if(d.open){ME={open:true};loadExpNames();loadIfNames();startAuto();load()}
     else showLogin();
   }catch(e){showLogin()}
 }
@@ -182,7 +234,7 @@ async function doLogin(){
   try{
     const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p}),signal:AbortSignal.timeout(15000)});
     if(!r.ok){const d=await r.json().catch(()=>({}));lerr.textContent=d.error||('login failed ('+r.status+')');return}
-    const d=await r.json();ME=d;$('#login').style.display='none';showUser();loadExpNames();startAuto();load();
+    const d=await r.json();ME=d;$('#login').style.display='none';showUser();loadExpNames();loadIfNames();startAuto();load();
   }catch(e){lerr.textContent='request failed: '+e.message}
 }
 async function doLogout(){
@@ -274,7 +326,7 @@ async function load(silent){
     else if(state.view==='exporters')await vExporters();
     else if(state.view==='labels')await vLabels();
     else if(state.view==='metrics')await vMetrics();
-    state.updated=Date.now();state.lastErr=null;
+    state.updated=Date.now();state.lastErr=null;syncHash();
     if(silent)content.scrollTop=keepScroll;
   }catch(e){
     if(silent){state.lastErr=e.message;toast('Refresh failed: '+e.message)}
@@ -297,13 +349,17 @@ function topTbl(items, fk){
 async function vOverview(){
   // One combined scan server-side instead of 6 separate top/summary calls.
   const [ov,st]=await Promise.all([
-    api('/api/v1/overview?'+q({bucket:state.bucket,limit:8})),api('/api/v1/status')]);
+    api('/api/v1/overview?'+q({bucket:state.bucket,limit:8,compare:1})),api('/api/v1/status')]);
   const sum=ov,ts=ov,s={items:ov.top.src_ip},d={items:ov.top.dst_ip},
         sa={items:ov.top.src_asn},da={items:ov.top.dst_asn},dp={items:ov.top.dst_port};
+  const pv=ov.prev||null;
+  const dlt=(cur,pr)=>{if(!pv||!pr)return'';const pct=(cur-pr)/pr*100;
+    const col=pct>=0?'var(--green)':'var(--red)';const ar=pct>=0?'▲':'▼';
+    return` <span style="color:${col}">${ar}${Math.abs(pct)>=1000?'999+':Math.abs(pct).toFixed(1)}%</span>`};
   const cards=`<div class="cards">
-    <div class="card"><div class="lbl">Flows</div><div class="val">${fmtN(sum.flows)}</div><div class="sub">${esc(trangeLabel())}</div></div>
-    <div class="card"><div class="lbl">Bytes</div><div class="val">${fmtB(sum.bytes)}</div><div class="sub">${fmtN(sum.packets)} packets</div></div>
-    <div class="card"><div class="lbl">Packets</div><div class="val">${fmtN(sum.packets)}</div><div class="sub">avg ${(sum.packets/Math.max(1,sum.flows)).toFixed(1)}/flow</div></div>
+    <div class="card"><div class="lbl">Flows</div><div class="val">${fmtN(sum.flows)}</div><div class="sub">${esc(trangeLabel())}${dlt(sum.flows,pv.flows)}</div></div>
+    <div class="card"><div class="lbl">Bytes</div><div class="val">${fmtB(sum.bytes)}</div><div class="sub">${fmtN(sum.packets)} packets${dlt(sum.bytes,pv.bytes)}</div></div>
+    <div class="card"><div class="lbl">Packets</div><div class="val">${fmtN(sum.packets)}</div><div class="sub">avg ${(sum.packets/Math.max(1,sum.flows)).toFixed(1)}/flow${dlt(sum.packets,pv.packets)}</div></div>
     <div class="card"><div class="lbl">Stored</div><div class="val">${fmtB(st.status.flow_bytes+st.status.rollup_bytes+st.status.hourly_bytes)}</div><div class="sub">${fmtN(st.status.flow_rows+st.status.rollup_rows+st.status.hourly_rows)} rows · ${st.status.uptime_secs}s up</div></div>
   </div>`;
   const protos=(sum.by_protocol||[]).slice(0,6).map(p=>`<tr><td>${protoBadge(p.name)}</td><td class="num">${fmtN(p.flows)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.packets)}</td></tr>`).join('');
@@ -329,7 +385,7 @@ async function vOverview(){
       <div class="panel"><h3>By Protocol</h3><table><tr><th>Proto</th><th class="num">Flows</th><th class="num">Bytes</th><th class="num">Packets</th></tr>${protos||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table></div>
       <div class="panel"><h3>Top Destination Ports</h3>${topTbl(dp.items,'dport')}</div>
     </div>`;
-  document.querySelectorAll('[data-m]').forEach(ch=>ch.onclick=()=>{state.metric=ch.dataset.m;document.querySelectorAll('[data-m]').forEach(x=>x.classList.toggle('on',x===ch));drawChart(state.chartSeries)});
+  document.querySelectorAll('[data-m]').forEach(ch=>ch.onclick=()=>{state.metric=ch.dataset.m;document.querySelectorAll('[data-m]').forEach(x=>x.classList.toggle('on',x===ch));syncHash();drawChart(state.chartSeries)});
   const bb=$('#b_bucket');if(bb)bb.onchange=()=>{state.bucket=bb.value;load()};
   drawChart(ts.series||[]);bindChartHover();
 }
@@ -445,15 +501,16 @@ async function vFlows(){
   const data=await api('/api/v1/flows?'+q({limit:lim}));
   const rows=(data.flows||[]).map(f=>`<tr>
     <td class="muted">${f.ts?new Date(f.ts*1000).toLocaleTimeString():'-'}</td>
-    <td><span class="clickable" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted">:${f.src_port}</span></td>
-    <td><span class="clickable" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted">:${f.dst_port}</span></td>
+    <td><span class="clickable" title="${esc(f.src_ptr||'')}" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted">:${f.src_port}</span></td>
+    <td><span class="clickable" title="${esc(f.dst_ptr||'')}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted">:${f.dst_port}</span></td>
     <td>${protoBadge(f.protocol_name||protoName(f.protocol))}</td>
     <td class="num">${fmtB(f.bytes)}</td><td class="num">${fmtN(f.packets)}</td>
     <td class="muted">AS${f.src_asn||'-'} → AS${f.dst_asn||'-'}</td>
     <td>${ocCell(f.src_org||f.src_country)} → ${ocCell(f.dst_org||f.dst_country)}</td>
     <td>${f.label?`<span class="tag clickable" onclick="setFilter('label','${esc(f.label)}')">${esc(f.label)}</span>`:'<span class="muted">-</span>'}</td>
-    <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td></tr>`).join('');
-  $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th></tr>${rows||'<tr><td colspan=10 class=muted>No flows</td></tr>'}</table>
+    <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td>
+    <td title="ingress → egress">${ifLabel(f.ingress_if)}<span class="muted"> → </span>${ifLabel(f.egress_if)}</td></tr>`).join('');
+  $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th><th title="ingress → egress interface">Interfaces</th></tr>${rows||'<tr><td colspan=11 class=muted>No flows</td></tr>'}</table>
    <div class="hint">${data.count} flows · <a href="#" onclick="dlCsv();return false">download CSV</a></div>`;
 }
 async function dlCsv(){const r=await fetch('/api/v1/flows?'+q({limit:10000,format:'csv'}));const d=await r.json();const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([d.csv],{type:'text/csv'}));a.download='bgflow-flows.csv';a.click()}
@@ -529,10 +586,10 @@ async function vAnomalies(){
     <button class="btn" onclick="load()">Scan</button></div>
    <div class="panel"><h3>Anomalies <span class="muted" style="text-transform:none">(z-score vs window baseline; needs ≥3 buckets)</span></h3><div id="tbl"></div></div>`;
   const by=$('#a_by').value,sig=$('#a_sigma').value||3;state.granularity=$('#a_gran').value;
-  const data=await api('/api/v1/anomalies?'+q({by,sigma:sig,limit:50}));
+  const data=await api('/api/v1/anomalies?'+q({by,sigma:sig,limit:50,compare:1}));
   const maxZ=(data.items||[])[0]?.zscore||1;
   const rows=(data.items||[]).map(a=>`<tr><td class="muted">${fmtT(a.t*1000)}</td>
-    <td class="clickable" onclick='clickDimRaw(${JSON.stringify(by)},${a.key_raw},${JSON.stringify(String(a.key))})'>${esc(a.key)}</td>
+    <td class="clickable" onclick='clickDimRaw(${JSON.stringify(by)},${a.key_raw},${JSON.stringify(String(a.key))})'>${a.is_new?'<span class="tag" style="margin-right:5px">NEW</span>':''}${esc(a.key)}</td>
     <td><span class="heat" style="width:${Math.min(100,a.zscore/maxZ*100)}%;background:linear-gradient(90deg,#fbbf24,#f87171)"></span></td>
     <td class="num">${a.zscore}σ</td><td class="num">${fmtB(a.bytes)}</td></tr>`).join('');
   $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Key</th><th></th><th class="num">Z</th><th class="num">Bytes</th></tr>${rows||'<tr><td colspan=5 class=muted>No anomalies — widen the range or lower sigma</td></tr>'}</table>`;
@@ -541,6 +598,9 @@ async function vAnomalies(){
 let expNames={};
 async function loadExpNames(){try{const d=await api('/api/v1/exporters');expNames={};(d.items||[]).forEach(e=>{if(e.name)expNames[e.ip]=e.name})}catch(e){}}
 function expLabel(ip){return expNames[ip]?`${expNames[ip]} (${ip})`:ip}
+let ifNames={};
+async function loadIfNames(){try{const d=await api('/api/v1/interfaces');ifNames={};(d.items||[]).forEach(e=>{if(e.name)ifNames[e.ifindex]=e.name})}catch(e){}}
+function ifLabel(i){if(!i)return'—';const n=ifNames[i];return n?`${esc(n)} <span class="muted">#${i}</span>`:`<span class="muted">#${i}</span>`}
 
 async function vExporters(){
   const [ex,st]=await Promise.all([api('/api/v1/exporters'),api('/api/v1/status')]);
@@ -743,25 +803,35 @@ async function vMetrics(){
 }
 
 function fmtUp(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h'}
-function refreshSys(){
-  fetch('/api/v1/status',{signal:AbortSignal.timeout(8000)}).then(r=>r.json()).then(d=>{
-    const el=$('#syschip');if(!el)return;
-    const sy=d.system||{};
-    if(!sy.ok){el.textContent='sys n/a';el.title='system stats unavailable on this platform';return}
-    const cpu=sy.cpu_pct==null?'—':sy.cpu_pct.toFixed(0)+'%';
-    const mem=sy.mem_pct==null?'—':sy.mem_pct.toFixed(0)+'%';
-    const dsk=sy.disk_pct==null?'—':sy.disk_pct.toFixed(0)+'%';
-    el.textContent=`CPU ${cpu} · MEM ${mem} · DSM ${dsk}`;
-    const st=d.status||{};
-    const stored=fmtB((st.flow_bytes||0)+(st.rollup_bytes||0)+(st.hourly_bytes||0));
-    el.title=`cpu ${cpu} of ${sy.cpu_count||'?'} cores · load ${sy.load1?.toFixed(2)??'—'}/${sy.load5?.toFixed(2)??'—'}/${sy.load15?.toFixed(2)??'—'}\n`
-      +`mem ${fmtB((sy.mem_used_mb||0)*1048576)} / ${fmtB((sy.mem_total_mb||0)*1048576)}\n`
-      +`disk ${sy.disk_path||''}: ${sy.disk_avail_gb??'?'}G free of ${sy.disk_total_gb??'?'}G\n`
-      +`bgflow stored: ${stored} (${st.flow_segments||0}f/${st.rollup_segments||0}r/${st.hourly_segments||0}h segs)`;
-    const ver=$('#ver');if(ver&&d.version){ver.textContent=`${d.version} · up ${fmtUp(st.uptime_secs||0)}`;ver.title='git: '+(d.git||'')}
-  }).catch(()=>{});
+function applyStatus(d){
+  const el=$('#syschip');if(!el)return;
+  const sy=d.system||{};
+  if(!sy.ok){el.textContent='sys n/a';el.title='system stats unavailable on this platform';return}
+  const cpu=sy.cpu_pct==null?'—':sy.cpu_pct.toFixed(0)+'%';
+  const mem=sy.mem_pct==null?'—':sy.mem_pct.toFixed(0)+'%';
+  const dsk=sy.disk_pct==null?'—':sy.disk_pct.toFixed(0)+'%';
+  el.textContent=`CPU ${cpu} · MEM ${mem} · DSM ${dsk}`;
+  const st=d.status||{};
+  const stored=fmtB((st.flow_bytes||0)+(st.rollup_bytes||0)+(st.hourly_bytes||0));
+  el.title=`cpu ${cpu} of ${sy.cpu_count||'?'} cores · load ${sy.load1?.toFixed(2)??'—'}/${sy.load5?.toFixed(2)??'—'}/${sy.load15?.toFixed(2)??'—'}\n`
+    +`mem ${fmtB((sy.mem_used_mb||0)*1048576)} / ${fmtB((sy.mem_total_mb||0)*1048576)}\n`
+    +`disk ${sy.disk_path||''}: ${sy.disk_avail_gb??'?'}G free of ${sy.disk_total_gb??'?'}G\n`
+    +`bgflow stored: ${stored} (${st.flow_segments||0}f/${st.rollup_segments||0}r/${st.hourly_segments||0}h segs)`;
+  const ver=$('#ver');if(ver&&d.version){ver.textContent=`${d.version} · up ${fmtUp(st.uptime_secs||0)}`;ver.title='git: '+(d.git||'')}
 }
-setInterval(refreshSys,10000);refreshSys();
+function refreshSys(){
+  fetch('/api/v1/status',{signal:AbortSignal.timeout(8000)}).then(r=>r.json()).then(applyStatus).catch(()=>{});
+}
+// Live channel: SSE pushes the same status payload every 2s (one server-side
+// computation shared by all clients). The 10s poll stays as fallback.
+function startStream(){
+  if(typeof EventSource==='undefined')return;
+  try{
+    const es=new EventSource('/api/v1/stream');
+    es.addEventListener('status',e=>{try{applyStatus(JSON.parse(e.data))}catch(_){}});
+  }catch(e){}
+}
+setInterval(refreshSys,10000);refreshSys();startStream();
 probeAuth();
 </script>
 </body>

@@ -4,7 +4,7 @@
 use crate::auth::AuthState;
 use crate::config::{self, AlertsConfig};
 use crate::enrich::HttpEnrichers;
-use crate::query::ExporterNames;
+use crate::query::{ExporterNames, InterfaceNames};
 use crate::rules::Ruleset;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -17,6 +17,7 @@ pub struct AdminShared {
     pub rules: Arc<Ruleset>,
     pub enrich: Arc<HttpEnrichers>,
     pub exporter_names: Arc<RwLock<ExporterNames>>,
+    pub interface_names: Arc<RwLock<InterfaceNames>>,
     pub auth: Arc<AuthState>,
     pub alerts: Arc<RwLock<AlertsConfig>>,
 }
@@ -68,6 +69,8 @@ impl AdminShared {
 
         *self.exporter_names.write().unwrap() = ExporterNames::build(&cfg.exporter_names);
         rep.exporter_names = cfg.exporter_names.len();
+
+        *self.interface_names.write().unwrap() = InterfaceNames::build(&cfg.interface_names);
 
         rep.users = self.auth.reload_users(&cfg.users);
 

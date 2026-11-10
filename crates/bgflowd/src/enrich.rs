@@ -1009,6 +1009,124 @@ impl HttpEnrichers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PTR (reverse DNS) cache — async, non-blocking, TTL'd
+// ---------------------------------------------------------------------------
+
+struct PtrEntry {
+    /// None = known-negative (NXDOMAIN/no PTR), Some = hostname.
+    name: Option<String>,
+    at: std::time::Instant,
+}
+
+const PTR_POS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const PTR_NEG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Don't queue more than this many in-flight lookups.
+const PTR_PENDING_MAX: usize = 50_000;
+
+/// Reverse-DNS cache. `get` is a cheap sync read — misses enqueue a
+/// background `getnameinfo` and return "unknown" so query paths never
+/// block on DNS. `resolve` does one bounded blocking lookup (for the
+/// manual /lookup endpoint) and populates the cache.
+pub struct PtrCache {
+    map: Arc<RwLock<HashMap<u128, PtrEntry>>>,
+    pending: Arc<Mutex<HashSet<u128>>>,
+    tx: tokio::sync::mpsc::UnboundedSender<u128>,
+}
+
+impl PtrCache {
+    pub fn new() -> Arc<Self> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u128>();
+        let this = Arc::new(PtrCache {
+            map: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashSet::new())),
+            tx,
+        });
+        let worker = PtrWorker {
+            map: this.map.clone(),
+            pending: this.pending.clone(),
+        };
+        tokio::spawn(async move {
+            while let Some(ip) = rx.recv().await {
+                worker.resolve_one(ip).await;
+            }
+        });
+        this
+    }
+
+    /// Sync cache read. `Some(Some(name))` = hostname, `Some(None)` =
+    /// known no-PTR, `None` = unknown (enqueued for background resolve).
+    pub fn get(&self, ip_u128: u128) -> Option<Option<String>> {
+        let mut g = self.map.read().unwrap();
+        if let Some(e) = g.get(&ip_u128) {
+            let ttl = if e.name.is_some() { PTR_POS_TTL } else { PTR_NEG_TTL };
+            if e.at.elapsed() < ttl {
+                return Some(e.name.clone());
+            }
+        }
+        drop(g);
+        // Miss/expired → enqueue once.
+        {
+            let mut p = self.pending.lock().unwrap();
+            if p.len() >= PTR_PENDING_MAX {
+                return None;
+            }
+            if p.insert(ip_u128) {
+                let _ = self.tx.send(ip_u128);
+            }
+        }
+        None
+    }
+
+    /// Bounded blocking resolve for interactive lookups; fills the cache.
+    pub async fn resolve(&self, ip: IpAddr) -> Option<String> {
+        let u = ip_to_u128(&ip);
+        if let Some(v) = self.get(u) {
+            return v;
+        }
+        let name = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip).ok()),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            _ => None,
+        };
+        self.insert(u, name.clone());
+        name
+    }
+
+    fn insert(&self, ip_u128: u128, name: Option<String>) {
+        self.map.write().unwrap().insert(
+            ip_u128,
+            PtrEntry { name, at: std::time::Instant::now() },
+        );
+        self.pending.lock().unwrap().remove(&ip_u128);
+    }
+}
+
+/// Worker-side state (shares the Arc'd maps with the cache).
+struct PtrWorker {
+    map: Arc<RwLock<HashMap<u128, PtrEntry>>>,
+    pending: Arc<Mutex<HashSet<u128>>>,
+}
+
+impl PtrWorker {
+    async fn resolve_one(&self, ip_u128: u128) {
+        let ip = u128_to_ip(ip_u128);
+        let name = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip).ok())
+            .await
+            .ok()
+            .flatten();
+        self.map.write().unwrap().insert(
+            ip_u128,
+            PtrEntry { name, at: std::time::Instant::now() },
+        );
+        self.pending.lock().unwrap().remove(&ip_u128);
+    }
+}
+
 /// Convenience: apply all synchronous enrichment to a record.
 pub fn enrich_record(
     rec: &mut FlowRecord,

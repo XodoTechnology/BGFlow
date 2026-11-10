@@ -21,6 +21,10 @@ pub struct Config {
     /// Friendly names for exporters, keyed by exporter IP:
     /// [exporter_names] "10.0.0.1" = "edge-rtr"
     pub exporter_names: std::collections::BTreeMap<String, String>,
+    /// Interface names, keyed by ifIndex (as carried in flow records):
+    /// [interface_names] "2" = "ae0"
+    #[serde(default)]
+    pub interface_names: std::collections::BTreeMap<String, String>,
     /// Multi-user accounts for the UI/API.
     /// [[users]] name = "admin" password_hash = "pbkdf2-sha256$..." role = "admin"
     /// Generate hashes with `bgflowd hash-password`. Roles: admin | viewer.
@@ -279,6 +283,7 @@ impl Default for Config {
             demo: DemoConfig::default(),
             alerts: AlertsConfig::default(),
             exporter_names: Default::default(),
+            interface_names: Default::default(),
             users: vec![],
         }
     }

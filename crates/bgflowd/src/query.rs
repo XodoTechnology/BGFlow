@@ -1,7 +1,7 @@
 //! Query path: scans segment files directly using the writer-published
 //! segment indexes, so HTTP queries never contend with the ingest writer.
 
-use crate::enrich::StringTable;
+use crate::enrich::{PtrCache, StringTable};
 use crate::rules::Ruleset;
 use crate::writer::SegmentIndex;
 use anyhow::Result;
@@ -57,6 +57,33 @@ impl ExporterNames {
     }
 }
 
+/// Interface names from `[interface_names]` config, keyed by ifIndex.
+/// Swapped on SIGHUP reload like exporter names.
+#[derive(Default)]
+pub struct InterfaceNames {
+    by_if: HashMap<u32, String>,
+}
+
+impl InterfaceNames {
+    pub fn build(map: &std::collections::BTreeMap<String, String>) -> Self {
+        let mut e = InterfaceNames::default();
+        for (k, v) in map {
+            if let Ok(i) = k.trim().parse::<u32>() {
+                e.by_if.insert(i, v.clone());
+            }
+        }
+        e
+    }
+
+    pub fn name_of(&self, ifindex: u32) -> Option<&str> {
+        self.by_if.get(&ifindex).map(|s| s.as_str())
+    }
+
+    pub fn all(&self) -> &HashMap<u32, String> {
+        &self.by_if
+    }
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub flow_index: SegmentIndex,
@@ -66,6 +93,9 @@ pub struct Ctx {
     pub orgs: Arc<StringTable>,
     pub rules: Arc<Ruleset>,
     pub exporter_names: Arc<RwLock<ExporterNames>>,
+    pub interface_names: Arc<RwLock<InterfaceNames>>,
+    /// Reverse-DNS cache — non-blocking lookups for flow rows.
+    pub ptr: Arc<PtrCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +868,10 @@ pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
         "duration_ms": f.duration_ms,
         "src_ip": ip_string(f.src_ip),
         "dst_ip": ip_string(f.dst_ip),
+        // PTR names resolve in the background — a miss returns null now and
+        // fills the cache for subsequent requests.
+        "src_ptr": ctx.ptr.get(f.src_ip).flatten().map_or(serde_json::Value::Null, |s| serde_json::json!(s)),
+        "dst_ptr": ctx.ptr.get(f.dst_ip).flatten().map_or(serde_json::Value::Null, |s| serde_json::json!(s)),
         "src_port": f.src_port,
         "dst_port": f.dst_port,
         "protocol": f.protocol,

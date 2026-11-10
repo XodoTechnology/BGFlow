@@ -11,7 +11,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{sse::Sse, Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -178,10 +178,10 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+fn status_payload(st: &AppState) -> serde_json::Value {
     let s = st.status.read().unwrap().clone();
     let system = crate::sys::sample(&st.config.storage.data_dir);
-    Json(serde_json::json!({
+    serde_json::json!({
         "version": env!("BGFLOW_VERSION_DISPLAY"),
         "git": env!("BGFLOW_GIT_DESCRIBE"),
         "system": system,
@@ -193,7 +193,39 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "enabled": !st.auth.is_open(),
             "users": st.auth.user_count(),
         },
-    }))
+    })
+}
+
+async fn status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(status_payload(&st))
+}
+
+/// SSE stream of status payloads — the UI's live channel for sys stats,
+/// uptime and writer health (2s cadence, one computation shared by all
+/// connected clients).
+async fn stream(
+    State(st): State<Arc<AppState>>,
+) -> Sse<tokio_stream::wrappers::ReceiverStream<Result<axum::response::sse::Event, std::convert::Infallible>>> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(8);
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            iv.tick().await;
+            let payload = status_payload(&st);
+            let ev = Event::default().event("status").json_data(payload);
+            match ev {
+                Ok(ev) => {
+                    if tx.send(Ok(ev)).await.is_err() {
+                        break; // client gone
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))
 }
 
 async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
@@ -595,9 +627,41 @@ async fn overview(
         );
     }
 
+    // Optional period-over-period: totals for the preceding equal-length
+    // window under the same filters — powers "vs previous" deltas in the UI.
+    let prev = if q.contains_key("compare") {
+        let span = to.saturating_sub(from);
+        let pfrom = from.saturating_sub(span);
+        let pneed = query::rollup_needed(&f, &[]);
+        let pt = query::rollup_scan_par(
+            &st.ctx,
+            set,
+            pfrom,
+            from,
+            &pneed,
+            Agg::default,
+            |acc: &mut Agg, r: &query::RollupRow| {
+                if f.matches(r) {
+                    acc.bytes += r.bytes();
+                    acc.packets += r.packets();
+                    acc.flows += r.flows();
+                }
+            },
+            |a: &mut Agg, b: Agg| agg_add(a, &b),
+        )
+        .map_err(|e| err(e.to_string()))?;
+        Some(serde_json::json!({
+            "from": pfrom, "to": from,
+            "bytes": pt.bytes, "packets": pt.packets, "flows": pt.flows,
+        }))
+    } else {
+        None
+    };
+
     Ok(Json(serde_json::json!({
         "from": from, "to": to,
         "bytes": total.bytes, "packets": total.packets, "flows": total.flows,
+        "prev": prev,
         "by_protocol": protos,
         "bucket_ms": size,
         "series": ts_rows,
@@ -882,6 +946,15 @@ async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"items": items}))
 }
 
+async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let g = st.ctx.interface_names.read().unwrap();
+    let mut items: Vec<_> = g.all().iter().collect();
+    items.sort_by_key(|(k, _)| **k);
+    Json(serde_json::json!({
+        "items": items.iter().map(|(k, v)| serde_json::json!({"ifindex": k, "name": v})).collect::<Vec<_>>()
+    }))
+}
+
 async fn labels(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let items: Vec<_> = st
         .ctx
@@ -950,6 +1023,38 @@ async fn anomalies(
         }
     }
 
+    // Optional "new in window" marking: with compare=1, keys absent from
+    // the preceding equal-length window get is_new=true.
+    let prev_keys: Option<std::collections::HashSet<u128>> = if q.contains_key("compare") {
+        let span = to.saturating_sub(from);
+        let (shards2, _) = query::rollup_scan_sharded(
+            &st.ctx,
+            set,
+            from.saturating_sub(span),
+            from,
+            &needed,
+            &f,
+            bgflow_store::scan_threads() * 4,
+            |r, out| {
+                out.push((query::dim_key(by, r), 1u8));
+            },
+            |a: &mut u8, b: u8| *a |= b,
+            unit_init,
+            unit_add,
+            unit_merge,
+        )
+        .map_err(|e| err(e.to_string()))?;
+        let mut s = std::collections::HashSet::new();
+        for m in shards2 {
+            for (k, _) in m {
+                s.insert(k);
+            }
+        }
+        Some(s)
+    } else {
+        None
+    };
+
     struct Anom {
         key: u128,
         bucket: u64,
@@ -987,6 +1092,7 @@ async fn anomalies(
                 "t": a.bucket / 1000,
                 "bytes": a.bytes,
                 "zscore": (a.z * 100.0).round() / 100.0,
+                "is_new": prev_keys.as_ref().map(|s| !s.contains(&a.key)),
             })
         })
         .collect();
@@ -1153,6 +1259,9 @@ async fn lookup(
     let s = q.get("ip").ok_or_else(|| err("missing ip"))?;
     let ip: IpAddr = s.parse().map_err(|_| err("bad ip"))?;
     let mut v = st.http_enrich.lookup_ip(ip);
+    if let Some(ptr) = st.ctx.ptr.resolve(ip).await {
+        v["ptr"] = serde_json::json!(ptr);
+    }
     if let Some(det) = st.geo.lookup_detail(ip) {
         if let Some(arr) = v.get_mut("results").and_then(|r| r.as_array_mut()) {
             arr.insert(
@@ -1405,6 +1514,7 @@ pub fn router(st: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/stream", get(stream))
         // Expensive scan endpoints get a stale-while-revalidate cache:
         // the UI polls these on an interval, so serving the previous
         // response while a background recompute runs keeps the dashboard
@@ -1423,6 +1533,7 @@ pub fn router(st: Arc<AppState>) -> Router {
                 .layer(crate::qcache::SwrCacheLayer::new()),
         )
         .route("/api/v1/exporters", get(exporters))
+        .route("/api/v1/interfaces", get(interfaces))
         .route("/api/v1/labels", get(labels))
         .route("/api/v1/enrichers", get(enrichers))
         .route("/api/v1/lookup", get(lookup))

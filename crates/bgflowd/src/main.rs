@@ -207,11 +207,16 @@ async fn main() -> Result<()> {
         },
     );
 
-    // Exporter names + alert rules are reloadable shared state.
+    // Exporter/interface names + alert rules are reloadable shared state.
     let exporter_names =
         Arc::new(RwLock::new(query::ExporterNames::build(
             &cfg.exporter_names,
         )));
+    let interface_names =
+        Arc::new(RwLock::new(query::InterfaceNames::build(
+            &cfg.interface_names,
+        )));
+    let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
 
     // Admin operations shared by SIGHUP and POST /api/v1/admin/reload.
@@ -220,6 +225,7 @@ async fn main() -> Result<()> {
         rules: rules.clone(),
         enrich: http_enrich.clone(),
         exporter_names: exporter_names.clone(),
+        interface_names: interface_names.clone(),
         auth: auth.clone(),
         alerts: alerts_cfg.clone(),
     });
@@ -232,6 +238,8 @@ async fn main() -> Result<()> {
             orgs: orgs.clone(),
             rules: rules.clone(),
             exporter_names: exporter_names.clone(),
+            interface_names: interface_names.clone(),
+            ptr: ptr.clone(),
         },
         status: shared.status.clone(),
         metrics: metrics.clone(),
