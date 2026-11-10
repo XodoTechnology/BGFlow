@@ -15,6 +15,34 @@ pub struct Config {
     pub inputs: Vec<InputConfig>,
     pub enrichers: Vec<EnricherConfig>,
     pub rules: Vec<RuleConfig>,
+    pub demo: DemoConfig,
+}
+
+/// Synthetic demo traffic (NetFlow v5) — for trying out the UI.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DemoConfig {
+    pub enabled: bool,
+    /// Send to this address; defaults to 127.0.0.1:<first input port>.
+    pub target: Option<SocketAddr>,
+    /// Datagrams per second.
+    pub pps: u64,
+    /// Flow records per datagram.
+    pub flows_per_pkt: usize,
+    /// Seconds to run; 0 = forever.
+    pub duration_secs: u64,
+}
+
+impl Default for DemoConfig {
+    fn default() -> Self {
+        DemoConfig {
+            enabled: false,
+            target: None,
+            pps: 20,
+            flows_per_pkt: 20,
+            duration_secs: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,11 +87,13 @@ pub struct GeoIpConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct InputConfig {
-    /// UDP listen address, e.g. "0.0.0.0:2055".
+    /// Listen address, e.g. "0.0.0.0:2055".
     pub listen: SocketAddr,
     /// auto | netflow5 | netflow9 | ipfix | sflow
     pub protocol: String,
-    /// Only accept datagrams from these exporter IPs (empty = all).
+    /// udp | tcp | both. TCP transport supports IPFIX only.
+    pub transport: String,
+    /// Only accept datagrams/connections from these exporter IPs (empty = all).
     pub allowed_exporters: Vec<std::net::IpAddr>,
 }
 
@@ -162,10 +192,12 @@ impl Default for Config {
             inputs: vec![InputConfig {
                 listen: "0.0.0.0:2055".parse().unwrap(),
                 protocol: "auto".into(),
+                transport: "udp".into(),
                 allowed_exporters: vec![],
             }],
             enrichers: vec![],
             rules: vec![],
+            demo: DemoConfig::default(),
         }
     }
 }
@@ -208,6 +240,7 @@ impl Default for InputConfig {
         InputConfig {
             listen: "0.0.0.0:2055".parse().unwrap(),
             protocol: "auto".into(),
+            transport: "udp".into(),
             allowed_exporters: vec![],
         }
     }

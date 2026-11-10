@@ -134,11 +134,19 @@ async fn main() -> Result<()> {
     tracing::info!("http: listening on {}", cfg.server.http_listen);
     let serve = axum::serve(listener, app);
 
-    // Demo sender runs in the background; daemon keeps serving regardless.
-    if let Some(target) = args.demo {
-        let pps = args.demo_pps;
-        let flows = args.demo_flows;
-        let secs = args.demo_secs;
+    // Demo traffic: --demo flag wins, else [demo] config section.
+    let demo_target = args.demo.or_else(|| {
+        cfg.demo.enabled.then(|| {
+            cfg.demo.target.unwrap_or_else(|| {
+                let port = cfg.inputs.first().map(|i| i.listen.port()).unwrap_or(2055);
+                format!("127.0.0.1:{}", port).parse().unwrap()
+            })
+        })
+    });
+    if let Some(target) = demo_target {
+        let pps = if args.demo.is_some() { args.demo_pps } else { cfg.demo.pps };
+        let flows = if args.demo.is_some() { args.demo_flows } else { cfg.demo.flows_per_pkt };
+        let secs = if args.demo.is_some() { args.demo_secs } else { cfg.demo.duration_secs };
         tokio::spawn(async move {
             let dur = if secs == 0 { None } else { Some(secs) };
             tracing::info!("demo: sending traffic to {}", target);

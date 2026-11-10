@@ -14,7 +14,8 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
 - **In-memory rollups** — 1-minute aggregates keep long-range queries fast and
   storage small; raw flows kept for a shorter retention window.
 - **Protocols**: NetFlow v5, NetFlow v9 (template cache), IPFIX (enterprise +
-  variable-length fields), sFlow v5. Auto-detected per datagram on one port.
+  variable-length fields, UDP **and TCP** stream transport), sFlow v5.
+  Auto-detected per datagram on one port.
 - **Enrichment**: MaxMind MMDB (GeoLite2-ASN/Country) plus **pluggable HTTP
   backends** — point it at your own whois/RDAP/IRR services (e.g. `irrd3.net`)
   with configurable JSON field mapping and prefix-granularity caching.
@@ -45,6 +46,7 @@ Or run the demo to see it ingest synthetic NetFlow:
 
 ```bash
 bgflowd --demo 127.0.0.1:2055 --demo-secs 60
+# or enable [demo] in bgflow.toml — then just run bgflowd
 # then browse http://localhost:8080
 ```
 

@@ -8,10 +8,12 @@ mod ipfix;
 mod netflow_v5;
 mod netflow_v9;
 mod sflow;
+mod stream;
 mod template;
 
 pub use ipfix::BootEstimator;
 pub use netflow_v9::{DomainTemplates, TemplateKey};
+pub use stream::IpfixTcpDecoder;
 
 use bgflow_types::FlowRecord;
 use std::collections::HashMap;

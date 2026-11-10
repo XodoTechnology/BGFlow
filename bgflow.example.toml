@@ -37,8 +37,15 @@ country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
 [[inputs]]
 listen = "0.0.0.0:2055"
 protocol = "auto"
+# transport = "udp"        # udp | tcp | both  (tcp = IPFIX stream only)
 # Optional exporter allowlist:
 # allowed_exporters = ["10.0.0.1", "10.0.0.2"]
+
+# IPFIX over TCP example:
+# [[inputs]]
+# listen = "0.0.0.0:4739"
+# protocol = "ipfix"
+# transport = "tcp"
 
 # [[inputs]]
 # listen = "0.0.0.0:6343"
@@ -107,3 +114,12 @@ dst_port = 53
 # name = "backup-window"
 # dst_port = 873          # rsync
 # exporter = "10.0.0.1"
+
+# --- Demo traffic -------------------------------------------------------------
+# Send synthetic NetFlow v5 to the first input — handy for trying the UI.
+# (Or use: bgflowd --demo 127.0.0.1:2055)
+# [demo]
+# enabled = true
+# pps = 20
+# flows_per_pkt = 20
+# duration_secs = 0       # 0 = forever
