@@ -486,6 +486,75 @@ impl<R: Record> Dataset<R> {
     }
 }
 
+/// Decode worker count for parallel segment scans.
+fn scan_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+/// Scan segments whose indices are in `idx` (positions into `infos`),
+/// decoding each with `decode` on a small thread pool and invoking `f`
+/// strictly in `idx` order. Decoding (file read + decompression) is the
+/// expensive part of a scan and is per-segment independent, so it runs
+/// `scan_threads()`-wide; aggregation stays sequential on the caller.
+///
+/// Segments are processed in batches so peak memory stays bounded
+/// (~batch_size decoded segments alive at once) and an early `Break`
+/// only wastes the remainder of the current batch.
+fn parallel_scan<T, D>(
+    infos: &[SegmentInfo],
+    idx: &[usize],
+    decode: D,
+    mut f: impl FnMut(T) -> ControlFlow<()>,
+) -> Result<()>
+where
+    T: Send,
+    D: Fn(&SegmentInfo) -> Result<T> + Sync,
+{
+    const BATCH: usize = 32;
+    let nthreads = scan_threads();
+    for chunk in idx.chunks(BATCH) {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<Option<Result<T>>> = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..nthreads.min(chunk.len()) {
+                let tx = tx.clone();
+                let next = &next;
+                let decode = &decode;
+                s.spawn(move || loop {
+                    let p = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if p >= chunk.len() {
+                        break;
+                    }
+                    let _ = tx.send((p, decode(&infos[chunk[p]])));
+                });
+            }
+            drop(tx);
+            let mut slots: Vec<Option<Result<T>>> = (0..chunk.len()).map(|_| None).collect();
+            for _ in 0..chunk.len() {
+                if let Ok((p, res)) = rx.recv() {
+                    slots[p] = Some(res);
+                }
+            }
+            slots
+        });
+        for slot in results {
+            match slot {
+                Some(Ok(v)) => {
+                    if f(v).is_break() {
+                        return Ok(());
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Like `for_each_segment_info` but decodes only the requested columns.
 /// The callback receives `(col_idx, ColumnData)` pairs (in request order)
 /// plus the row count — callers index columns by `col_idx`.
@@ -507,16 +576,13 @@ pub fn for_each_segment_cols(
     if newest_first {
         idx.reverse();
     }
-    for i in idx {
-        let info = &infos[i];
+    parallel_scan(infos, &idx, |info| {
         let reader = segment::SegmentReader::open(&info.path)?;
         let columns = reader.decode_columns(cols)?;
-        let rows = reader.header.row_count as usize;
-        if f(&columns, rows).is_break() {
-            break;
-        }
-    }
-    Ok(())
+        Ok((columns, reader.header.row_count as usize))
+    }, |(columns, rows)| {
+        f(&columns, rows)
+    })
 }
 
 /// Scan a caller-provided segment index (e.g. a snapshot taken from a
@@ -539,18 +605,12 @@ pub fn for_each_segment_info<R: Record>(
     if newest_first {
         idx.reverse();
     }
-    for i in idx {
-        let info = &infos[i];
+    parallel_scan(infos, &idx, |info| {
         let reader = segment::SegmentReader::open(&info.path)?;
-        let columns = reader.decode_all()?;
-        let scan = ScanResult {
+        Ok(ScanResult {
             schema,
             rows: reader.header.row_count as usize,
-            columns,
-        };
-        if f(&scan).is_break() {
-            break;
-        }
-    }
-    Ok(())
+            columns: reader.decode_all()?,
+        })
+    }, |scan| f(&scan))
 }

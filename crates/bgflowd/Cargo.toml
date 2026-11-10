@@ -21,6 +21,7 @@ clap = { workspace = true }
 maxminddb = { workspace = true }
 axum = { workspace = true }
 toml = { workspace = true }
+tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
 socket2 = "0.5"

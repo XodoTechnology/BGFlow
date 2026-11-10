@@ -1183,19 +1183,27 @@ pub fn router(st: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
-        .route("/api/v1/flows", get(flows))
-        .route("/api/v1/summary", get(summary))
-        .route("/api/v1/overview", get(overview))
-        .route("/api/v1/matrix", get(matrix))
-        .route("/api/v1/timeseries", get(timeseries))
-        .route("/api/v1/top", get(top))
-        .route("/api/v1/conversations", get(conversations))
+        // Expensive scan endpoints get a stale-while-revalidate cache:
+        // the UI polls these on an interval, so serving the previous
+        // response while a background recompute runs keeps the dashboard
+        // instant instead of pinning a core for seconds per refresh.
+        .merge(
+            Router::new()
+                .route("/api/v1/flows", get(flows))
+                .route("/api/v1/summary", get(summary))
+                .route("/api/v1/overview", get(overview))
+                .route("/api/v1/matrix", get(matrix))
+                .route("/api/v1/timeseries", get(timeseries))
+                .route("/api/v1/top", get(top))
+                .route("/api/v1/conversations", get(conversations))
+                .route("/api/v1/anomalies", get(anomalies))
+                .route("/api/v1/label_stats", get(label_stats))
+                .layer(crate::qcache::SwrCacheLayer::new()),
+        )
         .route("/api/v1/exporters", get(exporters))
         .route("/api/v1/labels", get(labels))
         .route("/api/v1/enrichers", get(enrichers))
         .route("/api/v1/lookup", get(lookup))
-        .route("/api/v1/anomalies", get(anomalies))
-        .route("/api/v1/label_stats", get(label_stats))
         .route("/api/v1/config", get(config_view))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/auth/login", post(auth_login))

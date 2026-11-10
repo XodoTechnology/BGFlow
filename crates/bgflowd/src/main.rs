@@ -10,6 +10,7 @@ mod demo;
 mod enrich;
 mod ingest;
 mod metrics;
+mod qcache;
 mod query;
 mod rules;
 mod sys;
