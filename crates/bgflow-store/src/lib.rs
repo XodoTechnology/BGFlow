@@ -11,7 +11,7 @@ pub mod schema;
 pub mod segment;
 pub mod timeutil;
 
-pub use dataset::{for_each_segment_info, Dataset, DatasetOpts, Record, ScanResult};
+pub use dataset::{for_each_segment_cols, for_each_segment_info, Dataset, DatasetOpts, Record, ScanResult};
 pub use encode::ColumnData;
 pub use rollup::RollupAggregator;
 pub use schema::{schema_by_id, RAW_SCHEMA, ROLLUP_SCHEMA};

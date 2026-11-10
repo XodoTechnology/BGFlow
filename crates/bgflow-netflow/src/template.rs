@@ -79,6 +79,12 @@ pub struct FlowBuilder {
     pub engine_type: u8,
     pub sampler_interval: u32,
     pub tcp_state: u8,
+    pub ip_ttl: u8,
+    pub flow_end_reason: u8,
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    pub post_nat_src: u128,
+    pub post_nat_dst: u128,
 
     // unresolved timestamp candidates (epoch ms or sysUpTime ms)
     pub end_epoch_ms: Option<u64>,
@@ -165,6 +171,12 @@ impl FlowBuilder {
             sampler_interval: self.sampler_interval,
             tcp_state: self.tcp_state,
             label_id: 0,
+            ip_ttl: self.ip_ttl,
+            flow_end_reason: self.flow_end_reason,
+            icmp_type: self.icmp_type,
+            icmp_code: self.icmp_code,
+            post_nat_src: self.post_nat_src,
+            post_nat_dst: self.post_nat_dst,
         }
     }
 }
@@ -206,6 +218,15 @@ mod ie {
     pub const FLOW_END_MICROSECONDS: u16 = 155;
     pub const FLOW_START_NANOSECONDS: u16 = 156;
     pub const FLOW_END_NANOSECONDS: u16 = 157;
+    pub const ICMP_TYPE_CODE_IPV4: u16 = 32;
+    pub const IP_VERSION: u16 = 60;
+    pub const FLOW_END_REASON: u16 = 136;
+    pub const ICMP_TYPE_CODE_IPV6: u16 = 139;
+    pub const IP_TTL: u16 = 192;
+    pub const POST_NAT_SRC_IPV4: u16 = 225;
+    pub const POST_NAT_DST_IPV4: u16 = 226;
+    pub const POST_NAT_SRC_IPV6: u16 = 281;
+    pub const POST_NAT_DST_IPV6: u16 = 282;
     pub const INGRESS_PHYSICAL_INTERFACE: u16 = 252;
     pub const EGRESS_PHYSICAL_INTERFACE: u16 = 253;
     pub const DOT1Q_VLAN_ID: u16 = 243;
@@ -405,6 +426,43 @@ pub fn decode_record(
                 let s = be_uint(val) as u64;
                 b.end_sysup_ms = Some(s);
                 *sysup_max = (*sysup_max).max(s);
+            }
+            ie::IP_TTL => {
+                if !val.is_empty() {
+                    b.ip_ttl = val[val.len() - 1];
+                }
+            }
+            ie::FLOW_END_REASON => {
+                if !val.is_empty() {
+                    b.flow_end_reason = val[val.len() - 1];
+                }
+            }
+            ie::ICMP_TYPE_CODE_IPV4 | ie::ICMP_TYPE_CODE_IPV6 => {
+                // [type u8][code u8]
+                if !val.is_empty() {
+                    b.icmp_type = val[0];
+                    if val.len() > 1 {
+                        b.icmp_code = val[1];
+                    }
+                }
+            }
+            ie::POST_NAT_SRC_IPV4 | ie::POST_NAT_SRC_IPV6 => {
+                if val.len() >= 4 {
+                    b.post_nat_src = if val.len() >= 16 {
+                        v6_to_u128(&val[val.len() - 16..])
+                    } else {
+                        v4_to_u128(&val[val.len() - 4..])
+                    };
+                }
+            }
+            ie::POST_NAT_DST_IPV4 | ie::POST_NAT_DST_IPV6 => {
+                if val.len() >= 4 {
+                    b.post_nat_dst = if val.len() >= 16 {
+                        v6_to_u128(&val[val.len() - 16..])
+                    } else {
+                        v4_to_u128(&val[val.len() - 4..])
+                    };
+                }
             }
             _ => {}
         }

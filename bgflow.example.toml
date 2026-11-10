@@ -8,6 +8,9 @@ http_listen = "0.0.0.0:8080"
 # auth = "admin:change-me"
 # Allow cross-origin API access (UI is same-origin; off by default)
 # cors = false
+# TLS: serve HTTPS directly (both required; otherwise plain HTTP).
+# tls_cert = "/etc/bgflow/tls.crt"
+# tls_key  = "/etc/bgflow/tls.key"
 
 [storage]
 # Data directory for .bfs segments + org string table.
@@ -23,6 +26,11 @@ raw_retention_days = 7
 rollup_retention_days = 90
 # How often retention sweeps run.
 retention_interval_secs = 300
+# Coarse rollup dataset: hourly buckets with /24·/48-masked IPs — low
+# cardinality, kept for coarse_retention_days. Query it with
+# granularity=hourly on /api/v1/top|summary|timeseries.
+coarse_rollup = true
+coarse_retention_days = 365
 
 [geoip]
 # MaxMind GeoLite2 databases (optional). Download from maxmind.com.
@@ -93,6 +101,20 @@ country = "$.country"
 # org = "$.name"
 # country = "$.country"
 
+# --- Table enricher: bulk prefix -> ASN/org/country --------------------------
+# Loads a prefix table (local file or URL) and does exact longest-prefix-match
+# lookups synchronously — no per-IP HTTP calls, ideal for BGP/IRR-scale data.
+# Line format (whitespace separated, '#' comments):
+#   1.2.3.0/24 13335 "Acme Corp" US
+#   2001:db8::/32 AS64496 Acme GB
+#   route: 10.0.0.0/8 origin: AS64512   (RPSL-ish, best effort)
+# asn may be digits or AS-prefixed; country = 2-letter code; rest = org name.
+# [[enrichers]]
+# type = "table"
+# name = "bgp-ribs"
+# path = "/var/lib/bgflow/prefixes.txt"   # or https://example.com/dump.txt
+# refresh_secs = 3600                     # re-read interval (min 60)
+
 # --- Label rules -------------------------------------------------------------
 # First matching rule wins; label_id is stored on the flow and shown in the UI.
 # All specified fields must match (AND). Omit a field to wildcard it.
@@ -122,6 +144,32 @@ dst_port = 53
 # name = "backup-window"
 # dst_port = 873          # rsync
 # exporter = "10.0.0.1"
+
+# --- Threshold alerts ---------------------------------------------------------
+# Evaluated every eval_secs over the rollup datasets. metric: bytes|packets|
+# flows|pps|mbps (per-second rate over window_secs). op: gt|gte|lt|lte.
+# group_by: any /top dimension (src_ip, src_asn, dst_country, label, ...).
+# granularity: minute (default) | hourly. Fires -> log + metric + webhook_url.
+# [alerts]
+# eval_secs = 60
+# cooldown_secs = 900        # min seconds between repeat fires per group
+# webhook_url = "https://alerts.example.com/hook"
+# [[alerts.rules]]
+# name = "dns-flood"
+# metric = "mbps"
+# op = "gt"
+# threshold = 500
+# window_secs = 300
+# group_by = "dst_port"
+# proto = 17
+# [[alerts.rules]]
+# name = "new-country-spike"
+# metric = "bytes"
+# op = "gt"
+# threshold = 100000000    # >100MB/s
+# window_secs = 600
+# group_by = "src_country"
+# min_change_pct = 200     # only fire on >2x jump vs previous window
 
 # --- Demo traffic -------------------------------------------------------------
 # Send synthetic NetFlow v5 to the first input — handy for trying the UI.

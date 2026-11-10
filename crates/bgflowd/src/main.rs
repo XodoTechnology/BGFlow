@@ -1,5 +1,6 @@
 //! bgflowd — BGFlow daemon: flow collector, storage engine, API, UI.
 
+mod alerts;
 mod api;
 mod config;
 mod demo;
@@ -85,7 +86,7 @@ async fn main() -> Result<()> {
         orgs.clone(),
     )?);
     if http_enrich.enabled() {
-        tracing::info!("{} HTTP enricher(s) configured", http_enrich.items.len());
+        tracing::info!("{} enricher backend(s) configured", http_enrich.backend_count());
         let h = http_enrich.clone();
         tokio::spawn(async move { h.run().await });
     }
@@ -124,26 +125,69 @@ async fn main() -> Result<()> {
     );
 
     // --- HTTP API + UI ---
-    let label_names: std::collections::HashMap<u32, String> = rules
-        .list()
-        .into_iter()
-        .map(|(id, n)| (id, n.to_string()))
-        .collect();
     let app_state = Arc::new(AppState {
         ctx: query::Ctx {
             flow_index: shared.flow_index.clone(),
             rollup_index: shared.rollup_index.clone(),
+            hourly_index: shared.hourly_index.clone(),
             orgs: orgs.clone(),
             rules: rules.clone(),
-            label_names,
         },
         status: shared.status.clone(),
         metrics: metrics.clone(),
         http_enrich: http_enrich.clone(),
+        geo: geo.clone(),
         config: Arc::new(cfg.clone()),
     });
 
+    // Alert evaluation loop (no-op when no rules configured).
+    {
+        let acfg = cfg.alerts.clone();
+        let c = app_state.ctx.clone();
+        let m = metrics.clone();
+        tokio::spawn(async move { alerts::run(acfg, c, m).await });
+    }
+
+    // SIGHUP: reload rules + enrichers without dropping ingest.
+    {
+        let cfg_path = config::resolve_path(args.config.as_ref());
+        let rules_h = rules.clone();
+        let enrich_h = http_enrich.clone();
+        tokio::spawn(async move {
+            let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGHUP handler unavailable: {}", e);
+                    return;
+                }
+            };
+            loop {
+                sig.recv().await;
+                match config::load(cfg_path.as_ref()) {
+                    Ok(new_cfg) => {
+                        rules_h.reload(&new_cfg.rules);
+                        if let Err(e) = enrich_h.reload(&new_cfg.enrichers) {
+                            tracing::warn!("enricher reload failed: {}", e);
+                        }
+                        tracing::info!("config reloaded (rules + enrichers)");
+                    }
+                    Err(e) => tracing::warn!("config reload failed: {}", e),
+                }
+            }
+        });
+    }
+
     let app = api::router(app_state);
+    if let (Some(cert), Some(key)) = (&cfg.server.tls_cert, &cfg.server.tls_key) {
+        tracing::info!("https: listening on {} (TLS)", cfg.server.http_listen);
+        let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS config failed: {}", e))?;
+        axum_server::bind_rustls(cfg.server.http_listen, rustls)
+            .serve(app.into_make_service())
+            .await?;
+        return Ok(());
+    }
     let listener = tokio::net::TcpListener::bind(cfg.server.http_listen).await?;
     tracing::info!("http: listening on {}", cfg.server.http_listen);
     let serve = axum::serve(listener, app);

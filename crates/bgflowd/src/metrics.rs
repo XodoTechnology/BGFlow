@@ -38,6 +38,8 @@ pub struct Metrics {
     pub http_misses: AtomicU64,
     pub http_lookups: AtomicU64,
     pub http_errors: AtomicU64,
+    pub table_hits: AtomicU64,
+    pub alerts_fired: AtomicU64,
     pub exporters: Mutex<HashMap<IpAddr, ExporterStat>>,
 }
 
@@ -79,6 +81,10 @@ impl Metrics {
         s.push_str(&format!("bgflow_enrich_http_lookups_total {}\n", g(&self.http_lookups)));
         s.push_str("# HELP bgflow_enrich_http_errors_total HTTP enrichment errors\n# TYPE bgflow_enrich_http_errors_total counter\n");
         s.push_str(&format!("bgflow_enrich_http_errors_total {}\n", g(&self.http_errors)));
+        s.push_str("# HELP bgflow_enrich_table_hits_total Table-enricher cache hits\n# TYPE bgflow_enrich_table_hits_total counter\n");
+        s.push_str(&format!("bgflow_enrich_table_hits_total {}\n", g(&self.table_hits)));
+        s.push_str("# HELP bgflow_alerts_fired_total Alert rule fires\n# TYPE bgflow_alerts_fired_total counter\n");
+        s.push_str(&format!("bgflow_alerts_fired_total {}\n", g(&self.alerts_fired)));
         s.push_str("# HELP bgflow_stored_bytes_total Bytes flushed to segments\n# TYPE bgflow_stored_bytes_total counter\n");
         s.push_str(&format!("bgflow_stored_bytes_total {}\n", g(&self.bytes_stored)));
         s.push_str("# HELP bgflow_stored_rows_total Rows flushed to segments\n# TYPE bgflow_stored_rows_total counter\n");

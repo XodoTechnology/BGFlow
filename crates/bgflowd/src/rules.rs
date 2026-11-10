@@ -25,7 +25,9 @@ pub struct Rule {
 }
 
 pub struct Ruleset {
-    rules: Vec<Rule>,
+    /// RwLock so SIGHUP config reload can swap rules without restarting
+    /// ingest; readers only hold the lock for the match scan.
+    rules: std::sync::RwLock<Vec<Rule>>,
 }
 
 /// Parse "a.b.c.d/n" or "addr" into (masked_base, mask). mask=0 matches all.
@@ -37,9 +39,8 @@ fn ip_in_net(ip: u128, net: (u128, u128)) -> bool {
     (ip & net.1) == net.0
 }
 
-impl Ruleset {
-    pub fn from_toml(items: &[RuleConfig]) -> Self {
-        let rules = items
+fn build_rules(items: &[RuleConfig]) -> Vec<Rule> {
+    items
             .iter()
             .filter_map(|r| {
                 let src_net = r.src_ip.as_deref().and_then(parse_prefix);
@@ -67,14 +68,27 @@ impl Ruleset {
                     org: r.org.as_ref().map(|s| s.to_lowercase()),
                 })
             })
-            .collect();
-        Ruleset { rules }
+            .collect()
+}
+
+impl Ruleset {
+    pub fn from_toml(items: &[RuleConfig]) -> Self {
+        Ruleset {
+            rules: std::sync::RwLock::new(build_rules(items)),
+        }
+    }
+
+    /// Hot-reload rules from new config (SIGHUP).
+    pub fn reload(&self, items: &[RuleConfig]) {
+        *self.rules.write().unwrap() = build_rules(items);
+        tracing::info!("rules reloaded: {} rule(s)", self.len());
     }
 
     /// Evaluate rules; returns label_id (1-based rule index) or 0.
     /// `org_name` resolves org ids to names (may be None if table unavailable).
     pub fn label(&self, f: &FlowRecord, org_name: impl Fn(u32) -> Option<String>) -> u32 {
-        for (i, r) in self.rules.iter().enumerate() {
+        let rules = self.rules.read().unwrap();
+        for (i, r) in rules.iter().enumerate() {
             if r.matches(f, &org_name) {
                 return (i + 1) as u32;
             }
@@ -83,16 +97,41 @@ impl Ruleset {
     }
 
     /// List rules for the API/UI: (id, name).
-    pub fn list(&self) -> Vec<(u32, &str)> {
+    pub fn list(&self) -> Vec<(u32, String)> {
         self.rules
+            .read()
+            .unwrap()
             .iter()
             .enumerate()
-            .map(|(i, r)| ((i + 1) as u32, r.name.as_str()))
+            .map(|(i, r)| ((i + 1) as u32, r.name.clone()))
+            .collect()
+    }
+
+    /// label_id -> rule name (None if unknown).
+    pub fn name_of(&self, id: u32) -> Option<String> {
+        if id == 0 {
+            return None;
+        }
+        self.rules
+            .read()
+            .unwrap()
+            .get(id as usize - 1)
+            .map(|r| r.name.clone())
+    }
+
+    /// All label names as a map (for name->id resolution).
+    pub fn names(&self) -> std::collections::HashMap<u32, String> {
+        self.rules
+            .read()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((i + 1) as u32, r.name.clone()))
             .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.rules.len()
+        self.rules.read().unwrap().len()
     }
 }
 

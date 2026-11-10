@@ -5,18 +5,21 @@ use crate::enrich::StringTable;
 use crate::rules::Ruleset;
 use crate::writer::SegmentIndex;
 use anyhow::Result;
+use bgflow_store::encode::ColumnData;
+use bgflow_store::schema::rollup_idx;
 use bgflow_store::{for_each_segment_info, Record};
-use bgflow_types::{ip_string, ip_to_u128, country_str, protocol_name, FlowRecord, RollupRecord};
+use bgflow_types::{ip_string, ip_to_u128, is_v4_mapped, country_str, protocol_name, FlowRecord, RollupRecord};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Ctx {
     pub flow_index: SegmentIndex,
     pub rollup_index: SegmentIndex,
+    /// Coarse hourly rollups (/24·/48-masked IPs, long retention).
+    pub hourly_index: SegmentIndex,
     pub orgs: Arc<StringTable>,
     pub rules: Arc<Ruleset>,
-    /// label_id -> rule name, precomputed at startup.
-    pub label_names: std::collections::HashMap<u32, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,10 +73,16 @@ pub struct FlowQuery {
     pub proto: Option<u8>,
     pub sport: Option<u16>,
     pub dport: Option<u16>,
-    pub exporter: Option<u128>,
+    /// Exporter allowlist — empty = all. Comma-separated in the API.
+    pub exporters: Vec<u128>,
     pub src_asn: Option<u32>,
     pub dst_asn: Option<u32>,
     pub label: Option<u32>,
+    /// IP version filters: 4 or 6 (matches that endpoint's address family).
+    pub src_ipver: Option<u8>,
+    pub dst_ipver: Option<u8>,
+    pub src_org: Option<u32>,
+    pub dst_org: Option<u32>,
     pub limit: usize,
     /// Skip this many matching rows before collecting (pagination).
     pub offset: usize,
@@ -92,6 +101,26 @@ impl FlowQuery {
                 return false;
             }
         }
+        if let Some(v) = self.src_ipver {
+            if (if is_v4_mapped(f.src_ip) { 4 } else { 6 }) != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dst_ipver {
+            if (if is_v4_mapped(f.dst_ip) { 4 } else { 6 }) != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.src_org {
+            if f.src_org != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dst_org {
+            if f.dst_org != v {
+                return false;
+            }
+        }
         if let Some(v) = self.proto {
             if f.protocol != v {
                 return false;
@@ -107,10 +136,8 @@ impl FlowQuery {
                 return false;
             }
         }
-        if let Some(v) = self.exporter {
-            if f.exporter != v {
-                return false;
-            }
+        if !self.exporters.is_empty() && !self.exporters.contains(&f.exporter) {
+            return false;
         }
         if let Some(v) = self.src_asn {
             if f.src_asn != v {
@@ -168,109 +195,345 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<Vec<FlowRecord>> {
 }
 
 // ---------------------------------------------------------------------------
-// Rollup queries (aggregates over the long-retention dataset)
+// Rollup queries (aggregates over the rollup datasets)
 // ---------------------------------------------------------------------------
 
-/// Stream rollup rows in [from,to] matching `pred`.
-pub fn rollup_each(
-    ctx: &Ctx,
-    from_ms: u64,
-    to_ms: u64,
-    pred: impl Fn(&RollupRecord) -> bool,
-    mut f: impl FnMut(RollupRecord),
-) -> Result<()> {
-    let infos = ctx.rollup_index.read().unwrap().clone();
-    for_each_segment_info::<RollupRecord>(
-        &infos,
-        RollupRecord::schema(),
-        from_ms,
-        to_ms,
-        false,
-        |scan| {
-            for i in 0..scan.rows {
-                let r = RollupRecord::from_scan(scan, i);
-                if r.bucket_ms + 60_000 < from_ms || r.bucket_ms > to_ms {
-                    continue;
-                }
-                if pred(&r) {
-                    f(r);
-                }
-            }
-            ControlFlow::Continue(())
-        },
-    )
+/// Which rollup dataset to scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupSet {
+    /// 1-minute buckets, full IPs (standard retention).
+    Minute,
+    /// Hourly buckets, /24·/48-masked IPs (coarse long-retention dataset).
+    Hourly,
+}
+
+impl RollupSet {
+    /// Bucket width in ms — used for range pruning.
+    pub fn period_ms(self) -> u64 {
+        match self {
+            RollupSet::Minute => 60_000,
+            RollupSet::Hourly => 3_600_000,
+        }
+    }
+}
+
+/// Sparse per-row view over a decoded segment — only the columns the query
+/// needs were decompressed. Missing columns read as 0.
+pub struct RollupRow<'a> {
+    arr: &'a [Option<&'a ColumnData>],
+    i: usize,
+}
+
+impl RollupRow<'_> {
+    #[inline]
+    pub fn v(&self, idx: usize) -> u128 {
+        self.arr
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|c| c.value_at(self.i))
+            .unwrap_or(0)
+    }
+    #[inline]
+    pub fn bucket_ms(&self) -> u64 {
+        self.v(rollup_idx::BUCKET_MS) as u64
+    }
+    #[inline]
+    pub fn bytes(&self) -> u64 {
+        self.v(rollup_idx::BYTES) as u64
+    }
+    #[inline]
+    pub fn packets(&self) -> u64 {
+        self.v(rollup_idx::PACKETS) as u64
+    }
+    #[inline]
+    pub fn flows(&self) -> u64 {
+        self.v(rollup_idx::FLOWS) as u64
+    }
+    #[inline]
+    pub fn protocol(&self) -> u8 {
+        self.v(rollup_idx::PROTOCOL) as u8
+    }
+    #[inline]
+    pub fn src_ip(&self) -> u128 {
+        self.v(rollup_idx::SRC_IP)
+    }
+    #[inline]
+    pub fn dst_ip(&self) -> u128 {
+        self.v(rollup_idx::DST_IP)
+    }
+    #[inline]
+    pub fn src_port(&self) -> u16 {
+        self.v(rollup_idx::SRC_PORT) as u16
+    }
+    #[inline]
+    pub fn dst_port(&self) -> u16 {
+        self.v(rollup_idx::DST_PORT) as u16
+    }
+    #[inline]
+    pub fn exporter(&self) -> u128 {
+        self.v(rollup_idx::EXPORTER)
+    }
+    #[inline]
+    pub fn src_asn(&self) -> u32 {
+        self.v(rollup_idx::SRC_ASN) as u32
+    }
+    #[inline]
+    pub fn dst_asn(&self) -> u32 {
+        self.v(rollup_idx::DST_ASN) as u32
+    }
+    #[inline]
+    pub fn src_country(&self) -> u16 {
+        self.v(rollup_idx::SRC_COUNTRY) as u16
+    }
+    #[inline]
+    pub fn dst_country(&self) -> u16 {
+        self.v(rollup_idx::DST_COUNTRY) as u16
+    }
+    #[inline]
+    pub fn src_org(&self) -> u32 {
+        self.v(rollup_idx::SRC_ORG) as u32
+    }
+    #[inline]
+    pub fn dst_org(&self) -> u32 {
+        self.v(rollup_idx::DST_ORG) as u32
+    }
+    #[inline]
+    pub fn label_id(&self) -> u32 {
+        self.v(rollup_idx::LABEL_ID) as u32
+    }
 }
 
 /// Shared rollup filter built from API query params.
 #[derive(Debug, Default, Clone)]
 pub struct RollupFilter {
-    pub exporter: Option<u128>,
+    /// Exporter allowlist — empty = all exporters. Multi-valued so several
+    /// exporters can be included (or everything-but via the UI).
+    pub exporters: Vec<u128>,
     pub proto: Option<u8>,
     pub src_asn: Option<u32>,
     pub dst_asn: Option<u32>,
     /// (masked base, mask) — mask=0 matches everything. See parse_ip_filter.
     pub src_ip: Option<(u128, u128)>,
     pub dst_ip: Option<(u128, u128)>,
+    /// IP version per endpoint: 4 or 6.
+    pub src_ipver: Option<u8>,
+    pub dst_ipver: Option<u8>,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     pub src_country: Option<u16>,
     pub dst_country: Option<u16>,
+    pub src_org: Option<u32>,
+    pub dst_org: Option<u32>,
+    pub label: Option<u32>,
 }
 
 impl RollupFilter {
-    pub fn matches(&self, r: &RollupRecord) -> bool {
-        if let Some(v) = self.exporter {
-            if r.exporter != v {
-                return false;
-            }
+    pub fn matches(&self, r: &RollupRow) -> bool {
+        if !self.exporters.is_empty() && !self.exporters.contains(&r.exporter()) {
+            return false;
         }
         if let Some(v) = self.proto {
-            if r.protocol != v {
+            if r.protocol() != v {
                 return false;
             }
         }
         if let Some(v) = self.src_asn {
-            if r.src_asn != v {
+            if r.src_asn() != v {
                 return false;
             }
         }
         if let Some(v) = self.dst_asn {
-            if r.dst_asn != v {
+            if r.dst_asn() != v {
                 return false;
             }
         }
         if let Some((base, mask)) = self.src_ip {
-            if (r.src_ip & mask) != base {
+            if (r.src_ip() & mask) != base {
                 return false;
             }
         }
         if let Some((base, mask)) = self.dst_ip {
-            if (r.dst_ip & mask) != base {
+            if (r.dst_ip() & mask) != base {
+                return false;
+            }
+        }
+        if let Some(v) = self.src_ipver {
+            if (if is_v4_mapped(r.src_ip()) { 4 } else { 6 }) != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dst_ipver {
+            if (if is_v4_mapped(r.dst_ip()) { 4 } else { 6 }) != v {
                 return false;
             }
         }
         if let Some(v) = self.src_port {
-            if r.src_port != v {
+            if r.src_port() != v {
                 return false;
             }
         }
         if let Some(v) = self.dst_port {
-            if r.dst_port != v {
+            if r.dst_port() != v {
                 return false;
             }
         }
         if let Some(v) = self.src_country {
-            if r.src_country != v {
+            if r.src_country() != v {
                 return false;
             }
         }
         if let Some(v) = self.dst_country {
-            if r.dst_country != v {
+            if r.dst_country() != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.src_org {
+            if r.src_org() != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dst_org {
+            if r.dst_org() != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.label {
+            if r.label_id() != v {
                 return false;
             }
         }
         true
     }
+
+    /// Schema columns this filter may read — feeds `rollup_needed`.
+    fn cols_used(&self) -> Vec<usize> {
+        use rollup_idx as ix;
+        let mut v = Vec::new();
+        if !self.exporters.is_empty() {
+            v.push(ix::EXPORTER);
+        }
+        if self.proto.is_some() {
+            v.push(ix::PROTOCOL);
+        }
+        if self.src_asn.is_some() {
+            v.push(ix::SRC_ASN);
+        }
+        if self.dst_asn.is_some() {
+            v.push(ix::DST_ASN);
+        }
+        if self.src_ip.is_some() || self.src_ipver.is_some() {
+            v.push(ix::SRC_IP);
+        }
+        if self.dst_ip.is_some() || self.dst_ipver.is_some() {
+            v.push(ix::DST_IP);
+        }
+        if self.src_port.is_some() {
+            v.push(ix::SRC_PORT);
+        }
+        if self.dst_port.is_some() {
+            v.push(ix::DST_PORT);
+        }
+        if self.src_country.is_some() {
+            v.push(ix::SRC_COUNTRY);
+        }
+        if self.dst_country.is_some() {
+            v.push(ix::DST_COUNTRY);
+        }
+        if self.src_org.is_some() {
+            v.push(ix::SRC_ORG);
+        }
+        if self.dst_org.is_some() {
+            v.push(ix::DST_ORG);
+        }
+        if self.label.is_some() {
+            v.push(ix::LABEL_ID);
+        }
+        v
+    }
+}
+
+/// Schema column feeding a top-N dimension (computed dims return the column
+/// their value derives from).
+pub fn dim_col(by: &str) -> Option<usize> {
+    use rollup_idx as ix;
+    Some(match by {
+        "src_ip" | "src_ipver" => ix::SRC_IP,
+        "dst_ip" | "dst_ipver" => ix::DST_IP,
+        "src_asn" => ix::SRC_ASN,
+        "dst_asn" => ix::DST_ASN,
+        "src_port" => ix::SRC_PORT,
+        "dst_port" => ix::DST_PORT,
+        "proto" | "protocol" => ix::PROTOCOL,
+        "exporter" => ix::EXPORTER,
+        "src_country" => ix::SRC_COUNTRY,
+        "dst_country" => ix::DST_COUNTRY,
+        "src_org" => ix::SRC_ORG,
+        "dst_org" => ix::DST_ORG,
+        "label" | "label_id" => ix::LABEL_ID,
+        _ => return None,
+    })
+}
+
+/// Columns a rollup query must decompress: bucket + metrics + whatever the
+/// filter and requested dims actually read.
+pub fn rollup_needed(f: &RollupFilter, dims: &[&str]) -> Vec<usize> {
+    use rollup_idx as ix;
+    let mut s = std::collections::BTreeSet::new();
+    s.insert(ix::BUCKET_MS);
+    s.insert(ix::BYTES);
+    s.insert(ix::PACKETS);
+    s.insert(ix::FLOWS);
+    for c in f.cols_used() {
+        s.insert(c);
+    }
+    for d in dims {
+        if let Some(c) = dim_col(d) {
+            s.insert(c);
+        }
+    }
+    s.into_iter().collect()
+}
+
+/// Scan rollup rows in [from,to] on `set`, decoding only `needed` columns.
+/// The callback receives a RollupRow; return ControlFlow::Break to stop.
+pub fn rollup_scan(
+    ctx: &Ctx,
+    set: RollupSet,
+    from_ms: u64,
+    to_ms: u64,
+    needed: &[usize],
+    mut f: impl FnMut(&RollupRow) -> ControlFlow<()>,
+) -> Result<()> {
+    let infos = match set {
+        RollupSet::Minute => ctx.rollup_index.read().unwrap().clone(),
+        RollupSet::Hourly => ctx.hourly_index.read().unwrap().clone(),
+    };
+    let period = set.period_ms();
+    bgflow_store::for_each_segment_cols(
+        &infos,
+        RollupRecord::schema(),
+        needed,
+        from_ms,
+        to_ms,
+        false,
+        |columns, rows| {
+            let mut arr: Vec<Option<&ColumnData>> = vec![None; RollupRecord::schema().columns.len()];
+            for (ci, data) in columns {
+                arr[*ci] = Some(data);
+            }
+            for i in 0..rows {
+                let row = RollupRow { arr: &arr, i };
+                if row.bucket_ms() + period < from_ms || row.bucket_ms() > to_ms {
+                    continue;
+                }
+                if f(&row).is_break() {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +543,7 @@ impl RollupFilter {
 /// Serialize a FlowRecord to JSON, resolving org ids to names and label ids
 /// to rule names.
 pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
-    let label = ctx.label_names.get(&f.label_id).cloned();
+    let label = ctx.rules.name_of(f.label_id);
     serde_json::json!({
         "ts": f.ts_ms / 1000,
         "ts_ms": f.ts_ms,
@@ -309,47 +572,45 @@ pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
         "engine_type": f.engine_type,
         "sampler_interval": f.sampler_interval,
         "tcp_state": f.tcp_state,
+        "ip_ttl": f.ip_ttl,
+        "flow_end_reason": f.flow_end_reason,
+        "icmp_type": f.icmp_type,
+        "icmp_code": f.icmp_code,
+        "post_nat_src": if f.post_nat_src != 0 { serde_json::json!(ip_string(f.post_nat_src)) } else { serde_json::Value::Null },
+        "post_nat_dst": if f.post_nat_dst != 0 { serde_json::json!(ip_string(f.post_nat_dst)) } else { serde_json::Value::Null },
         "label": label,
         "label_id": f.label_id,
     })
 }
 
-/// Format a rollup "by" dimension key for top-N output.
-pub fn dim_value(by: &str, r: &RollupRecord) -> serde_json::Value {
+/// Grouping key for a top-N dimension.
+pub fn dim_key(by: &str, r: &RollupRow) -> u128 {
     match by {
-        "src_ip" => serde_json::json!(ip_string(r.src_ip)),
-        "dst_ip" => serde_json::json!(ip_string(r.dst_ip)),
-        "src_asn" => serde_json::json!(r.src_asn),
-        "dst_asn" => serde_json::json!(r.dst_asn),
-        "src_port" => serde_json::json!(r.src_port),
-        "dst_port" => serde_json::json!(r.dst_port),
-        "proto" | "protocol" => serde_json::json!(protocol_name(r.protocol)),
-        "exporter" => serde_json::json!(ip_string(r.exporter)),
-        "src_country" => serde_json::json!(country_str(r.src_country)),
-        "dst_country" => serde_json::json!(country_str(r.dst_country)),
-        _ => serde_json::json!(null),
-    }
-}
-
-/// Raw u128 key for grouping by a dimension.
-pub fn dim_key(by: &str, r: &RollupRecord) -> u128 {
-    match by {
-        "src_ip" => r.src_ip,
-        "dst_ip" => r.dst_ip,
-        "src_asn" => r.src_asn as u128,
-        "dst_asn" => r.dst_asn as u128,
-        "src_port" => r.src_port as u128,
-        "dst_port" => r.dst_port as u128,
-        "proto" | "protocol" => r.protocol as u128,
-        "exporter" => r.exporter,
-        "src_country" => r.src_country as u128,
-        "dst_country" => r.dst_country as u128,
+        "src_ip" => r.src_ip(),
+        "dst_ip" => r.dst_ip(),
+        "src_asn" => r.src_asn() as u128,
+        "dst_asn" => r.dst_asn() as u128,
+        "src_port" => r.src_port() as u128,
+        "dst_port" => r.dst_port() as u128,
+        "proto" | "protocol" => r.protocol() as u128,
+        "exporter" => r.exporter(),
+        "src_country" => r.src_country() as u128,
+        "dst_country" => r.dst_country() as u128,
+        "src_org" => r.src_org() as u128,
+        "dst_org" => r.dst_org() as u128,
+        "label" | "label_id" => r.label_id() as u128,
+        "src_ipver" => {
+            if is_v4_mapped(r.src_ip()) { 4 } else { 6 }
+        }
+        "dst_ipver" => {
+            if is_v4_mapped(r.dst_ip()) { 4 } else { 6 }
+        }
         _ => 0,
     }
 }
 
 /// Format a grouped u128 dimension key for top-N output.
-pub fn format_key(by: &str, key: u128) -> serde_json::Value {
+pub fn format_key(ctx: &Ctx, by: &str, key: u128) -> serde_json::Value {
     match by {
         "src_ip" => serde_json::json!(ip_string(key)),
         "dst_ip" => serde_json::json!(ip_string(key)),
@@ -361,6 +622,24 @@ pub fn format_key(by: &str, key: u128) -> serde_json::Value {
         "exporter" => serde_json::json!(ip_string(key)),
         "src_country" => serde_json::json!(country_str(key as u16)),
         "dst_country" => serde_json::json!(country_str(key as u16)),
+        "src_org" => ctx
+            .orgs
+            .name(key as u32)
+            .map(|s| serde_json::json!(s))
+            .unwrap_or_else(|| serde_json::json!(key as u32)),
+        "dst_org" => ctx
+            .orgs
+            .name(key as u32)
+            .map(|s| serde_json::json!(s))
+            .unwrap_or_else(|| serde_json::json!(key as u32)),
+        "label" | "label_id" => ctx
+            .rules
+            .name_of(key as u32)
+            .map(|s| serde_json::json!(s))
+            .unwrap_or_else(|| serde_json::json!(key as u32)),
+        "src_ipver" | "dst_ipver" => {
+            serde_json::json!(if key == 4 { "IPv4" } else { "IPv6" })
+        }
         _ => serde_json::json!(key),
     }
 }

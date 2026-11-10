@@ -104,9 +104,10 @@ macro_rules! col {
 use ColType::*;
 use Encoding::*;
 
-/// Schema id 0: raw flow records (26 columns).
+/// Schema id 2: raw flow records (32 columns). id 0 was the v1 layout
+/// (26 cols); old segments are skipped on open since ids no longer match.
 pub const RAW_SCHEMA: Schema = Schema {
-    id: 0,
+    id: 2,
     name: "flows",
     columns: &[
         col!("ts_ms", U64, Delta, ts),
@@ -135,6 +136,12 @@ pub const RAW_SCHEMA: Schema = Schema {
         col!("sampler_interval", U32, Dict),
         col!("tcp_state", U8, Dict),
         col!("label_id", U32, Dict),
+        col!("ip_ttl", U8, Dict),
+        col!("flow_end_reason", U8, Dict),
+        col!("icmp_type", U8, Dict),
+        col!("icmp_code", U8, Dict),
+        col!("post_nat_src", U128, Dict),
+        col!("post_nat_dst", U128, Dict),
     ],
 };
 
@@ -166,11 +173,17 @@ pub mod raw_idx {
     pub const SAMPLER_INTERVAL: usize = 23;
     pub const TCP_STATE: usize = 24;
     pub const LABEL_ID: usize = 25;
+    pub const IP_TTL: usize = 26;
+    pub const FLOW_END_REASON: usize = 27;
+    pub const ICMP_TYPE: usize = 28;
+    pub const ICMP_CODE: usize = 29;
+    pub const POST_NAT_SRC: usize = 30;
+    pub const POST_NAT_DST: usize = 31;
 }
 
-/// Schema id 1: rollup records (16 columns).
+/// Schema id 3: rollup records (19 columns). id 1 was the v1 layout.
 pub const ROLLUP_SCHEMA: Schema = Schema {
-    id: 1,
+    id: 3,
     name: "rollup",
     columns: &[
         col!("bucket_ms", U64, Delta, ts),
@@ -189,6 +202,9 @@ pub const ROLLUP_SCHEMA: Schema = Schema {
         col!("flows", U64, Plain),
         col!("min_ts_ms", U64, Plain),
         col!("max_ts_ms", U64, Plain),
+        col!("src_org", U32, Dict),
+        col!("dst_org", U32, Dict),
+        col!("label_id", U32, Dict),
     ],
 };
 
@@ -210,12 +226,15 @@ pub mod rollup_idx {
     pub const FLOWS: usize = 13;
     pub const MIN_TS: usize = 14;
     pub const MAX_TS: usize = 15;
+    pub const SRC_ORG: usize = 16;
+    pub const DST_ORG: usize = 17;
+    pub const LABEL_ID: usize = 18;
 }
 
 pub fn schema_by_id(id: u16) -> Option<&'static Schema> {
     match id {
-        0 => Some(&RAW_SCHEMA),
-        1 => Some(&ROLLUP_SCHEMA),
+        2 => Some(&RAW_SCHEMA),
+        3 => Some(&ROLLUP_SCHEMA),
         _ => None,
     }
 }

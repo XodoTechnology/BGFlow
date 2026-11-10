@@ -45,6 +45,18 @@ pub struct FlowRecord {
     pub tcp_state: u8,
     /// Matched label rule id (0 = none). Rules are defined in config.
     pub label_id: u32,
+    /// IP TTL observed on the flow (IE 192; 0 = not reported).
+    pub ip_ttl: u8,
+    /// Why the flow ended (IE 136 flowEndReason; 0 = unknown).
+    /// 1=idle, 2=active timeout, 3=end of flow, 4=forced export, ...
+    pub flow_end_reason: u8,
+    /// ICMP type/code for ICMP/ICMPv6 flows (IE 32/139; 0 = n/a).
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    /// Post-NAT addresses when the exporter reports them
+    /// (IE 225/226 v4, 281/282 v6). 0 = not reported.
+    pub post_nat_src: u128,
+    pub post_nat_dst: u128,
 }
 
 /// Pre-aggregated rollup record: one row per (minute, exporter, protocol,
@@ -63,6 +75,11 @@ pub struct RollupRecord {
     pub dst_port: u16,
     pub src_country: u16,
     pub dst_country: u16,
+    /// Interned org ids (same table as FlowRecord; 0 = unknown).
+    pub src_org: u32,
+    pub dst_org: u32,
+    /// Matched label id (0 = none) — enables per-label stats on rollups.
+    pub label_id: u32,
     pub bytes: u64,
     pub packets: u64,
     pub flows: u64,
@@ -92,6 +109,13 @@ pub fn u128_to_ip(v: u128) -> IpAddr {
     } else {
         IpAddr::V6(Ipv6Addr::from(b))
     }
+}
+
+/// True if the stored u128 is an IPv4-mapped address (::ffff:a.b.c.d),
+/// i.e. the value represents an IPv4 endpoint.
+pub fn is_v4_mapped(v: u128) -> bool {
+    let b = v.to_be_bytes();
+    b[0..10].iter().all(|&x| x == 0) && b[10] == 0xff && b[11] == 0xff
 }
 
 /// Display form of a stored u128 IP (dotted quad for v4, compressed for v6).

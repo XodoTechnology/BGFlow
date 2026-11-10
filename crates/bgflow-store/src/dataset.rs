@@ -85,6 +85,12 @@ impl Record for FlowRecord {
         cols[ix::SAMPLER_INTERVAL].extend_from_slice(&self.sampler_interval.to_le_bytes());
         cols[ix::TCP_STATE].push(self.tcp_state);
         cols[ix::LABEL_ID].extend_from_slice(&self.label_id.to_le_bytes());
+        cols[ix::IP_TTL].push(self.ip_ttl);
+        cols[ix::FLOW_END_REASON].push(self.flow_end_reason);
+        cols[ix::ICMP_TYPE].push(self.icmp_type);
+        cols[ix::ICMP_CODE].push(self.icmp_code);
+        cols[ix::POST_NAT_SRC].extend_from_slice(&self.post_nat_src.to_le_bytes());
+        cols[ix::POST_NAT_DST].extend_from_slice(&self.post_nat_dst.to_le_bytes());
     }
 
     fn from_scan(scan: &ScanResult, i: usize) -> Self {
@@ -117,6 +123,12 @@ impl Record for FlowRecord {
             sampler_interval: c[ix::SAMPLER_INTERVAL].value_at(i) as u32,
             tcp_state: c[ix::TCP_STATE].value_at(i) as u8,
             label_id: c[ix::LABEL_ID].value_at(i) as u32,
+            ip_ttl: c[ix::IP_TTL].value_at(i) as u8,
+            flow_end_reason: c[ix::FLOW_END_REASON].value_at(i) as u8,
+            icmp_type: c[ix::ICMP_TYPE].value_at(i) as u8,
+            icmp_code: c[ix::ICMP_CODE].value_at(i) as u8,
+            post_nat_src: c[ix::POST_NAT_SRC].value_at(i),
+            post_nat_dst: c[ix::POST_NAT_DST].value_at(i),
         }
     }
 }
@@ -148,6 +160,9 @@ impl Record for RollupRecord {
         cols[ix::FLOWS].extend_from_slice(&self.flows.to_le_bytes());
         cols[ix::MIN_TS].extend_from_slice(&self.min_ts_ms.to_le_bytes());
         cols[ix::MAX_TS].extend_from_slice(&self.max_ts_ms.to_le_bytes());
+        cols[ix::SRC_ORG].extend_from_slice(&self.src_org.to_le_bytes());
+        cols[ix::DST_ORG].extend_from_slice(&self.dst_org.to_le_bytes());
+        cols[ix::LABEL_ID].extend_from_slice(&self.label_id.to_le_bytes());
     }
 
     fn from_scan(scan: &ScanResult, i: usize) -> Self {
@@ -170,6 +185,9 @@ impl Record for RollupRecord {
             flows: c[ix::FLOWS].value_at(i) as u64,
             min_ts_ms: c[ix::MIN_TS].value_at(i) as u64,
             max_ts_ms: c[ix::MAX_TS].value_at(i) as u64,
+            src_org: c[ix::SRC_ORG].value_at(i) as u32,
+            dst_org: c[ix::DST_ORG].value_at(i) as u32,
+            label_id: c[ix::LABEL_ID].value_at(i) as u32,
         }
     }
 }
@@ -466,6 +484,39 @@ impl<R: Record> Dataset<R> {
     pub fn total_rows(&self) -> u64 {
         self.segments.iter().map(|s| s.header.row_count).sum()
     }
+}
+
+/// Like `for_each_segment_info` but decodes only the requested columns.
+/// The callback receives `(col_idx, ColumnData)` pairs (in request order)
+/// plus the row count — callers index columns by `col_idx`.
+pub fn for_each_segment_cols(
+    infos: &[SegmentInfo],
+    _schema: &'static Schema,
+    cols: &[usize],
+    from_ms: u64,
+    to_ms: u64,
+    newest_first: bool,
+    mut f: impl FnMut(&[(usize, ColumnData)], usize) -> ControlFlow<()>,
+) -> Result<()> {
+    let mut idx: Vec<usize> = infos
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.overlaps(from_ms, to_ms))
+        .map(|(i, _)| i)
+        .collect();
+    if newest_first {
+        idx.reverse();
+    }
+    for i in idx {
+        let info = &infos[i];
+        let reader = segment::SegmentReader::open(&info.path)?;
+        let columns = reader.decode_columns(cols)?;
+        let rows = reader.header.row_count as usize;
+        if f(&columns, rows).is_break() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Scan a caller-provided segment index (e.g. a snapshot taken from a

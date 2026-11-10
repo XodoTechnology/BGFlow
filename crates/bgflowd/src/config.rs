@@ -2,11 +2,11 @@
 
 use anyhow::{Context, Result};
 use bgflow_netflow::ProtoHint;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -16,10 +16,12 @@ pub struct Config {
     pub enrichers: Vec<EnricherConfig>,
     pub rules: Vec<RuleConfig>,
     pub demo: DemoConfig,
+    /// Threshold alerting over rollup data.
+    pub alerts: AlertsConfig,
 }
 
 /// Synthetic demo traffic (NetFlow v5) — for trying out the UI.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DemoConfig {
     pub enabled: bool,
@@ -45,7 +47,7 @@ impl Default for DemoConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// HTTP API + UI listen address.
@@ -54,9 +56,12 @@ pub struct ServerConfig {
     pub auth: Option<String>,
     /// Allow CORS on the API (off by default; UI is same-origin).
     pub cors: bool,
+    /// TLS cert + key paths (PEM). Both set = serve HTTPS; empty = HTTP.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Root data directory.
@@ -73,9 +78,14 @@ pub struct StorageConfig {
     pub rollup_retention_days: u32,
     /// How often the retention sweep runs, in seconds.
     pub retention_interval_secs: u64,
+    /// Maintain the coarse hourly dataset (masked /24·/48 IPs) for
+    /// long-retention stats.
+    pub coarse_rollup: bool,
+    /// Coarse rollup retention in days (0 = keep forever).
+    pub coarse_retention_days: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GeoIpConfig {
     /// MaxMind ASN database path (mmdb). Empty disables.
@@ -84,7 +94,7 @@ pub struct GeoIpConfig {
     pub country_db: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct InputConfig {
     /// Listen address, e.g. "0.0.0.0:2055".
@@ -103,7 +113,7 @@ pub struct InputConfig {
     pub max_connections: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EnricherConfig {
     /// "mmdb" is handled by [geoip]; only "http" enrichers appear here.
@@ -126,9 +136,15 @@ pub struct EnricherConfig {
     /// `Authorization = "Bearer ..."` or an API key header for your backend.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+    /// kind = "table": local file path or file:// URL with prefix lines
+    /// ("1.2.3.0/24 13335 AS13335 OrgName US" — asn/org/country optional).
+    /// Re-read every `refresh_secs`.
+    pub path: Option<String>,
+    /// kind = "table"/"http": seconds between refreshes (0 = once).
+    pub refresh_secs: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HttpFields {
     pub asn: Option<String>,
     pub org: Option<String>,
@@ -148,11 +164,13 @@ impl Default for EnricherConfig {
             cache_ttl_secs: 86400,
             fields: HttpFields::default(),
             headers: std::collections::HashMap::new(),
+            path: None,
+            refresh_secs: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuleConfig {
     /// Label name applied when the rule matches.
@@ -211,6 +229,7 @@ impl Default for Config {
             enrichers: vec![],
             rules: vec![],
             demo: DemoConfig::default(),
+            alerts: AlertsConfig::default(),
         }
     }
 }
@@ -221,6 +240,8 @@ impl Default for ServerConfig {
             http_listen: "0.0.0.0:8080".parse().unwrap(),
             auth: None,
             cors: false,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -235,6 +256,8 @@ impl Default for StorageConfig {
             raw_retention_days: 7,
             rollup_retention_days: 90,
             retention_interval_secs: 300,
+            coarse_rollup: true,
+            coarse_retention_days: 365,
         }
     }
 }
@@ -261,6 +284,88 @@ impl Default for InputConfig {
     }
 }
 
+/// `[alerts]` section: eval loop + rule list.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AlertsConfig {
+    /// How often alert rules are evaluated, in seconds.
+    pub eval_secs: u64,
+    /// Minimum seconds between repeat fires of the same alert+group.
+    pub cooldown_secs: u64,
+    /// Optional webhook URL POSTed on every alert fire (JSON body).
+    pub webhook_url: Option<String>,
+    #[serde(rename = "rules")]
+    pub items: Vec<AlertConfig>,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        AlertsConfig {
+            eval_secs: 60,
+            cooldown_secs: 900,
+            webhook_url: None,
+            items: vec![],
+        }
+    }
+}
+
+/// One threshold alert over rollup data.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AlertConfig {
+    /// Alert name (used in logs/metrics/webhook).
+    pub name: String,
+    /// What to measure: bytes | packets | flows | pps | mbps.
+    pub metric: String,
+    /// Comparison: gt | lt | gte | lte.
+    pub op: String,
+    /// Threshold on the per-second rate over the window.
+    pub threshold: f64,
+    /// Evaluation window in seconds (rate = total/window).
+    pub window_secs: u64,
+    /// Group-by dimension (same names as /top?by=); empty = whole set.
+    pub group_by: Option<String>,
+    /// Optional rollup dataset: minute (default) | hourly.
+    pub granularity: Option<String>,
+    /// Optional filters — same names as the query API.
+    pub proto: Option<u8>,
+    pub src_asn: Option<u32>,
+    pub dst_asn: Option<u32>,
+    pub src_ip: Option<String>,
+    pub dst_ip: Option<String>,
+    pub src_country: Option<String>,
+    pub dst_country: Option<String>,
+    pub exporter: Option<String>,
+    pub label: Option<String>,
+    /// Only alert when the rate jumps this much vs. the previous window
+    /// (fold-change). 0 = disabled.
+    pub min_change_pct: f64,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        AlertConfig {
+            name: String::new(),
+            metric: "mbps".into(),
+            op: "gt".into(),
+            threshold: 100.0,
+            window_secs: 300,
+            group_by: None,
+            granularity: None,
+            proto: None,
+            src_asn: None,
+            dst_asn: None,
+            src_ip: None,
+            dst_ip: None,
+            src_country: None,
+            dst_country: None,
+            exporter: None,
+            label: None,
+            min_change_pct: 0.0,
+        }
+    }
+}
+
 /// Helper to map the protocol string to ProtoHint.
 pub fn proto_hint(s: &str) -> ProtoHint {
     match s.to_ascii_lowercase().as_str() {
@@ -272,24 +377,26 @@ pub fn proto_hint(s: &str) -> ProtoHint {
     }
 }
 
+/// Resolve which config file would be loaded (for hot-reload on SIGHUP).
+pub fn resolve_path(arg: Option<&PathBuf>) -> Option<PathBuf> {
+    match arg {
+        Some(p) => Some(p.clone()),
+        None => [
+            PathBuf::from("bgflow.toml"),
+            PathBuf::from("/etc/bgflow/bgflow.toml"),
+        ]
+        .into_iter()
+        .find(|c| c.exists()),
+    }
+}
+
 pub fn load(path: Option<&PathBuf>) -> Result<Config> {
-    match path {
+    match resolve_path(path) {
         Some(p) => {
-            let text = std::fs::read_to_string(p)
+            let text = std::fs::read_to_string(&p)
                 .with_context(|| format!("cannot read config {}", p.display()))?;
             toml::from_str(&text).with_context(|| format!("cannot parse {}", p.display()))
         }
-        None => {
-            // Look for bgflow.toml next to the binary / in cwd / /etc/bgflow.
-            for cand in [
-                PathBuf::from("bgflow.toml"),
-                PathBuf::from("/etc/bgflow/bgflow.toml"),
-            ] {
-                if cand.exists() {
-                    return load(Some(&cand));
-                }
-            }
-            Ok(Config::default())
-        }
+        None => Ok(Config::default()),
     }
 }

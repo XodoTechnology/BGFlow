@@ -9,12 +9,13 @@
 
 use crate::config::{EnricherConfig, GeoIpConfig};
 use crate::metrics::Metrics;
-use bgflow_types::{country_pack, country_str, ip_string, ip_to_u128, u128_to_ip, FlowRecord};
+use bgflow_types::{country_pack, country_str, ip_string, ip_to_u128, is_v4_mapped, u128_to_ip, FlowRecord};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -236,7 +237,7 @@ pub struct LookupResult {
 
 /// Cache granularity: v4 /24, v6 /48.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PrefixKey {
+pub(crate) enum PrefixKey {
     V4(u32),  // a.b.c (top 24 bits)
     V6(u64),  // top 48 bits
 }
@@ -341,7 +342,13 @@ impl HttpEnricher {
     }
 
     /// Mark a prefix for background lookup; returns true if newly enqueued.
-    pub(crate) fn enqueue(&self, ip: IpAddr, tx: &tokio::sync::mpsc::Sender<(usize, PrefixKey)>, idx: usize) {
+    /// The message carries this enricher's Arc so in-flight lookups stay
+    /// valid across config reloads.
+    pub(crate) fn enqueue(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        tx: &tokio::sync::mpsc::Sender<(Arc<HttpEnricher>, PrefixKey)>,
+    ) {
         let key = prefix_key(ip);
         {
             let mut p = self.pending.lock().unwrap();
@@ -349,7 +356,7 @@ impl HttpEnricher {
                 return; // already pending
             }
         }
-        if tx.try_send((idx, key)).is_err() {
+        if tx.try_send((self.clone(), key)).is_err() {
             self.pending.lock().unwrap().remove(&key);
         }
     }
@@ -449,6 +456,12 @@ impl HttpEnricher {
 
     /// Apply a cached result to a record (fills only unset fields).
     pub fn apply(&self, res: &LookupResult, orgs: &StringTable, rec: &mut FlowRecord, is_src: bool) {
+        apply_result(res, orgs, rec, is_src);
+    }
+}
+
+/// Fill unset asn/org/country fields from a lookup result.
+fn apply_result(res: &LookupResult, orgs: &StringTable, rec: &mut FlowRecord, is_src: bool) {
         let (asn_f, org_f, ctry_f) = if is_src {
             (&mut rec.src_asn, &mut rec.src_org, &mut rec.src_country)
         } else {
@@ -469,7 +482,6 @@ impl HttpEnricher {
                 *ctry_f = c;
             }
         }
-    }
 }
 
 /// Minimal JSON dot-path: "$.a.b.c", "a.b.c", with numeric array indices.
@@ -489,25 +501,287 @@ fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
     Some(cur)
 }
 
-/// Owns all HTTP enrichers + the background lookup worker.
+// ---------------------------------------------------------------------------
+// Table enricher: prefix -> ASN/org/country from a file or URL dump.
+// Exact longest-prefix-match via per-length hash lookups — fast enough for
+// ingest (a handful of lookups per flow) and needs no external service.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+struct TableRow {
+    asn: Option<u32>,
+    org: Option<String>,
+    country: Option<u16>,
+}
+
+struct TableData {
+    /// (masked_base, prefix_len) -> row
+    map: HashMap<(u128, u8), TableRow>,
+    /// Distinct prefix lengths present, sorted descending (early-exit LPM).
+    lens: Vec<u8>,
+    rows: usize,
+}
+
+/// Mask keeping the top `bits` of an address. `is_v4` addresses live in the
+/// low 32 bits of the u128 (v4-mapped form).
+fn prefix_mask(bits: u8, is_v4: bool) -> u128 {
+    if is_v4 {
+        if bits == 0 {
+            0
+        } else {
+            ((u32::MAX << (32 - bits)) as u128) & 0xFFFF_FFFF
+        }
+    } else if bits == 0 {
+        0
+    } else {
+        u128::MAX << (128 - bits)
+    }
+}
+
+/// Parse one dump line. Accepted forms (whitespace separated):
+///   1.2.3.0/24 13335 "Acme LLC" US
+///   2001:db8::/32 AS64496 Acme  GB
+///   route: 1.2.3.0/24 origin: AS13335   (RPSL-ish, best effort)
+/// asn may be bare digits or AS-prefixed; country is a 2-letter code.
+fn parse_table_line(line: &str) -> Option<((u128, u8), TableRow)> {
+    let line = line.split('#').next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    // Find the prefix token (first token containing '/', skipping "route:").
+    let (pfx_idx, pfx) = toks.iter().enumerate().find(|(_, t)| t.contains('/'))?;
+    let (addr_s, bits_s) = pfx.split_once('/')?;
+    let addr: IpAddr = addr_s.parse().ok()?;
+    let bits: u8 = bits_s.parse().ok()?;
+    let is_v4 = addr.is_ipv4();
+    if (is_v4 && bits > 32) || (!is_v4 && bits > 128) {
+        return None;
+    }
+    let base = ip_to_u128(&addr) & prefix_mask(bits, is_v4);
+
+    let mut row = TableRow::default();
+    let mut org_parts: Vec<&str> = Vec::new();
+    for t in toks.iter().skip(pfx_idx + 1) {
+        let t = t.trim_end_matches(|c: char| ".,;".contains(c));
+        if t.is_empty() || t == "origin:" || t == "route:" {
+            continue;
+        }
+        let up = t.to_ascii_uppercase();
+        if row.asn.is_none() {
+            let digits = up.strip_prefix("AS").unwrap_or(&up);
+            if let Ok(n) = digits.parse::<u32>() {
+                if n > 0 && n < 4_000_000_000 {
+                    row.asn = Some(n);
+                    continue;
+                }
+            }
+        }
+        if row.country.is_none() && t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic()) {
+            let packed = country_pack(t);
+            if packed != 0 {
+                row.country = Some(packed);
+                continue;
+            }
+        }
+        org_parts.push(t);
+    }
+    if !org_parts.is_empty() {
+        row.org = Some(org_parts.join(" "));
+    }
+    Some(((base, bits), row))
+}
+
+fn parse_table(text: &str) -> TableData {
+    let mut map = HashMap::new();
+    let mut lens_set = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if let Some((k, row)) = parse_table_line(line) {
+            lens_set.insert(k.1);
+            map.insert(k, row);
+        }
+    }
+    let lens: Vec<u8> = lens_set.into_iter().rev().collect();
+    let rows = map.len();
+    TableData { map, lens, rows }
+}
+
+/// Prefix table enricher. `kind = "table"` in config; `path` is a local
+/// file or http(s) URL, re-read every `refresh_secs` (0 = load once).
+pub struct TableEnricher {
+    pub name: String,
+    source: TableSource,
+    refresh: Duration,
+    data: RwLock<TableData>,
+    loaded_ms: AtomicU64,
+}
+
+enum TableSource {
+    File(PathBuf),
+    Url { url: String, client: reqwest::Client },
+}
+
+impl TableEnricher {
+    fn new(cfg: &EnricherConfig) -> anyhow::Result<Self> {
+        let src = cfg.path.clone().unwrap_or_default();
+        let source = if src.starts_with("http://") || src.starts_with("https://") {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("bgflowd/0.1 (+https://github.com/XodoTechnology/BGFlow)")
+                .build()?;
+            TableSource::Url { url: src, client }
+        } else {
+            TableSource::File(PathBuf::from(src))
+        };
+        let t = TableEnricher {
+            name: cfg.name.clone(),
+            source,
+            refresh: Duration::from_secs(cfg.refresh_secs.max(60)),
+            data: RwLock::new(TableData { map: HashMap::new(), lens: vec![], rows: 0 }),
+            loaded_ms: AtomicU64::new(0),
+        };
+        // Synchronous first load for file sources (fast, local).
+        if matches!(t.source, TableSource::File(_)) {
+            if let Ok(text) = t.fetch_text() {
+                *t.data.write().unwrap() = parse_table(&text);
+                t.loaded_ms.store(crate::metrics::now_ms(), Ordering::Relaxed);
+            }
+        }
+        Ok(t)
+    }
+
+    /// Spawn the periodic refresh loop (call once after construction).
+    pub fn spawn_refresh(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            // First refresh immediately covers URL sources.
+            loop {
+                this.refresh().await;
+                tokio::time::sleep(this.refresh).await;
+            }
+        });
+    }
+
+    async fn refresh(&self) {
+        match self.fetch_text_async().await {
+            Some(text) => {
+                let d = parse_table(&text);
+                tracing::info!(
+                    "table enricher '{}': loaded {} prefixes",
+                    self.name,
+                    d.rows
+                );
+                *self.data.write().unwrap() = d;
+                self.loaded_ms.store(crate::metrics::now_ms(), Ordering::Relaxed);
+            }
+            None => tracing::warn!("table enricher '{}': refresh failed", self.name),
+        }
+    }
+
+    fn fetch_text(&self) -> std::io::Result<String> {
+        match &self.source {
+            TableSource::File(p) => std::fs::read_to_string(p),
+            TableSource::Url { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "url source needs async fetch",
+            )),
+        }
+    }
+
+    async fn fetch_text_async(&self) -> Option<String> {
+        match &self.source {
+            TableSource::File(p) => std::fs::read_to_string(p).ok(),
+            TableSource::Url { url, client } => {
+                let resp = client.get(url).send().await.ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                resp.text().await.ok()
+            }
+        }
+    }
+
+    /// Exact longest-prefix-match lookup. Returns a LookupResult so the
+    /// shared apply path works unchanged.
+    pub fn lookup(&self, ip_u128: u128) -> Option<LookupResult> {
+        let is_v4 = is_v4_mapped(ip_u128);
+        let g = self.data.read().unwrap();
+        for &len in &g.lens {
+            let key = (ip_u128 & prefix_mask(len, is_v4), len);
+            if let Some(row) = g.map.get(&key) {
+                if row.asn.is_none() && row.org.is_none() && row.country.is_none() {
+                    return None;
+                }
+                return Some(LookupResult {
+                    asn: row.asn,
+                    org: row.org.clone(),
+                    country: row.country,
+                    extra: vec![],
+                });
+            }
+        }
+        None
+    }
+
+    pub fn stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "prefixes": self.data.read().unwrap().rows,
+            "loaded_ms": self.loaded_ms.load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// The full enricher set — swapped atomically on config reload.
+struct EnricherSet {
+    http: Vec<Arc<HttpEnricher>>,
+    tables: Vec<Arc<TableEnricher>>,
+}
+
+/// Owns all enrichers + the background lookup worker. `set` is an
+/// `Arc`-swapped snapshot so reloads are race-free: in-flight lookups keep
+/// their old enricher, new flows see the new set.
 pub struct HttpEnrichers {
-    pub items: Vec<HttpEnricher>,
-    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(usize, PrefixKey)>>,
-    tx: tokio::sync::mpsc::Sender<(usize, PrefixKey)>,
+    set: RwLock<Arc<EnricherSet>>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Arc<HttpEnricher>, PrefixKey)>>,
+    tx: tokio::sync::mpsc::Sender<(Arc<HttpEnricher>, PrefixKey)>,
     metrics: Arc<Metrics>,
     orgs: Arc<StringTable>,
 }
 
+fn build_set(cfgs: &[EnricherConfig]) -> anyhow::Result<EnricherSet> {
+    let mut http = Vec::new();
+    let mut tables = Vec::new();
+    for c in cfgs {
+        match c.kind.as_str() {
+            "http" => {
+                http.push(Arc::new(HttpEnricher::new(c)?));
+                tracing::info!("enricher '{}' -> {}", c.name, c.url);
+            }
+            "table" => {
+                let t = Arc::new(TableEnricher::new(c)?);
+                tracing::info!(
+                    "table enricher '{}' <- {}",
+                    t.name,
+                    c.path.as_deref().unwrap_or("?")
+                );
+                tables.push(t);
+            }
+            other => tracing::warn!("unknown enricher type '{}' (skipped)", other),
+        }
+    }
+    Ok(EnricherSet { http, tables })
+}
+
 impl HttpEnrichers {
     pub fn new(cfgs: &[EnricherConfig], metrics: Arc<Metrics>, orgs: Arc<StringTable>) -> anyhow::Result<Self> {
-        let mut items = Vec::new();
-        for c in cfgs.iter().filter(|c| c.kind == "http") {
-            items.push(HttpEnricher::new(c)?);
-            tracing::info!("enricher '{}' -> {}", c.name, c.url);
+        let set = Arc::new(build_set(cfgs)?);
+        // Kick off table refresh loops.
+        for t in &set.tables {
+            t.spawn_refresh();
         }
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
         Ok(HttpEnrichers {
-            items,
+            set: RwLock::new(set),
             rx: tokio::sync::Mutex::new(rx),
             tx,
             metrics,
@@ -515,22 +789,49 @@ impl HttpEnrichers {
         })
     }
 
-    pub fn enabled(&self) -> bool {
-        !self.items.is_empty()
+    /// Hot-reload: rebuild the enricher set from new config (SIGHUP).
+    /// In-flight HTTP lookups complete against the old set harmlessly.
+    pub fn reload(&self, cfgs: &[EnricherConfig]) -> anyhow::Result<()> {
+        let set = Arc::new(build_set(cfgs)?);
+        for t in &set.tables {
+            t.spawn_refresh();
+        }
+        *self.set.write().unwrap() = set;
+        tracing::info!("enrichers reloaded");
+        Ok(())
     }
 
-    /// Ingest-path hook: apply cached results and enqueue misses.
+    pub fn enabled(&self) -> bool {
+        let s = self.set.read().unwrap();
+        !s.http.is_empty() || !s.tables.is_empty()
+    }
+
+    pub fn backend_count(&self) -> usize {
+        let s = self.set.read().unwrap();
+        s.http.len() + s.tables.len()
+    }
+
+    /// Ingest-path hook: apply cached/table results and enqueue misses.
     /// Called per flow record, per endpoint.
     pub fn enrich_record(&self, rec: &mut FlowRecord) {
-        for (i, e) in self.items.iter().enumerate() {
-            for (ip_u128, is_src) in [(rec.src_ip, true), (rec.dst_ip, false)] {
-                let ip = u128_to_ip(ip_u128);
+        let set = self.set.read().unwrap().clone();
+        for (ip_u128, is_src) in [(rec.src_ip, true), (rec.dst_ip, false)] {
+            let ip = u128_to_ip(ip_u128);
+            // Table enrichers: synchronous, exact LPM, fill unset fields.
+            for t in &set.tables {
+                if let Some(res) = t.lookup(ip_u128) {
+                    self.metrics.table_hits.fetch_add(1, Ordering::Relaxed);
+                    apply_result(&res, &self.orgs, rec, is_src);
+                }
+            }
+            // HTTP enrichers: cache hit applies, miss enqueues.
+            for e in &set.http {
                 if let Some(res) = e.cached(ip) {
-                    self.metrics.http_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.http_hits.fetch_add(1, Ordering::Relaxed);
                     e.apply(&res, &self.orgs, rec, is_src);
                 } else {
-                    self.metrics.http_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    e.enqueue(ip, &self.tx, i);
+                    self.metrics.http_misses.fetch_add(1, Ordering::Relaxed);
+                    e.enqueue(ip, &self.tx);
                 }
             }
         }
@@ -540,9 +841,8 @@ impl HttpEnrichers {
     pub async fn run(&self) {
         loop {
             let msg = self.rx.lock().await.recv().await;
-            let Some((idx, key)) = msg else { break };
-            let e = &self.items[idx];
-            self.metrics.http_lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some((e, key)) = msg else { break };
+            self.metrics.http_lookups.fetch_add(1, Ordering::Relaxed);
             match e.lookup(key).await {
                 Some(res) => {
                     let empty = res.asn.is_none() && res.org.is_none() && res.country.is_none() && res.extra.is_empty();
@@ -551,7 +851,7 @@ impl HttpEnrichers {
                 None => {
                     // Backend failure: count it and negative-cache briefly so
                     // a down backend doesn't get hammered per flow.
-                    self.metrics.http_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.http_errors.fetch_add(1, Ordering::Relaxed);
                     e.store(key, LookupResult::default(), true);
                 }
             }
@@ -560,13 +860,20 @@ impl HttpEnrichers {
 
     /// Status for the API.
     pub fn status(&self) -> serde_json::Value {
+        let s = self.set.read().unwrap();
         serde_json::json!({
             "enabled": self.enabled(),
-            "backends": self.items.iter().map(|e| serde_json::json!({
+            "backends": s.http.iter().map(|e| serde_json::json!({
                 "name": e.name,
+                "type": "http",
                 "url": e.url,
                 "cache_entries": e.cache.lock().unwrap().len(),
                 "pending": e.pending.lock().unwrap().len(),
+            })).collect::<Vec<_>>(),
+            "tables": s.tables.iter().map(|t| serde_json::json!({
+                "name": t.name,
+                "type": "table",
+                "stats": t.stats(),
             })).collect::<Vec<_>>(),
         })
     }
@@ -574,10 +881,11 @@ impl HttpEnrichers {
     /// Cached detail for one IP (for the UI lookup tool).
     pub fn lookup_ip(&self, ip: IpAddr) -> serde_json::Value {
         let key = prefix_key(ip);
-        serde_json::json!({
-            "ip": ip_string(ip_to_u128(&ip)),
-            "prefix": prefix_str(key),
-            "results": self.items.iter().map(|e| {
+        let set = self.set.read().unwrap();
+        let mut backends: Vec<serde_json::Value> = set
+            .http
+            .iter()
+            .map(|e| {
                 let g = e.cache.lock().unwrap();
                 let v = g.get(&key).map(|en| serde_json::json!({
                     "asn": en.result.asn,
@@ -585,8 +893,21 @@ impl HttpEnrichers {
                     "country": en.result.country.map(|c| country_str(c)),
                     "extra": en.result.extra,
                 }));
-                serde_json::json!({"backend": e.name, "result": v})
-            }).collect::<Vec<_>>(),
+                serde_json::json!({"backend": e.name, "type": "http", "result": v})
+            })
+            .collect();
+        for t in &set.tables {
+            let v = t.lookup(ip_to_u128(&ip)).map(|r| serde_json::json!({
+                "asn": r.asn,
+                "org": r.org,
+                "country": r.country.map(|c| country_str(c)),
+            }));
+            backends.push(serde_json::json!({"backend": t.name, "type": "table", "result": v}));
+        }
+        serde_json::json!({
+            "ip": ip_string(ip_to_u128(&ip)),
+            "prefix": prefix_str(key),
+            "results": backends,
         })
     }
 }
@@ -599,4 +920,56 @@ pub fn enrich_record(
 ) {
     geo.enrich(rec);
     http.enrich_record(rec);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_parse_and_lpm() {
+        let text = r#"
+# comment
+1.2.3.0/24 64512 "Acme Corp" US
+1.2.3.0/24 64512 Acme Corp US
+10.0.0.0/8 AS65000 BigNet
+2001:db8::/32 64496 v6net GB
+route: 9.9.9.0/24 origin: AS13335
+"#;
+        let d = parse_table(text);
+        assert_eq!(d.rows, 4);
+        // direct hit
+        let ip = ip_to_u128(&"1.2.3.99".parse::<IpAddr>().unwrap());
+        let r = d.map.get(&(ip & prefix_mask(24, true), 24)).unwrap();
+        assert_eq!(r.asn, Some(64512));
+        // LPM: /8 covers 10.x
+        let ip8 = ip_to_u128(&"10.9.8.7".parse::<IpAddr>().unwrap());
+        assert!(d.map.contains_key(&(ip8 & prefix_mask(8, true), 8)));
+        // v6
+        let ip6 = ip_to_u128(&"2001:db8::1".parse::<IpAddr>().unwrap());
+        assert!(d.map.contains_key(&(ip6 & prefix_mask(32, false), 32)));
+    }
+
+    #[test]
+    fn table_enricher_lookup() {
+        let cfg = EnricherConfig {
+            kind: "table".into(),
+            name: "t".into(),
+            path: None,
+            url: String::new(),
+            timeout_ms: 1000,
+            cache_ttl_secs: 60,
+            fields: crate::config::HttpFields::default(),
+            headers: Default::default(),
+            refresh_secs: 0,
+        };
+        let t = TableEnricher::new(&cfg).unwrap();
+        *t.data.write().unwrap() = parse_table("1.2.3.0/24 64512 Acme US\n");
+        let hit = t.lookup(ip_to_u128(&"1.2.3.77".parse::<IpAddr>().unwrap())).unwrap();
+        assert_eq!(hit.asn, Some(64512));
+        assert_eq!(hit.org.as_deref(), Some("Acme"));
+        assert_eq!(hit.country, Some(country_pack("US")));
+        // no match outside prefix
+        assert!(t.lookup(ip_to_u128(&"9.9.9.9".parse::<IpAddr>().unwrap())).is_none());
+    }
 }

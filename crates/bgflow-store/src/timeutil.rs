@@ -27,6 +27,11 @@ pub fn minute_floor(ms: u64) -> u64 {
     ms - (ms % 60_000)
 }
 
+/// Hour-aligned unix ms for a timestamp.
+pub fn hour_floor(ms: u64) -> u64 {
+    ms - (ms % 3_600_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

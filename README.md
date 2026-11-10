@@ -12,18 +12,32 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   per-column dictionary/delta encoding + ZSTD. No ClickHouse, no DuckDB, no
   external DB.
 - **In-memory rollups** — 1-minute aggregates keep long-range queries fast and
-  storage small; raw flows kept for a shorter retention window.
+  storage small; raw flows kept for a shorter retention window. A second
+  **coarse dataset** (hourly buckets, /24·/48-masked IPs) provides
+  year-scale stats at minimal cardinality — query with `granularity=hourly`.
 - **Protocols**: NetFlow v5, NetFlow v9 (template cache), IPFIX (enterprise +
   variable-length fields, UDP **and TCP** stream transport), sFlow v5.
   Auto-detected per datagram on one port.
-- **Enrichment**: MaxMind MMDB (GeoLite2-ASN/Country) plus **pluggable HTTP
-  backends** — point it at your own whois/RDAP/IRR services (e.g. `irrd3.net`)
-  with configurable JSON field mapping and prefix-granularity caching.
+- **Rich flow metadata** — IPFIX/NetFlow IEs mapped to TTL, flow-end reason,
+  ICMP type/code, post-NAT addresses, direction, DSCP, IP version, TCP state,
+  sampler interval, observation domain.
+- **Enrichment**: MaxMind MMDB (GeoLite2-ASN/Country) plus **pluggable
+  backends** — HTTP services (e.g. `irrd3.net`) with JSON field mapping,
+  auth headers, and prefix caching; **table enrichers** for bulk
+  prefix→ASN/org/country dumps (BGP/IRR-scale, exact LPM, file or URL).
 - **Label rules** — TOML-defined rules tag flows (ASN, port, prefix, org, …)
-  for filtering and classification.
-- **Prometheus metrics** at `/metrics`.
-- **Embedded UI** — dark, Elastiflow-style SPA: overview dashboard, flow
-  explorer, top talkers, conversations, exporters, labels, metrics.
+  for filtering and classification; hot-reloadable via SIGHUP.
+- **Threshold alerts** — rate-based rules over rollups (bytes/packets/flows/
+  mbps per window, optional group-by + fold-change), log + metric + webhook.
+- **Analytics** — top-N by 15 dimensions (IP, ASN, org, port, protocol,
+  country, label, IP version, exporter), per-label stats, z-score anomaly
+  detection, country heat view, CSV export, OpenAPI spec.
+- **Prometheus metrics** at `/metrics` (incl. per-exporter stats).
+- **Embedded UI** — dark, Elastiflow-style SPA: dashboard, flow explorer with
+  click-to-filter, top talkers, country heatmap, conversations, anomalies,
+  exporters, labels, metrics, saved filter presets, auto-refresh.
+- **Ops** — `bgflowd doctor` (segment CRC verification), deep `/health`,
+  SIGHUP config reload, optional TLS, UDP buffer sizing, TCP conn limits.
 - **Low resource use** — a few % CPU and tens of MB RAM at moderate rates.
 
 ## Quickstart
@@ -137,17 +151,30 @@ Rule match fields (all ANDed): `proto`, `src_port`, `dst_port`, `src_ip`,
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/flows` | Raw flows — `from,to,src,dst,proto,sport,dport,exporter,src_asn,dst_asn,label,limit,offset,order` |
+| `GET /api/v1/flows` | Raw flows — `from,to,src,dst,proto,sport,dport,exporter` (comma list),`src_asn,dst_asn,src_ipver,dst_ipver,src_org,dst_org,label,limit,offset,order,format=csv` |
 | `GET /api/v1/summary` | Totals + per-protocol breakdown over rollups |
 | `GET /api/v1/timeseries` | `bucket=1m|5m|15m|1h|6h|1d` bytes/packets/flows series |
-| `GET /api/v1/top` | `by=src_ip,dst_ip,src_asn,dst_asn,src_port,dst_port,proto,exporter,src_country,dst_country` |
+| `GET /api/v1/top` | `by=` any of `src_ip,dst_ip,src_ipver,dst_ipver,src_asn,dst_asn,src_org,dst_org,src_port,dst_port,proto,exporter,src_country,dst_country,label`; filters same as summary + `granularity=minute|hourly` |
 | `GET /api/v1/conversations` | Top 5-tuple conversations |
+| `GET /api/v1/anomalies` | z-score outliers, `by=`, `sigma=`, `granularity=` |
+| `GET /api/v1/label_stats` | Traffic totals per label |
 | `GET /api/v1/exporters` | Seen exporters + counters |
 | `GET /api/v1/labels` | Configured label rules |
-| `GET /api/v1/enrichers` | Enricher backends + cache stats |
+| `GET /api/v1/enrichers` | Enricher backends + cache/table stats |
 | `GET /api/v1/lookup?ip=` | Cached enrichment detail for an IP |
+| `GET /api/v1/config` | Effective config (secrets redacted) |
+| `GET /api/v1/openapi.json` | OpenAPI 3.0 spec |
 | `GET /api/v1/status` | Daemon/storage status |
+| `GET /api/v1/health` | Deep health: writer liveness, buffers, flush age |
 | `GET /metrics` | Prometheus exposition |
+
+Rollup-backed endpoints (`summary`, `timeseries`, `top`, `conversations`,
+`anomalies`, `label_stats`) accept `granularity=hourly` to query the coarse
+long-retention dataset (hour buckets, /24·/48-masked IPs). Filters:
+`from,to,src,dst` (IP or CIDR), `proto`, `sport,dport` (or `src_port,
+dst_port`), `exporter` (comma-separated allowlist), `src_asn,dst_asn`,
+`src_country,dst_country` (alpha-2), `src_ipver,dst_ipver` (4|6),
+`src_org,dst_org` (org id), `label` (name or id).
 
 Time params accept epoch seconds, epoch millis, or relative `-15m`, `-1h`,
 `-7d`. `to` defaults to now.

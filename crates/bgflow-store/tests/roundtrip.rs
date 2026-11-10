@@ -30,6 +30,12 @@ fn sample_flow(i: u64) -> FlowRecord {
         sampler_interval: if i % 10 == 0 { 0 } else { 1000 },
         tcp_state: (i % 12) as u8,
         label_id: 0,
+        ip_ttl: (i % 255) as u8,
+        flow_end_reason: (i % 4) as u8,
+        icmp_type: (i % 256) as u8,
+        icmp_code: (i % 256) as u8,
+        post_nat_src: 0,
+        post_nat_dst: 0,
     }
 }
 
