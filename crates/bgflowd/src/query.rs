@@ -611,6 +611,14 @@ pub fn dim_key(by: &str, r: &RollupRow) -> u128 {
 
 /// Format a grouped u128 dimension key for top-N output.
 pub fn format_key(ctx: &Ctx, by: &str, key: u128) -> serde_json::Value {
+    // Dimensions where 0 means "unset/unknown" display as "-".
+    match by {
+        "src_asn" | "dst_asn" | "src_country" | "dst_country" | "src_org"
+        | "dst_org" | "label" | "label_id" if key == 0 => {
+            return serde_json::json!("-");
+        }
+        _ => {}
+    }
     match by {
         "src_ip" => serde_json::json!(ip_string(key)),
         "dst_ip" => serde_json::json!(ip_string(key)),
@@ -620,8 +628,14 @@ pub fn format_key(ctx: &Ctx, by: &str, key: u128) -> serde_json::Value {
         "dst_port" => serde_json::json!(key as u16),
         "proto" | "protocol" => serde_json::json!(protocol_name(key as u8)),
         "exporter" => serde_json::json!(ip_string(key)),
-        "src_country" => serde_json::json!(country_str(key as u16)),
-        "dst_country" => serde_json::json!(country_str(key as u16)),
+        "src_country" => {
+            let s = country_str(key as u16);
+            serde_json::json!(if s.is_empty() { "-" } else { s.as_str() })
+        }
+        "dst_country" => {
+            let s = country_str(key as u16);
+            serde_json::json!(if s.is_empty() { "-" } else { s.as_str() })
+        }
         "src_org" => ctx
             .orgs
             .name(key as u32)

@@ -172,10 +172,13 @@ dst_port = 53
 # min_change_pct = 200     # only fire on >2x jump vs previous window
 
 # --- Demo traffic -------------------------------------------------------------
-# Send synthetic NetFlow v5 to the first input — handy for trying the UI.
+# Send synthetic NetFlow v5 + IPFIX(IPv6) to the first input — handy for
+# trying the UI. Traffic is spread across loopback exporter IPs
+# (127.0.0.1..N) so the exporter dimension has multiple values.
 # (Or use: bgflowd --demo 127.0.0.1:2055)
 # [demo]
 # enabled = true
 # pps = 20
 # flows_per_pkt = 20
+# exporters = 3           # loopback source IPs: 127.0.0.1 .. 127.0.0.N
 # duration_secs = 0       # 0 = forever

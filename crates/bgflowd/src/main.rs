@@ -205,10 +205,11 @@ async fn main() -> Result<()> {
         let pps = if args.demo.is_some() { args.demo_pps } else { cfg.demo.pps };
         let flows = if args.demo.is_some() { args.demo_flows } else { cfg.demo.flows_per_pkt };
         let secs = if args.demo.is_some() { args.demo_secs } else { cfg.demo.duration_secs };
+        let exporters = if args.demo.is_some() { 3 } else { cfg.demo.exporters };
         tokio::spawn(async move {
             let dur = if secs == 0 { None } else { Some(secs) };
             tracing::info!("demo: sending traffic to {}", target);
-            if let Err(e) = demo::run(target, pps, flows, dur).await {
+            if let Err(e) = demo::run(target, pps, flows, dur, exporters).await {
                 tracing::error!("demo sender failed: {}", e);
             }
         });

@@ -31,6 +31,8 @@ pub struct DemoConfig {
     pub pps: u64,
     /// Flow records per datagram.
     pub flows_per_pkt: usize,
+    /// Loopback source IPs to spread demo traffic across (exporter dim).
+    pub exporters: usize,
     /// Seconds to run; 0 = forever.
     pub duration_secs: u64,
 }
@@ -42,6 +44,7 @@ impl Default for DemoConfig {
             target: None,
             pps: 20,
             flows_per_pkt: 20,
+            exporters: 3,
             duration_secs: 0,
         }
     }

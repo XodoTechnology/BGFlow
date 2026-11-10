@@ -515,24 +515,31 @@ struct TableRow {
 }
 
 struct TableData {
-    /// (masked_base, prefix_len) -> row
-    map: HashMap<(u128, u8), TableRow>,
-    /// Distinct prefix lengths present, sorted descending (early-exit LPM).
-    lens: Vec<u8>,
+    /// (masked_base, prefix_len, is_v4) -> row. The family flag prevents
+    /// v4/v6 keys colliding and lets lookups skip the wrong family entirely.
+    map: HashMap<(u128, u8, bool), TableRow>,
+    /// Distinct (prefix_len, is_v4) present, sorted by len descending
+    /// (early-exit LPM).
+    lens: Vec<(u8, bool)>,
     rows: usize,
 }
 
 /// Mask keeping the top `bits` of an address. `is_v4` addresses live in the
-/// low 32 bits of the u128 (v4-mapped form).
+/// low 32 bits of the u128 (v4-mapped form). Returns all-ones for an
+/// out-of-range v4 length so it can never match a stored key.
 fn prefix_mask(bits: u8, is_v4: bool) -> u128 {
     if is_v4 {
         if bits == 0 {
             0
+        } else if bits > 32 {
+            u128::MAX
         } else {
             ((u32::MAX << (32 - bits)) as u128) & 0xFFFF_FFFF
         }
     } else if bits == 0 {
         0
+    } else if bits > 128 {
+        u128::MAX
     } else {
         u128::MAX << (128 - bits)
     }
@@ -543,7 +550,7 @@ fn prefix_mask(bits: u8, is_v4: bool) -> u128 {
 ///   2001:db8::/32 AS64496 Acme  GB
 ///   route: 1.2.3.0/24 origin: AS13335   (RPSL-ish, best effort)
 /// asn may be bare digits or AS-prefixed; country is a 2-letter code.
-fn parse_table_line(line: &str) -> Option<((u128, u8), TableRow)> {
+fn parse_table_line(line: &str) -> Option<((u128, u8, bool), TableRow)> {
     let line = line.split('#').next()?.trim();
     if line.is_empty() {
         return None;
@@ -589,7 +596,7 @@ fn parse_table_line(line: &str) -> Option<((u128, u8), TableRow)> {
     if !org_parts.is_empty() {
         row.org = Some(org_parts.join(" "));
     }
-    Some(((base, bits), row))
+    Some(((base, bits, is_v4), row))
 }
 
 fn parse_table(text: &str) -> TableData {
@@ -597,11 +604,13 @@ fn parse_table(text: &str) -> TableData {
     let mut lens_set = std::collections::BTreeSet::new();
     for line in text.lines() {
         if let Some((k, row)) = parse_table_line(line) {
-            lens_set.insert(k.1);
+            lens_set.insert((k.1, k.2));
             map.insert(k, row);
         }
     }
-    let lens: Vec<u8> = lens_set.into_iter().rev().collect();
+    // Sort by prefix length descending so LPM tries longest first.
+    let mut lens: Vec<(u8, bool)> = lens_set.into_iter().collect();
+    lens.sort_by(|a, b| b.0.cmp(&a.0));
     let rows = map.len();
     TableData { map, lens, rows }
 }
@@ -706,8 +715,11 @@ impl TableEnricher {
     pub fn lookup(&self, ip_u128: u128) -> Option<LookupResult> {
         let is_v4 = is_v4_mapped(ip_u128);
         let g = self.data.read().unwrap();
-        for &len in &g.lens {
-            let key = (ip_u128 & prefix_mask(len, is_v4), len);
+        for &(len, fam_v4) in &g.lens {
+            if fam_v4 != is_v4 {
+                continue;
+            }
+            let key = (ip_u128 & prefix_mask(len, is_v4), len, is_v4);
             if let Some(row) = g.map.get(&key) {
                 if row.asn.is_none() && row.org.is_none() && row.country.is_none() {
                     return None;
@@ -940,14 +952,19 @@ route: 9.9.9.0/24 origin: AS13335
         assert_eq!(d.rows, 4);
         // direct hit
         let ip = ip_to_u128(&"1.2.3.99".parse::<IpAddr>().unwrap());
-        let r = d.map.get(&(ip & prefix_mask(24, true), 24)).unwrap();
+        let r = d
+            .map
+            .get(&(ip & prefix_mask(24, true), 24, true))
+            .unwrap();
         assert_eq!(r.asn, Some(64512));
         // LPM: /8 covers 10.x
         let ip8 = ip_to_u128(&"10.9.8.7".parse::<IpAddr>().unwrap());
-        assert!(d.map.contains_key(&(ip8 & prefix_mask(8, true), 8)));
+        assert!(d.map.contains_key(&(ip8 & prefix_mask(8, true), 8, true)));
         // v6
         let ip6 = ip_to_u128(&"2001:db8::1".parse::<IpAddr>().unwrap());
-        assert!(d.map.contains_key(&(ip6 & prefix_mask(32, false), 32)));
+        assert!(d
+            .map
+            .contains_key(&(ip6 & prefix_mask(32, false), 32, false)));
     }
 
     #[test]
@@ -964,12 +981,21 @@ route: 9.9.9.0/24 origin: AS13335
             refresh_secs: 0,
         };
         let t = TableEnricher::new(&cfg).unwrap();
-        *t.data.write().unwrap() = parse_table("1.2.3.0/24 64512 Acme US\n");
+        *t.data.write().unwrap() = parse_table(
+            "1.2.3.0/24 64512 Acme US\n2001:db8::/32 64496 v6net GB\n",
+        );
         let hit = t.lookup(ip_to_u128(&"1.2.3.77".parse::<IpAddr>().unwrap())).unwrap();
         assert_eq!(hit.asn, Some(64512));
         assert_eq!(hit.org.as_deref(), Some("Acme"));
         assert_eq!(hit.country, Some(country_pack("US")));
         // no match outside prefix
         assert!(t.lookup(ip_to_u128(&"9.9.9.9".parse::<IpAddr>().unwrap())).is_none());
+        // regression: v4 lookup with v6 prefixes in the table must not panic
+        // (previously prefix_mask underflowed on len>32) and must still hit.
+        assert!(t.lookup(ip_to_u128(&"1.2.3.200".parse::<IpAddr>().unwrap())).is_some());
+        let v6hit = t
+            .lookup(ip_to_u128(&"2001:db8::5".parse::<IpAddr>().unwrap()))
+            .unwrap();
+        assert_eq!(v6hit.asn, Some(64496));
     }
 }
