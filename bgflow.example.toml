@@ -63,7 +63,12 @@ coarse_rollup = true
 coarse_retention_days = 365
 
 [geoip]
-# MaxMind GeoLite2 databases (optional). Download from maxmind.com.
+# GeoIP MMDB databases (optional) — fills in ASN/org/country for flows
+# whose exporter didn't provide them. Any MaxMind-compatible MMDB works:
+#   * DB-IP Lite (free, no account): https://db-ip.com/db/download/ip-to-asn-mmdb.html
+#     and https://db-ip.com/db/download/ip-to-country-mmdb.html
+#   * MaxMind GeoLite2 (free account + license key): https://www.maxmind.com
+# Typical install: /usr/share/GeoIP/{GeoLite2-ASN,GeoLite2-Country}.mmdb
 # Leave empty to disable MMDB enrichment.
 asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"
 country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"

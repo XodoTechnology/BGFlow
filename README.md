@@ -173,8 +173,8 @@ raw_retention_days = 7          # raw flow retention
 rollup_retention_days = 90      # rollup retention (long-range queries)
 
 [geoip]
-asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"      # optional
-country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
+asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"      # optional — any MaxMind MMDB
+country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"  # (DB-IP Lite works too)
 
 [[inputs]]
 listen = "0.0.0.0:2055"

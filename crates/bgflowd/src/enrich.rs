@@ -108,6 +108,9 @@ impl StringTable {
 struct AsnRecord {
     #[serde(rename = "autonomous_system_number")]
     asn: Option<u64>,
+    // GeoLite2 uses "autonomous_system_organization"; DB-IP Lite uses
+    // "organization" — accept either.
+    #[serde(alias = "autonomous_system_organization")]
     organization: Option<String>,
 }
 

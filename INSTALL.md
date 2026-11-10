@@ -110,6 +110,22 @@ Try the built-in demo while learning the UI:
 bgflowd --demo 127.0.0.1:2055 --demo-pps 20 --demo-secs 300
 ```
 
+## GeoIP enrichment (optional)
+
+ASN/org/country lookup works out of the box for flows whose exporter
+provides the fields, plus HTTP enrichers (e.g. `irrd3.net`) and table
+dumps. For **MMDB-backed enrichment of everything else**, drop any
+MaxMind-compatible `.mmdb` at the paths in `[geoip]`:
+
+- **DB-IP Lite** — free, no account:
+  `https://db-ip.com/db/download/ip-to-asn-mmdb.html` and
+  `https://db-ip.com/db/download/ip-to-country-mmdb.html`
+  (monthly updates; gunzip into `/usr/share/GeoIP/`)
+- **MaxMind GeoLite2** — free account + license key from maxmind.com
+
+Then `systemctl reload bgflow` (or restart) — the log shows
+`geoip enrichment enabled` when the DBs load.
+
 ## Securing a public deployment
 
 If the UI/API will be reachable beyond localhost, **set up auth before
