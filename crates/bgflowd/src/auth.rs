@@ -200,6 +200,9 @@ pub struct AuthState {
     pub secure_cookie: bool,
     /// Per-IP failed-login tracking for throttling.
     attempts: Mutex<HashMap<IpAddr, Attempt>>,
+    /// Revoked session token ids (jti → expiry). Stateless tokens can't be
+    /// un-signed, so logout records the id here until natural expiry.
+    revoked: Mutex<HashMap<String, u64>>,
     /// Precomputed hash used to equalize timing for unknown usernames
     /// (lazy — costs one PBKDF2 on first unknown-user attempt).
     dummy_hash: std::sync::OnceLock<String>,
@@ -241,6 +244,7 @@ impl AuthState {
             session_ttl: session_ttl_secs.unwrap_or(SESSION_TTL_DEFAULT).max(60),
             secure_cookie,
             attempts: Mutex::new(HashMap::new()),
+            revoked: Mutex::new(HashMap::new()),
             dummy_hash: std::sync::OnceLock::new(),
         }
     }
@@ -359,8 +363,9 @@ impl AuthState {
         format!("{}.{}", p, sig)
     }
 
-    /// Verify a session token → (user, role, seconds_left).
-    pub fn verify_token(&self, token: &str) -> Option<(String, Role, u64)> {
+    /// Parse + verify a session token → (user, role, secs_left, jti, exp).
+    /// Returns None for bad signature, malformed payload, or expiry.
+    fn parse_token(&self, token: &str) -> Option<(String, Role, u64, String, u64)> {
         let (p, sig) = token.split_once('.')?;
         let expect = self.sign(p.as_bytes());
         if !ct_eq(sig.as_bytes(), expect.as_bytes()) {
@@ -382,7 +387,36 @@ impl AuthState {
         if left == 0 {
             return None;
         }
-        Some((user, role, left))
+        let jti = it.next().unwrap_or("").to_string();
+        Some((user, role, left, jti, exp))
+    }
+
+    /// Verify a session token → (user, role, seconds_left).
+    /// Rejects revoked (logged-out) token ids.
+    pub fn verify_token(&self, token: &str) -> Option<(String, Role, u64)> {
+        let (u, r, left, jti, _) = self.parse_token(token)?;
+        if !jti.is_empty() && self.revoked.lock().unwrap().contains_key(&jti) {
+            return None;
+        }
+        Some((u, r, left))
+    }
+
+    /// Revoke a session token (logout). Verifies the signature first so
+    /// arbitrary ids can't be injected; records the jti until expiry.
+    /// No-op for invalid/expired tokens.
+    pub fn revoke_token(&self, token: &str) {
+        let Some((_, _, _, jti, exp)) = self.parse_token(token) else {
+            return;
+        };
+        if jti.is_empty() {
+            return;
+        }
+        let mut m = self.revoked.lock().unwrap();
+        if m.len() > 4096 {
+            let now = now_unix();
+            m.retain(|_, e| *e > now);
+        }
+        m.insert(jti, exp);
     }
 
     fn sign(&self, data: &[u8]) -> String {
@@ -541,6 +575,20 @@ mod tests {
         assert_eq!(st.check_basic("admin", "pw"), Some(Role::Admin));
         assert_eq!(st.check_basic("admin", "no"), None);
         assert!(!st.is_open());
+    }
+
+    #[test]
+    fn logout_revokes_token() {
+        let st = state();
+        let tok = st.issue_token("alice", Role::Admin);
+        assert!(st.verify_token(&tok).is_some());
+        st.revoke_token(&tok);
+        assert!(st.verify_token(&tok).is_none());
+        // Other tokens unaffected; forged revocations rejected.
+        let tok2 = st.issue_token("alice", Role::Viewer);
+        assert!(st.verify_token(&tok2).is_some());
+        st.revoke_token("forged.token");
+        assert!(st.verify_token(&tok2).is_some());
     }
 
     #[test]

@@ -1200,7 +1200,16 @@ async fn auth_login(
 }
 
 /// POST /api/v1/auth/logout — expire the session cookie.
-async fn auth_logout(State(st): State<Arc<AppState>>) -> Response {
+async fn auth_logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    // Revoke the token server-side — stateless tokens stay valid until
+    // expiry otherwise, so "logout" would be cosmetic for a stolen cookie.
+    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie.split(';') {
+            if let Some(tok) = part.trim().strip_prefix("bgflow_session=") {
+                st.auth.revoke_token(tok);
+            }
+        }
+    }
     let cookie = format!(
         "bgflow_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
         if st.auth.secure_cookie { "; Secure" } else { "" }
