@@ -71,6 +71,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <a data-v="top">▲ Top Talkers</a>
     <a data-v="countries">🌍 Countries</a>
     <a data-v="conv">⬌ Conversations</a>
+    <a data-v="flowmap">≋ Flow Map</a>
     <a data-v="anomalies">⚠ Anomalies</a>
     <a data-v="exporters">⬒ Exporters</a>
     <a data-v="labels">⚑ Labels &amp; Enrichment</a>
@@ -106,7 +107,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 <script>
 "use strict";
 const $=s=>document.querySelector(s), content=$('#content');
-const state={view:'overview',range:'-24h',refreshMs:15000,metric:'bytes',bucket:'5m',topby:'src_ip',topn:15,granularity:'minute',updated:0,chartSeries:null,hoverI:-1,rate:null};
+const state={view:'overview',range:'-24h',refreshMs:15000,metric:'bytes',bucket:'5m',topby:'src_ip',topn:15,granularity:'minute',updated:0,chartSeries:null,hoverI:-1,rate:null,msrc:'src_country',mdst:'dst_country',mlim:100,mapData:null,mapHover:-1,mapHoverNode:null};
 const F={}; // active filters
 let timer=null;
 
@@ -153,6 +154,7 @@ async function load(silent){
     else if(state.view==='top')await vTop();
     else if(state.view==='countries')await vCountries();
     else if(state.view==='conv')await vConv();
+    else if(state.view==='flowmap')await vFlowmap();
     else if(state.view==='anomalies')await vAnomalies();
     else if(state.view==='exporters')await vExporters();
     else if(state.view==='labels')await vLabels();
@@ -171,11 +173,11 @@ function topTbl(items, fk){
 }
 
 async function vOverview(){
-  const [sum,ts,s,d,sa,da,dp,st]=await Promise.all([
-    api('/api/v1/summary?'+q()),api('/api/v1/timeseries?'+q({bucket:state.bucket})),
-    api('/api/v1/top?'+q({by:'src_ip',limit:8})),api('/api/v1/top?'+q({by:'dst_ip',limit:8})),
-    api('/api/v1/top?'+q({by:'src_asn',limit:8})),api('/api/v1/top?'+q({by:'dst_asn',limit:8})),
-    api('/api/v1/top?'+q({by:'dst_port',limit:8})),api('/api/v1/status')]);
+  // One combined scan server-side instead of 6 separate top/summary calls.
+  const [ov,st]=await Promise.all([
+    api('/api/v1/overview?'+q({bucket:state.bucket,limit:8})),api('/api/v1/status')]);
+  const sum=ov,ts=ov,s={items:ov.top.src_ip},d={items:ov.top.dst_ip},
+        sa={items:ov.top.src_asn},da={items:ov.top.dst_asn},dp={items:ov.top.dst_port};
   const cards=`<div class="cards">
     <div class="card"><div class="lbl">Flows</div><div class="val">${fmtN(sum.flows)}</div><div class="sub">${esc(trangeLabel())}</div></div>
     <div class="card"><div class="lbl">Bytes</div><div class="val">${fmtB(sum.bytes)}</div><div class="sub">${fmtN(sum.packets)} packets</div></div>
@@ -448,6 +450,140 @@ async function vLabels(){
    <div class="panel"><h3>Storage</h3><pre>${esc(JSON.stringify(st.status,null,2))}</pre></div>`;
 }
 async function doLookup(){const ip=$('#lu_ip').value.trim();if(!ip)return;try{const d=await api('/api/v1/lookup?ip='+encodeURIComponent(ip));$('#lu_out').textContent=JSON.stringify(d,null,2)}catch(e){$('#lu_out').textContent='Error: '+e.message}}
+
+// ---------- flow map (sankey) ----------
+const MATRIX_DIMS=['src_ipver','dst_ipver','src_asn','dst_asn','src_org','dst_org','src_country','dst_country','proto','label','src_port','dst_port'];
+
+async function vFlowmap(){
+  content.innerHTML=`<div class="filters">
+    ${presetBar()}
+    <span class="muted">from</span>
+    <select id="m_src">${MATRIX_DIMS.map(d=>`<option ${state.msrc===d?'selected':''}>${d}</option>`).join('')}</select>
+    <span class="muted">→</span>
+    <select id="m_dst">${MATRIX_DIMS.map(d=>`<option ${state.mdst===d?'selected':''}>${d}</option>`).join('')}</select>
+    <select id="m_lim"><option>25</option><option>50</option><option selected>100</option><option>250</option><option>500</option></select>
+    <select id="m_gran"><option value="minute" ${state.granularity==='minute'?'selected':''}>minute</option><option value="hourly" ${state.granularity==='hourly'?'selected':''}>hourly</option></select>
+    <button class="btn" onclick="drawMap()">Draw</button></div>
+   <div class="panel"><h3>Flow Map — <span id="m_lbl"></span> <span class="muted" style="text-transform:none">(hover a node to isolate its flows)</span></h3><canvas id="sankey" style="height:540px"></canvas></div>
+   <div class="panel"><h3>Top Pairs</h3><div id="ptbl"></div></div>`;
+  state.msrc=$('#m_src').value;state.mdst=$('#m_dst').value;state.mlim=+$('#m_lim').value;state.granularity=$('#m_gran').value;
+  await drawMap();
+}
+async function drawMap(){
+  const data=await api('/api/v1/matrix?'+q({src_dim:state.msrc,dst_dim:state.mdst,limit:state.mlim}));
+  state.mapData=data;state.mapHover=-1;
+  $('#m_lbl').textContent=`${state.msrc} → ${state.mdst}`;
+  drawSankey(data.items||[]);bindSankeyHover();
+  const max=(data.items||[])[0]?.bytes||1;
+  const rows=(data.items||[]).slice(0,25).map(p=>{
+    // country filters need the 2-letter code, not the packed raw value
+    const sv=state.msrc.includes('country')?p.src:String(p.src_raw??p.src);
+    const dv=state.mdst.includes('country')?p.dst:String(p.dst_raw??p.dst);
+    return `<tr>
+    <td class="clickable" data-k="${esc(sv)}" data-dim="${state.msrc}" onclick="pairFilter(this)">${esc(p.src)}</td>
+    <td class="muted">→</td>
+    <td class="clickable" data-k="${esc(dv)}" data-dim="${state.mdst}" onclick="pairFilter(this)">${esc(p.dst)}</td>
+    <td style="width:20%"><span class="bar" style="width:${Math.max(2,p.bytes/max*100)}%"></span></td>
+    <td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.flows)}</td></tr>`}).join('');
+  $('#ptbl').innerHTML=`<table><tr><th>Source</th><th></th><th>Dest</th><th></th><th class="num">Bytes</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=6 class=muted>No data</td></tr>'}</table>`;
+}
+function pairFilter(el){F[el.dataset.dim]=el.dataset.k;load()}
+
+// Sankey renderer: left nodes = src dim, right = dst dim, ribbons ∝ bytes.
+function nodeColor(id){let h=0;for(const ch of id)h=(h*31+ch.charCodeAt(0))>>>0;return `hsl(${h%360},65%,55%)`}
+function drawSankey(items){
+  const c=$('#sankey');if(!c)return;
+  const dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
+  c.width=W*dpr;c.height=H*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);
+  x.clearRect(0,0,W,H);
+  if(!items.length)return;
+  // node totals
+  const L={},R={};
+  items.forEach(p=>{L[p.src]=(L[p.src]||0)+p.bytes;R[p.dst]=(R[p.dst]||0)+p.bytes});
+  const padL=8,padR=8,padT=20,padB=20,nodeW=9,gap=3,midX=W/2;
+  const total=Math.max(Object.values(L).reduce((a,b)=>a+b,0),1);
+  const scale=(H-padT-padB-nodeW*Math.max(Object.keys(L).length,Object.keys(R).length,gap*2))/total;
+  // layout helper: stack nodes vertically, proportional to value
+  function layout(nodes){
+    const keys=Object.keys(nodes).sort((a,b)=>nodes[b]-nodes[a]);
+    const out={};let y=padT;const h={};
+    keys.forEach(k=>{const v=Math.max(2,nodes[k]*scale);h[k]=v;out[k]={y0:y,y1:y+v,c:y+v/2};y+=v+gap});
+    return{keys,h,pos:out,total:y-padT};
+  }
+  const layL=layout(L),layR=layout(R);
+  // assign each ribbon a sub-span inside both endpoint nodes (stacked order)
+  const ribbons=items.map(p=>{
+    const s=layL.pos[p.src],d=layR.pos[p.dst];
+    return{p,s,d};
+  });
+  // cumulative offsets within each node, ordered by pair bytes desc
+  const sOff={},dOff={};
+  ribbons.sort((a,b)=>b.p.bytes-a.p.bytes).forEach(r=>{
+    const w=Math.max(1.5,r.p.bytes*scale);
+    const so=sOff[r.p.src]??0,do2=dOff[r.p.dst]??0;
+    sOff[r.p.src]=so+w;dOff[r.p.dst]=do2+w;
+    r.w=w;
+    r.s0=r.s.y0+so;r.s1=r.s.y0+so+w;
+    r.d0=r.d.y0+do2;r.d1=r.d.y0+do2+w;
+    r.sC=(r.s0+r.s1)/2;r.dC=(r.d0+r.d1)/2;
+  });
+  // hover state: node label -> isolate
+  const hov=state.mapHover>=0?state.mapHover:-2;
+  const hovLabel=hov>=0?(ribbons[hov]?.p.src??null):null;
+  const isNodeHov = hovLabel===null&&state.mapHoverNode;
+  // draw ribbons
+  const x1=midX-nodeW/2-30,x2=midX+nodeW/2+30;
+  ribbons.forEach((r,i)=>{
+    const connected=isNodeHov?(r.p.src===state.mapHoverNode||r.p.dst===state.mapHoverNode):true;
+    const alpha=connected?.4:.05;
+    const col=nodeColor(r.p.src);
+    x.beginPath();
+    x.moveTo(x1,r.s0);
+    x.bezierCurveTo(midX,r.s0,midX,r.d0,x2,r.d0);
+    x.lineTo(x2,r.d1);
+    x.bezierCurveTo(midX,r.d1,midX,r.s1,x1,r.s1);
+    x.closePath();
+    x.fillStyle=col;x.globalAlpha=alpha;x.fill();x.globalAlpha=1;
+  });
+  // draw nodes
+  function drawNodes(lay,side){
+    const xs=side==='L'?[padL+2,x1-nodeW]:[x2,x2+nodeW];
+    lay.keys.forEach(k=>{
+      const nd=lay.pos[k],h=nd.y1-nd.y0;
+      const hovN=state.mapHoverNode===k;
+      x.fillStyle=hovN?'#3b82f6':'#1d2534';
+      x.fillRect(xs[0],nd.y0,nodeW,h);
+      x.fillStyle='#e6edf3';x.font='10px ui-monospace,monospace';
+      const label=side==='L'?k:String(k).slice(0,16);
+      x.fillText(label,xs[1]+3,nd.y0+h/2+3);
+      const v=side==='L'?L[k]:R[k];
+      x.fillStyle='#8b949e';
+      x.fillText(fmtB(v),xs[1]+3,nd.y0+h/2+15>H-6?H-6:nd.y0+h/2+15);
+    });
+  }
+  drawNodes(layL,'L');drawNodes(layR,'R');
+  state._sankey={ribbons,layL,layR,x1,x2,nodeW,padL,padR,W,H};
+}
+function bindSankeyHover(){
+  const c=$('#sankey');if(!c)return;
+  c.onmousemove=e=>{
+    const sk=state._sankey;if(!sk)return;
+    const r=c.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    // node hit-test first
+    let hit=null;
+    for(const side of['layL','layR']){
+      for(const k of sk[side].keys){
+        const nd=sk[side].pos[k];
+        const x0=side==='layL'?sk.padL+2:sk.x2, x1=x0+sk.nodeW+70;
+        if(mx>=x0-4&&mx<=x1&&my>=nd.y0&&my<=nd.y1){hit=k;break}
+      }
+      if(hit)break;
+    }
+    const nn=hit||null;
+    if(nn!==state.mapHoverNode){state.mapHoverNode=nn;if(state.mapData)drawSankey(state.mapData.items||[])}
+  };
+  c.onmouseleave=()=>{state.mapHoverNode=null;if(state.mapData)drawSankey(state.mapData.items||[])};
+}
 
 async function vMetrics(){
   const r=await fetch('/metrics');const t=await r.text();

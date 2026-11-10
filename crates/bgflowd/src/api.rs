@@ -361,6 +361,177 @@ async fn summary(
     })))
 }
 
+/// Combined dashboard payload: totals + protocol breakdown + timeseries +
+/// top-N for the overview dims — all from ONE rollup scan (vs ~7 separate
+/// scans when the UI calls each endpoint individually).
+async fn overview(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<Q>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (from, to) = range(&q);
+    let set = rollup_set(&q);
+    let f = rollup_filter(&q, &st.ctx)?;
+    let size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
+    let limit: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+        .min(100);
+    const TOP_DIMS_OV: [&str; 5] = ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"];
+    let needed = query::rollup_needed(&f, &["proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]);
+
+    let mut total = Agg::default();
+    let mut by_proto: HashMap<u8, Agg> = HashMap::new();
+    let mut series: HashMap<u64, Agg> = HashMap::new();
+    let mut tops: HashMap<&'static str, HashMap<u128, Agg>> = TOP_DIMS_OV
+        .iter()
+        .map(|d| (*d, HashMap::new()))
+        .collect();
+
+    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
+        if !f.matches(r) {
+            return ControlFlow::Continue(());
+        }
+        total.bytes += r.bytes();
+        total.packets += r.packets();
+        total.flows += r.flows();
+        let p = by_proto.entry(r.protocol()).or_default();
+        p.bytes += r.bytes();
+        p.packets += r.packets();
+        p.flows += r.flows();
+        let b = (r.bucket_ms() / size) * size;
+        let s = series.entry(b).or_default();
+        s.bytes += r.bytes();
+        s.packets += r.packets();
+        s.flows += r.flows();
+        for d in TOP_DIMS_OV {
+            let k = query::dim_key(d, r);
+            let a = tops.get_mut(d).unwrap().entry(k).or_default();
+            a.bytes += r.bytes();
+            a.packets += r.packets();
+            a.flows += r.flows();
+        }
+        ControlFlow::Continue(())
+    })
+    .map_err(|e| err(e.to_string()))?;
+
+    let mut protos: Vec<_> = by_proto
+        .into_iter()
+        .map(|(p, a)| {
+            serde_json::json!({
+                "protocol": p,
+                "name": bgflow_types::protocol_name(p),
+                "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+            })
+        })
+        .collect();
+    protos.sort_by_key(|v| std::cmp::Reverse(v["bytes"].as_u64().unwrap_or(0)));
+
+    let mut ts_rows: Vec<_> = series
+        .into_iter()
+        .map(|(t, a)| {
+            serde_json::json!({
+                "t": t / 1000, "bucket_ms": t,
+                "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+            })
+        })
+        .collect();
+    ts_rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
+
+    let mut top_out = serde_json::Map::new();
+    for (d, map) in tops {
+        let mut rows: Vec<(u128, Agg)> = map.into_iter().collect();
+        rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows)));
+        rows.truncate(limit);
+        top_out.insert(
+            d.to_string(),
+            serde_json::json!(rows
+                .into_iter()
+                .map(|(k, a)| serde_json::json!({
+                    "key": query::format_key(&st.ctx, d, k),
+                    "key_raw": k.to_string(),
+                    "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+                }))
+                .collect::<Vec<_>>()),
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "from": from, "to": to,
+        "bytes": total.bytes, "packets": total.packets, "flows": total.flows,
+        "by_protocol": protos,
+        "bucket_ms": size,
+        "series": ts_rows,
+        "top": top_out,
+        "set": match set { RollupSet::Minute => "minute", RollupSet::Hourly => "hourly" },
+    })))
+}
+
+/// Pair aggregation for the flow-map view: groups rollups by (src_dim, dst_dim).
+/// IP/exporter dims are excluded — pair cardinality would explode.
+const MATRIX_DIMS: &[&str] = &[
+    "src_ipver", "dst_ipver", "src_asn", "dst_asn", "src_org", "dst_org",
+    "src_country", "dst_country", "proto", "label", "src_port", "dst_port",
+];
+
+async fn matrix(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<Q>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (from, to) = range(&q);
+    let set = rollup_set(&q);
+    let f = rollup_filter(&q, &st.ctx)?;
+    // NB: params are src_dim/dst_dim — bare `src`/`dst` are flow-filter aliases.
+    let sd = q.get("src_dim").map(|s| s.as_str()).unwrap_or("src_country");
+    let dd = q.get("dst_dim").map(|s| s.as_str()).unwrap_or("dst_country");
+    if !MATRIX_DIMS.contains(&sd) || !MATRIX_DIMS.contains(&dd) {
+        return Err(err(format!(
+            "bad matrix dim; src/dst must be one of {}",
+            MATRIX_DIMS.join(", ")
+        )));
+    }
+    let limit: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+        .min(1000);
+    let needed = query::rollup_needed(&f, &[sd, dd]);
+    let mut map: HashMap<(u128, u128), Agg> = HashMap::new();
+    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
+        if !f.matches(r) {
+            return ControlFlow::Continue(());
+        }
+        let k = (query::dim_key(sd, r), query::dim_key(dd, r));
+        let a = map.entry(k).or_default();
+        a.bytes += r.bytes();
+        a.packets += r.packets();
+        a.flows += r.flows();
+        ControlFlow::Continue(())
+    })
+    .map_err(|e| err(e.to_string()))?;
+
+    let mut rows: Vec<((u128, u128), Agg)> = map.into_iter().collect();
+    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows)));
+    rows.truncate(limit);
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|((s, d), a)| {
+            serde_json::json!({
+                "src": query::format_key(&st.ctx, sd, s),
+                "src_raw": s.to_string(),
+                "dst": query::format_key(&st.ctx, dd, d),
+                "dst_raw": d.to_string(),
+                "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "src_dim": sd, "dst_dim": dd,
+        "set": match set { RollupSet::Minute => "minute", RollupSet::Hourly => "hourly" },
+        "items": items,
+    })))
+}
+
 fn bucket_ms(s: Option<&str>) -> u64 {
     match s.unwrap_or("1m") {
         "1m" => 60_000,
@@ -700,6 +871,12 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "format", "in": "query", "description": "csv"},
             ]}},
             "/api/v1/summary": {"get": {"summary": "Totals + per-protocol breakdown"}},
+            "/api/v1/overview": {"get": {"summary": "Combined dashboard payload (one scan): totals, by_protocol, series, top dims"}},
+            "/api/v1/matrix": {"get": {"summary": "Src→dst pair aggregation for flow maps", "parameters": [
+                {"name": "src_dim", "in": "query", "description": "src dim (asn/org/country/ipver/proto/port/label)"},
+                {"name": "dst_dim", "in": "query", "description": "dst dim"},
+                {"name": "limit", "in": "query", "description": "max pairs (default 100)"},
+            ]}},
             "/api/v1/timeseries": {"get": {"summary": "Bytes/packets/flows per bucket", "parameters": [
                 {"name": "bucket", "in": "query", "description": "1m|5m|15m|1h|6h|1d"},
                 {"name": "granularity", "in": "query", "description": "minute|hourly"},
@@ -821,6 +998,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/flows", get(flows))
         .route("/api/v1/summary", get(summary))
+        .route("/api/v1/overview", get(overview))
+        .route("/api/v1/matrix", get(matrix))
         .route("/api/v1/timeseries", get(timeseries))
         .route("/api/v1/top", get(top))
         .route("/api/v1/conversations", get(conversations))
