@@ -15,8 +15,9 @@
 body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,'Segoe UI',Roboto,sans-serif;height:100vh;display:flex;overflow:hidden}
 a{color:var(--accent);text-decoration:none}
 #side{width:210px;min-width:210px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:14px 0}
-#side .logo{padding:6px 18px 18px;font-size:19px;font-weight:700;letter-spacing:.5px}
+#side .logo{padding:6px 18px 18px;font-size:19px;font-weight:700;letter-spacing:.5px;display:flex;align-items:center;gap:9px}
 #side .logo span{color:var(--accent2)}
+#side .logo .lg{flex:none;filter:drop-shadow(0 0 6px rgba(59,130,246,.35))}
 #side nav a{display:flex;align-items:center;gap:10px;padding:9px 18px;color:var(--muted);border-left:3px solid transparent;cursor:pointer;font-size:13.5px}
 #side nav a:hover{color:var(--text);background:var(--panel2)}
 #side nav a.on{color:var(--text);border-left-color:var(--accent);background:var(--panel2)}
@@ -63,7 +64,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 </head>
 <body>
 <div id="side">
-  <div class="logo">BG<span>Flow</span></div>
+  <div class="logo"><span class="lg"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="0.5" y="0.5" width="25" height="25" rx="7" fill="#0e1420" stroke="#232b3a"/><circle cx="6.5" cy="8.5" r="2.2" fill="#22d3ee"/><circle cx="6.5" cy="17.5" r="2.2" fill="#22d3ee"/><circle cx="19.5" cy="13" r="2.8" fill="#3b82f6"/><path d="M8.7 8.5 C13 8.5 13.5 13 16.7 13" stroke="#22d3ee" stroke-width="1.5" fill="none" opacity=".85"/><path d="M8.7 17.5 C13 17.5 13.5 13 16.7 13" stroke="#3b82f6" stroke-width="1.5" fill="none" opacity=".85"/></svg></span>BG<span>Flow</span></div>
   <nav id="nav">
     <a data-v="overview" class="on">◈ Overview</a>
     <a data-v="flows">⇄ Flows</a>
@@ -89,7 +90,15 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <input id="fromin" placeholder="from (e.g. -1h)" style="display:none;min-width:130px">
     <input id="toin" placeholder="to" style="display:none;min-width:130px">
     <span style="flex:1"></span>
-    <span class="chip" id="autoref">auto ⟳</span>
+    <span id="ratetick" class="muted" style="font-family:var(--mono);font-size:12px"></span>
+    <span id="upd" class="muted" style="font-size:11.5px"></span>
+    <select id="refsel" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:4px 8px;border-radius:6px;font-size:12px">
+      <option value="5000">live·5s</option>
+      <option value="15000" selected>15s</option>
+      <option value="30000">30s</option>
+      <option value="60000">1m</option>
+      <option value="0">off</option>
+    </select>
     <button class="btn ghost" onclick="load()">⟳ Refresh</button>
   </div>
   <div id="content"></div>
@@ -97,7 +106,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 <script>
 "use strict";
 const $=s=>document.querySelector(s), content=$('#content');
-const state={view:'overview',range:'-24h',auto:true,bucket:'5m',topby:'src_ip',topn:15,granularity:'minute'};
+const state={view:'overview',range:'-24h',refreshMs:15000,metric:'bytes',bucket:'5m',topby:'src_ip',topn:15,granularity:'minute',updated:0,chartSeries:null,hoverI:-1,rate:null};
 const F={}; // active filters
 let timer=null;
 
@@ -130,8 +139,10 @@ function delPreset(){const n=$('#preset_sel')?.value;if(!n||!presets()[n])return
 // ---------- nav / topbar ----------
 document.querySelectorAll('#nav a').forEach(a=>a.onclick=()=>{document.querySelectorAll('#nav a').forEach(x=>x.classList.remove('on'));a.classList.add('on');state.view=a.dataset.v;$('#viewtitle').textContent=a.textContent.trim();load()});
 document.querySelectorAll('.chip[data-r]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-r]').forEach(x=>x.classList.remove('on'));c.classList.add('on');state.range=c.dataset.r;const cust=state.range==='custom';$('#fromin').style.display=cust?'':'none';$('#toin').style.display=cust?'':'none';load()});
-$('#autoref').onclick=()=>{state.auto=!state.auto;$('#autoref').textContent=state.auto?'auto ⟳':'manual';$('#autoref').classList.toggle('on',state.auto);if(state.auto)startAuto()};
-function startAuto(){clearInterval(timer);if(state.auto)timer=setInterval(()=>{if(state.view!=='metrics')load(true)},30000)}
+$('#refsel').onchange=e=>{state.refreshMs=+e.target.value;startAuto()};
+function startAuto(){clearInterval(timer);if(state.refreshMs>0)timer=setInterval(()=>{if(state.view!=='metrics')load(true)},state.refreshMs)}
+setInterval(()=>{const el=$('#upd');if(el&&state.updated)el.textContent='updated '+Math.floor((Date.now()-state.updated)/1000)+'s ago';
+  const rt=$('#ratetick');if(rt&&state.rate)rt.textContent='≈ '+fmtB(state.rate.bps)+'/s · '+fmtN(state.rate.pps)+' pkt/s'},1000);
 
 // ---------- views ----------
 async function load(silent){
@@ -146,6 +157,7 @@ async function load(silent){
     else if(state.view==='exporters')await vExporters();
     else if(state.view==='labels')await vLabels();
     else if(state.view==='metrics')await vMetrics();
+    state.updated=Date.now();
   }catch(e){content.innerHTML='<div class="err">Error: '+esc(e.message)+'</div>'}
 }
 
@@ -171,8 +183,16 @@ async function vOverview(){
     <div class="card"><div class="lbl">Stored</div><div class="val">${fmtB(st.status.flow_bytes+st.status.rollup_bytes+st.status.hourly_bytes)}</div><div class="sub">${fmtN(st.status.flow_rows+st.status.rollup_rows+st.status.hourly_rows)} rows · ${st.status.uptime_secs}s up</div></div>
   </div>`;
   const protos=(sum.by_protocol||[]).slice(0,6).map(p=>`<tr><td>${esc(p.name)}</td><td class="num">${fmtN(p.flows)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.packets)}</td></tr>`).join('');
-  content.innerHTML=activeChips()+cards+
-   `<div class="panel"><h3>Traffic — ${esc(state.bucket)}</h3><canvas id="chart"></canvas></div>
+  // live rate from the most recent bucket
+  const last=ts.series&&ts.series[ts.series.length-1];
+  if(last&&ts.bucket_ms){const secs=ts.bucket_ms/1000;state.rate={bps:last.bytes/secs,pps:last.packets/secs}}
+  content.innerHTML=filterBar()+activeChips()+cards+
+   `<div class="panel"><h3>Traffic — ${esc(state.bucket)}
+     <span style="float:right">
+       ${['bytes','packets','flows'].map(m=>`<span class="chip ${state.metric===m?'on':''}" data-m="${m}" style="font-size:11px;padding:2px 9px">${m}</span>`).join('')}
+       <select id="b_bucket" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:2px 6px;border-radius:5px;font-size:11px">
+         ${['1m','5m','15m','1h','6h','1d'].map(b=>`<option value="${b}" ${state.bucket===b?'selected':''}>${b}</option>`).join('')}
+       </select></span></h3><canvas id="chart" style="height:280px"></canvas></div>
     <div class="grid2">
       <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click to filter)</span></h3>${topTbl(s.items,'src')}</div>
       <div class="panel"><h3>Top Destinations</h3>${topTbl(d.items,'dst')}</div>
@@ -185,30 +205,77 @@ async function vOverview(){
       <div class="panel"><h3>By Protocol</h3><table><tr><th>Proto</th><th class="num">Flows</th><th class="num">Bytes</th><th class="num">Packets</th></tr>${protos||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table></div>
       <div class="panel"><h3>Top Destination Ports</h3>${topTbl(dp.items,'dport')}</div>
     </div>`;
-  drawChart(ts.series||[]);
+  document.querySelectorAll('[data-m]').forEach(ch=>ch.onclick=()=>{state.metric=ch.dataset.m;document.querySelectorAll('[data-m]').forEach(x=>x.classList.toggle('on',x===ch));drawChart(state.chartSeries)});
+  const bb=$('#b_bucket');if(bb)bb.onchange=()=>{state.bucket=bb.value;load()};
+  drawChart(ts.series||[]);bindChartHover();
 }
 function trangeLabel(){return state.range==='custom'?($('#fromin').value||'?')+' → '+($('#toin').value||'now'):state.range}
 
 function drawChart(series){
-  const c=$('#chart');if(!c||!series.length)return;
+  const c=$('#chart');if(!c||!series||!series.length){state.chartSeries=series;return}
+  state.chartSeries=series;
+  const metric=state.metric||'bytes';
   const dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
   c.width=W*dpr;c.height=H*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);
-  const max=Math.max(...series.map(s=>s.bytes),1);
-  const n=series.length,pad=8,bw=(W-2*pad)/n;
-  x.strokeStyle='#232b3a';x.lineWidth=1;
-  for(let i=0;i<=4;i++){const y=pad+(H-2*pad)*i/4;x.beginPath();x.moveTo(pad,y);x.lineTo(W-pad,y);x.stroke()}
-  series.forEach((s,i)=>{
-    const h=(H-2*pad)*(s.bytes/max);
-    const g=x.createLinearGradient(0,H-pad-h,0,H-pad);
-    g.addColorStop(0,'#3b82f6');g.addColorStop(1,'#1d4ed8');
-    x.fillStyle=g;
-    x.fillRect(pad+i*bw+1,H-pad-h,bw-2,Math.max(1,h));
-  });
-  x.fillStyle='#8b949e';x.font='10px '+getComputedStyle(document.body).fontFamily;
+  const vals=series.map(s=>s[metric]||0);
+  const max=Math.max(...vals,1);
+  const n=series.length,padL=10,padR=14,padT=16,padB=24,iw=W-padL-padR,ih=H-padT-padB;
+  const fmt=metric==='bytes'?fmtB:fmtN;
+  // grid + y labels
+  x.strokeStyle='#1d2534';x.fillStyle='#8b949e';x.font='10px ui-monospace,monospace';x.lineWidth=1;
+  for(let i=0;i<=4;i++){const v=max*i/4,y=padT+ih*(1-i/4);
+    x.beginPath();x.moveTo(padL,y);x.lineTo(W-padR,y);x.stroke();
+    x.fillText(fmt(v),3,y+3);}
+  // x labels
   const step=Math.ceil(n/8);
-  series.forEach((s,i)=>{if(i%step)return;const d=new Date(s.t*1000);x.fillText(d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),pad+i*bw,W-0)});
-  x.fillStyle='#e6edf3';x.font='11px ui-monospace,monospace';
-  x.fillText(fmtB(max)+' peak',pad+4,14);
+  series.forEach((s,i)=>{if(i%step)return;const d=new Date(s.t*1000);
+    x.fillText(d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),padL+i*iw/Math.max(1,n-1)-16,H-8)});
+  // points + catmull-rom → bezier smoothing
+  const px=i=>padL+i*iw/Math.max(1,n-1), py=v=>padT+ih-(v/max)*ih;
+  const pts=vals.map((v,i)=>[px(i),py(v)]);
+  const path=()=>{x.beginPath();
+    if(pts.length<3){pts.forEach((p,i)=>i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]));return}
+    x.moveTo(pts[0][0],pts[0][1]);
+    for(let i=0;i<pts.length-1;i++){
+      const p0=pts[Math.max(0,i-1)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(pts.length-1,i+2)];
+      x.bezierCurveTo(p1[0]+(p2[0]-p0[0])/6,p1[1]+(p2[1]-p0[1])/6,p2[0]-(p3[0]-p1[0])/6,p2[1]-(p3[1]-p1[1])/6,p2[0],p2[1]);
+    }};
+  // gradient area fill
+  const g=x.createLinearGradient(0,padT,0,H-padB);
+  g.addColorStop(0,'rgba(59,130,246,.38)');g.addColorStop(.7,'rgba(59,130,246,.08)');g.addColorStop(1,'rgba(59,130,246,0)');
+  path();x.lineTo(px(n-1),padT+ih);x.lineTo(px(0),padT+ih);x.closePath();x.fillStyle=g;x.fill();
+  // gradient stroke line
+  const lg=x.createLinearGradient(padL,0,W-padR,0);lg.addColorStop(0,'#3b82f6');lg.addColorStop(1,'#22d3ee');
+  path();x.strokeStyle=lg;x.lineWidth=2;x.lineJoin='round';x.stroke();
+  // peak marker
+  const mi=vals.indexOf(max);
+  x.fillStyle='#e6edf3';x.font='600 11px ui-monospace,monospace';
+  x.fillText(fmt(max),px(mi)-14,padT+ih-8);
+  // hover crosshair + tooltip
+  const hi=state.hoverI;
+  if(hi>=0&&hi<n){
+    const s=series[hi],hx=px(hi),hy=py(vals[hi]);
+    x.strokeStyle='rgba(230,237,243,.35)';x.setLineDash([4,4]);x.lineWidth=1;
+    x.beginPath();x.moveTo(hx,padT);x.lineTo(hx,padT+ih);x.stroke();x.setLineDash([]);
+    x.beginPath();x.arc(hx,hy,3.5,0,7);x.fillStyle='#22d3ee';x.fill();
+    x.strokeStyle='#0b0e14';x.lineWidth=1.5;x.stroke();
+    const lbl=`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`;
+    x.font='11px ui-monospace,monospace';
+    const tw=x.measureText(lbl).width+12;
+    let bx=Math.min(Math.max(hx-tw/2,padL),W-padR-tw),by=padT+4;
+    x.fillStyle='rgba(18,22,31,.95)';x.strokeStyle='#232b3a';
+    if(x.roundRect){x.beginPath();x.roundRect(bx,by,tw,18,5);x.fill();x.stroke()}
+    else{x.fillRect(bx,by,tw,18);x.strokeRect(bx,by,tw,18)}
+    x.fillStyle='#e6edf3';x.fillText(lbl,bx+6,by+13);
+  }
+}
+function bindChartHover(){
+  const c=$('#chart');if(!c)return;
+  c.onmousemove=e=>{const s=state.chartSeries;if(!s||!s.length)return;
+    const r=c.getBoundingClientRect(),padL=10,padR=14,iw=r.width-padL-padR;
+    const i=Math.round((e.clientX-r.left-padL)/iw*(s.length-1));
+    i===state.hoverI||(state.hoverI=Math.max(0,Math.min(s.length-1,i)),drawChart(s));};
+  c.onmouseleave=()=>{state.hoverI=-1;if(state.chartSeries)drawChart(state.chartSeries)};
 }
 
 function filterBar(extra=''){
