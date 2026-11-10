@@ -522,7 +522,7 @@ async function drawMap(){
 function pairFilter(el){F[el.dataset.dim]=el.dataset.k;load()}
 
 // Sankey renderer: left nodes = src dim, right = dst dim, ribbons ∝ bytes.
-function nodeColor(id){let h=0;for(const ch of id)h=(h*31+ch.charCodeAt(0))>>>0;return `hsl(${h%360},65%,55%)`}
+function nodeColor(id){let h=0;for(const ch of String(id))h=(h*31+ch.charCodeAt(0))>>>0;return `hsl(${h%360},65%,55%)`}
 const SANK_MAXN=40;
 function drawSankey(items){
   const c=$('#sankey');if(!c)return;
@@ -535,8 +535,9 @@ function drawSankey(items){
   const totals=(arr,f)=>{const o={};arr.forEach(p=>{const k=f(p);o[k]=(o[k]||0)+p.bytes});return o};
   const keepSet=(o)=>{const ks=Object.keys(o);if(ks.length<=SANK_MAXN)return null;
     return new Set(ks.sort((a,b)=>o[b]-o[a]).slice(0,SANK_MAXN))};
-  const kL=keepSet(totals(items,p=>p.src)),kR=keepSet(totals(items,p=>p.dst));
-  const mk=(k,keep)=>keep?(keep.has(k)?k:'Other'):k;
+  const kL=keepSet(totals(items,p=>String(p.src))),kR=keepSet(totals(items,p=>String(p.dst)));
+  // format_key emits JSON numbers for asn/port/org/label — normalize to strings
+  const mk=(k,keep)=>{const ks=String(k);return keep?(keep.has(ks)?ks:'Other'):ks};
   const pm=new Map();
   items.forEach(p=>{
     const s=mk(p.src,kL),d=mk(p.dst,kR),key=s+' '+d;
