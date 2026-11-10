@@ -253,7 +253,14 @@ setInterval(()=>{const el=$('#upd');if(el&&state.updated){
   const rt=$('#ratetick');if(rt&&state.rate)rt.textContent='≈ '+fmtB(state.rate.bps)+'/s · '+fmtN(state.rate.pps)+' pkt/s'}},1000);
 
 // ---------- views ----------
+let loadBusy=false,loadNext=null;
 async function load(silent){
+  // Serialize loads: while one is in flight, further requests coalesce
+  // into a single follow-up run. Without this, a slow fetch resolving
+  // after the user navigated writes into DOM elements that no longer
+  // exist (null.textContent crashes).
+  if(loadBusy){loadNext={silent:(loadNext?loadNext.silent:true)&&!!silent};return}
+  loadBusy=true;
   const keepScroll=silent?content.scrollTop:0;
   if(!silent)content.innerHTML='<div class="hint">Loading…</div>';
   try{
@@ -272,6 +279,9 @@ async function load(silent){
   }catch(e){
     if(silent){state.lastErr=e.message;toast('Refresh failed: '+e.message)}
     else content.innerHTML='<div class="err">Error: '+esc(e.message)+'</div>'
+  }finally{
+    loadBusy=false;
+    if(loadNext){const n=loadNext;loadNext=null;load(n.silent)}
   }
 }
 
@@ -467,6 +477,7 @@ async function vTop(){
 async function loadTopData(){
   $('#t_lbl').textContent=state.topby;
   const data=await api('/api/v1/top?'+q({by:state.topby,limit:state.topn}));
+  if(!$('#t_lbl'))return; // navigated away mid-fetch
   const max=data.items?.[0]?.bytes||1;
   const rows=(data.items||[]).map((t,i)=>`<tr><td class="num muted">${i+1}</td>
     <td class="clickable" onclick='clickDimRaw(${JSON.stringify(state.topby)},${t.key_raw},${JSON.stringify(typeof t.key==='object'?JSON.stringify(t.key):String(t.key))})'>${dimLabel(state.topby,typeof t.key==='object'?JSON.stringify(t.key):t.key)}</td>
@@ -561,7 +572,7 @@ async function vLabels(){
      <pre id="lu_out">Cached enrichment detail for an IP (backend results).</pre></div></div>
    <div class="panel"><h3>Storage</h3><pre>${esc(JSON.stringify(st.status,null,2))}</pre></div>`;
 }
-async function doLookup(){const ip=$('#lu_ip').value.trim();if(!ip)return;try{const d=await api('/api/v1/lookup?ip='+encodeURIComponent(ip));$('#lu_out').textContent=JSON.stringify(d,null,2)}catch(e){$('#lu_out').textContent='Error: '+e.message}}
+async function doLookup(){const ip=$('#lu_ip')?.value.trim();if(!ip)return;try{const d=await api('/api/v1/lookup?ip='+encodeURIComponent(ip));const el=$('#lu_out');if(el)el.textContent=JSON.stringify(d,null,2)}catch(e){const el=$('#lu_out');if(el)el.textContent='Error: '+e.message}}
 
 // ---------- flow map (sankey) ----------
 const MATRIX_DIMS=['src_ipver','dst_ipver','src_asn','dst_asn','src_org','dst_org','src_country','dst_country','proto','label','src_port','dst_port'];
@@ -594,6 +605,7 @@ function syncMapCtl(){
 async function drawMap(){
   syncMapCtl();
   const data=await api('/api/v1/matrix?'+q({src_dim:state.msrc,dst_dim:state.mdst,limit:state.mlim}));
+  if(!$('#sankey'))return; // navigated away mid-fetch
   state.mapData=data;state.mapHoverNode=null;
   $('#m_lbl').textContent=`${state.msrc} → ${state.mdst}`;
   drawSankey(data.items||[]);bindSankeyHover();
