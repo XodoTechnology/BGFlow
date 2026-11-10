@@ -219,10 +219,10 @@ const DIM2F={src_ip:'src',dst_ip:'dst',src_asn:'src_asn',dst_asn:'dst_asn',src_p
 function clickDim(by,key){const f=DIM2F[by];if(!f)return;F[f]=key;load()}
 // raw key for filtering when formatted key is a display string
 function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
-  // ipver/org/label keys: use raw numeric where the API wants it
-  if(by==='src_ipver'||by==='dst_ipver'){F[f]=keyRaw===4?'4':'6'}
+  // key_raw is a string (u128-safe); use fmtKey where semantics matter
+  if(by==='src_ipver'||by==='dst_ipver'){F[f]=fmtKey==='IPv6'?'6':'4'}
   else if(by==='label'){F[f]=fmtKey} // label name preferred
-  else if(by==='src_org'||by==='dst_org'){F[f]=keyRaw}
+  else if(by==='src_org'||by==='dst_org'){F[f]=keyRaw} // numeric org id as string — API parses u32
   else{F[f]=fmtKey}
   load()}
 

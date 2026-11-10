@@ -448,7 +448,9 @@ async fn top(
         .map(|(k, a)| {
             serde_json::json!({
                 "key": query::format_key(&st.ctx, by, k),
-                "key_raw": k,
+                // u128 doesn't fit JSON numbers — emit as string. UI only
+                // consumes it for small dims (org id, ipver), which parse fine.
+                "key_raw": k.to_string(),
                 "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
             })
         })
@@ -595,7 +597,7 @@ async fn anomalies(
         .map(|a| {
             serde_json::json!({
                 "key": query::format_key(&st.ctx, by, a.key),
-                "key_raw": a.key,
+                "key_raw": a.key.to_string(),
                 "bucket_ms": a.bucket,
                 "t": a.bucket / 1000,
                 "bytes": a.bytes,
