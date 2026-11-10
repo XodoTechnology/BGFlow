@@ -582,6 +582,223 @@ pub fn rollup_scan(
     )
 }
 
+/// Parallel rollup aggregation. Partitions the overlapping segments
+/// across worker threads; each thread decodes its segments and feeds
+/// rows into its own `T` via `add`, then partial states are merged with
+/// `merge` on the calling thread. Only valid for order-insensitive
+/// aggregates (sums/counts) — there is no early-break.
+///
+/// `init` produces an empty accumulator per worker and for the merge
+/// target; `add` receives `(state, row)` and should apply the row's
+/// filter check itself (the filter is `Sync` and shared).
+pub fn rollup_scan_par<T>(
+    ctx: &Ctx,
+    set: RollupSet,
+    from_ms: u64,
+    to_ms: u64,
+    needed: &[usize],
+    init: impl Fn() -> T + Sync,
+    add: impl Fn(&mut T, &RollupRow) + Sync,
+    merge: impl Fn(&mut T, T),
+) -> Result<T>
+where
+    T: Send,
+{
+    let infos = match set {
+        RollupSet::Minute => ctx.rollup_index.read().unwrap().clone(),
+        RollupSet::Hourly => ctx.hourly_index.read().unwrap().clone(),
+    };
+    let period = set.period_ms();
+    let idx: Vec<usize> = infos
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.overlaps(from_ms, to_ms))
+        .map(|(i, _)| i)
+        .collect();
+
+    let nth = bgflow_store::scan_threads().min(idx.len().max(1));
+    let chunk_size = idx.len().div_ceil(nth).max(1);
+    let ncols = RollupRecord::schema().columns.len();
+
+    let results: Vec<Result<T>> = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in idx.chunks(chunk_size) {
+            let infos = Arc::clone(&infos);
+            let chunk: Vec<usize> = chunk.to_vec();
+            let needed = needed.to_vec();
+            let init = &init;
+            let add = &add;
+            handles.push(s.spawn(move || -> Result<T> {
+                let mut state = init();
+                for &i in &chunk {
+                    let info = &infos[i];
+                    let reader = bgflow_store::segment::SegmentReader::open(&info.path)?;
+                    let columns = reader.decode_columns(&needed)?;
+                    let mut arr: Vec<Option<&ColumnData>> = vec![None; ncols];
+                    for (ci, data) in &columns {
+                        arr[*ci] = Some(data);
+                    }
+                    for ri in 0..reader.header.row_count as usize {
+                        let row = RollupRow {
+                            arr: &arr,
+                            i: ri,
+                        };
+                        if row.bucket_ms() + period < from_ms || row.bucket_ms() > to_ms {
+                            continue;
+                        }
+                        add(&mut state, &row);
+                    }
+                }
+                Ok(state)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("rollup scan worker panicked")))
+            })
+            .collect()
+    });
+
+    let mut out = init();
+    for r in results {
+        merge(&mut out, r?);
+    }
+    Ok(out)
+}
+
+/// Parallel rollup aggregation for HIGH-cardinality groupings (e.g.
+/// conversations, top-N over IPs). Like `rollup_scan_par`, segments are
+/// decoded on worker threads — but instead of each worker building a
+/// private map over every key (which multiplies memory by the worker
+/// count), rows are routed by key hash into `shards` disjoint maps behind
+/// mutexes. Each key's complete aggregate therefore lives in exactly one
+/// shard: total memory equals a single sequential map, while decode and
+/// aggregation both run in parallel.
+///
+/// `extract` maps a row to `(key, value)` (or `None` to skip); `add`
+/// merges a buffered value into the shard's entry for that key. Workers
+/// buffer per-shard batches so mutex acquisitions stay rare. Returns the
+/// shard maps — keys are partitioned, never duplicated across shards.
+pub fn rollup_scan_sharded<K, V>(
+    ctx: &Ctx,
+    set: RollupSet,
+    from_ms: u64,
+    to_ms: u64,
+    needed: &[usize],
+    filter: &RollupFilter,
+    shards: usize,
+    extract: impl Fn(&RollupRow) -> Option<(K, V)> + Sync,
+    add: impl Fn(&mut V, V) + Sync,
+) -> Result<Vec<HashMap<K, V>>>
+where
+    K: Eq + std::hash::Hash + Send,
+    V: Send,
+{
+    use std::hash::Hasher;
+
+    let infos = match set {
+        RollupSet::Minute => ctx.rollup_index.read().unwrap().clone(),
+        RollupSet::Hourly => ctx.hourly_index.read().unwrap().clone(),
+    };
+    let period = set.period_ms();
+    let idx: Vec<usize> = infos
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.overlaps(from_ms, to_ms))
+        .map(|(i, _)| i)
+        .collect();
+
+    let nth = bgflow_store::scan_threads().min(idx.len().max(1));
+    let shards = shards.max(1);
+    let chunk_size = idx.len().div_ceil(nth).max(1);
+    let ncols = RollupRecord::schema().columns.len();
+    let maps: Vec<std::sync::Mutex<HashMap<K, V>>> =
+        (0..shards).map(|_| std::sync::Mutex::new(HashMap::new())).collect();
+
+    let scan_res: Result<()> = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in idx.chunks(chunk_size) {
+            let infos = Arc::clone(&infos);
+            let chunk: Vec<usize> = chunk.to_vec();
+            let needed = needed.to_vec();
+            let maps = &maps;
+            let filter = filter;
+            let extract = &extract;
+            let add = &add;
+            handles.push(s.spawn(move || -> Result<()> {
+                // Per-shard buffers: flushed into the shared maps in
+                // batches so lock hold time stays tiny.
+                const FLUSH_AT: usize = 2048;
+                let mut bufs: Vec<Vec<(K, V)>> =
+                    (0..shards).map(|_| Vec::new()).collect();
+                let mut flush = |bufs: &mut Vec<Vec<(K, V)>>| {
+                    for (si, buf) in bufs.iter_mut().enumerate() {
+                        if buf.is_empty() {
+                            continue;
+                        }
+                        let mut g = maps[si].lock().unwrap();
+                        for (k, v) in buf.drain(..) {
+                            match g.entry(k) {
+                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    add(e.get_mut(), v);
+                                }
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert(v);
+                                }
+                            }
+                        }
+                    }
+                };
+                for &i in &chunk {
+                    let info = &infos[i];
+                    let reader = bgflow_store::segment::SegmentReader::open(&info.path)?;
+                    let columns = reader.decode_columns(&needed)?;
+                    let mut arr: Vec<Option<&ColumnData>> = vec![None; ncols];
+                    for (ci, data) in &columns {
+                        arr[*ci] = Some(data);
+                    }
+                    for ri in 0..reader.header.row_count as usize {
+                        let row = RollupRow {
+                            arr: &arr,
+                            i: ri,
+                        };
+                        if row.bucket_ms() + period < from_ms || row.bucket_ms() > to_ms {
+                            continue;
+                        }
+                        if !filter.matches(&row) {
+                            continue;
+                        }
+                        if let Some((k, v)) = extract(&row) {
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            k.hash(&mut h);
+                            let si = (h.finish() as usize) % shards;
+                            bufs[si].push((k, v));
+                            if bufs[si].len() >= FLUSH_AT {
+                                flush(&mut bufs);
+                            }
+                        }
+                    }
+                }
+                flush(&mut bufs);
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("rollup scan worker panicked")))?;
+        }
+        Ok(())
+    });
+    scan_res?;
+
+    Ok(maps
+        .into_iter()
+        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // JSON serialization helpers
 // ---------------------------------------------------------------------------

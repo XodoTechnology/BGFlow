@@ -329,6 +329,73 @@ struct Agg {
     flows: u64,
 }
 
+fn agg_add(a: &mut Agg, b: &Agg) {
+    a.bytes += b.bytes;
+    a.packets += b.packets;
+    a.flows += b.flows;
+}
+
+/// Reduce key-sharded rollup maps to the global top-`limit` by
+/// (bytes, flows). Keys are partitioned across shards with complete
+/// aggregates, so every global top-`limit` member is within its own
+/// shard's local top-`limit` — collecting per-shard candidates and
+/// re-sorting yields the exact global top-`limit` without materializing
+/// or sorting the full key space.
+fn shard_top<K>(
+    shards: Vec<HashMap<K, Agg>>,
+    limit: usize,
+) -> Vec<(K, Agg)> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let cmp = |a: &(K, Agg), b: &(K, Agg)| {
+        b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
+    };
+    let mut cand: Vec<(K, Agg)> = Vec::new();
+    for map in shards {
+        let mut v: Vec<(K, Agg)> = map.into_iter().collect();
+        if v.len() > limit {
+            v.select_nth_unstable_by(limit - 1, cmp);
+            v.truncate(limit);
+        }
+        cand.extend(v);
+    }
+    cand.sort_by(cmp);
+    cand.truncate(limit);
+    cand
+}
+
+/// Merge one worker's `HashMap<K, Agg>` partial into the combined map.
+fn merge_agg_map<K>(a: &mut HashMap<K, Agg>, b: HashMap<K, Agg>)
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    for (k, v) in b {
+        agg_add(a.entry(k).or_default(), &v);
+    }
+}
+
+/// Overview endpoint accumulator — totals + protocol + timeseries + the
+/// five top-dim maps, merged from per-worker partials.
+#[derive(Default)]
+struct OvAcc {
+    total: Agg,
+    by_proto: HashMap<u8, Agg>,
+    series: HashMap<u64, Agg>,
+    tops: HashMap<&'static str, HashMap<u128, Agg>>,
+}
+
+impl OvAcc {
+    fn merge(&mut self, o: Self) {
+        agg_add(&mut self.total, &o.total);
+        merge_agg_map(&mut self.by_proto, o.by_proto);
+        merge_agg_map(&mut self.series, o.series);
+        for (d, m) in o.tops {
+            merge_agg_map(self.tops.entry(d).or_default(), m);
+        }
+    }
+}
+
 async fn summary(
     State(st): State<Arc<AppState>>,
     Query(q): Query<Q>,
@@ -337,21 +404,30 @@ async fn summary(
     let set = rollup_set(&q);
     let f = rollup_filter(&q, &st.ctx)?;
     let needed = query::rollup_needed(&f, &["proto"]);
-    let mut total = Agg::default();
-    let mut by_proto: HashMap<u8, Agg> = HashMap::new();
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        total.bytes += r.bytes();
-        total.packets += r.packets();
-        total.flows += r.flows();
-        let p = by_proto.entry(r.protocol()).or_default();
-        p.bytes += r.bytes();
-        p.packets += r.packets();
-        p.flows += r.flows();
-        ControlFlow::Continue(())
-    })
+    let (total, by_proto) = query::rollup_scan_par(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        || (Agg::default(), HashMap::<u8, Agg>::new()),
+        |(total, by_proto), r| {
+            if !f.matches(r) {
+                return;
+            }
+            total.bytes += r.bytes();
+            total.packets += r.packets();
+            total.flows += r.flows();
+            let p = by_proto.entry(r.protocol()).or_default();
+            p.bytes += r.bytes();
+            p.packets += r.packets();
+            p.flows += r.flows();
+        },
+        |(t, p), (t2, p2)| {
+            agg_add(t, &t2);
+            merge_agg_map(p, p2);
+        },
+    )
     .map_err(|e| err(e.to_string()))?;
 
     let mut protos: Vec<_> = by_proto
@@ -392,40 +468,52 @@ async fn overview(
     const TOP_DIMS_OV: [&str; 5] = ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"];
     let needed = query::rollup_needed(&f, &["proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]);
 
-    let mut total = Agg::default();
-    let mut by_proto: HashMap<u8, Agg> = HashMap::new();
-    let mut series: HashMap<u64, Agg> = HashMap::new();
-    let mut tops: HashMap<&'static str, HashMap<u128, Agg>> = TOP_DIMS_OV
-        .iter()
-        .map(|d| (*d, HashMap::new()))
-        .collect();
-
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        total.bytes += r.bytes();
-        total.packets += r.packets();
-        total.flows += r.flows();
-        let p = by_proto.entry(r.protocol()).or_default();
-        p.bytes += r.bytes();
-        p.packets += r.packets();
-        p.flows += r.flows();
-        let b = (r.bucket_ms() / size) * size;
-        let s = series.entry(b).or_default();
-        s.bytes += r.bytes();
-        s.packets += r.packets();
-        s.flows += r.flows();
-        for d in TOP_DIMS_OV {
-            let k = query::dim_key(d, r);
-            let a = tops.get_mut(d).unwrap().entry(k).or_default();
-            a.bytes += r.bytes();
-            a.packets += r.packets();
-            a.flows += r.flows();
-        }
-        ControlFlow::Continue(())
-    })
+    let acc = query::rollup_scan_par(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        || OvAcc {
+            tops: TOP_DIMS_OV
+                .iter()
+                .map(|d| (*d, HashMap::new()))
+                .collect(),
+            ..Default::default()
+        },
+        |acc, r| {
+            if !f.matches(r) {
+                return;
+            }
+            acc.total.bytes += r.bytes();
+            acc.total.packets += r.packets();
+            acc.total.flows += r.flows();
+            let p = acc.by_proto.entry(r.protocol()).or_default();
+            p.bytes += r.bytes();
+            p.packets += r.packets();
+            p.flows += r.flows();
+            let b = (r.bucket_ms() / size) * size;
+            let s = acc.series.entry(b).or_default();
+            s.bytes += r.bytes();
+            s.packets += r.packets();
+            s.flows += r.flows();
+            for d in TOP_DIMS_OV {
+                let k = query::dim_key(d, r);
+                let a = acc.tops.get_mut(d).unwrap().entry(k).or_default();
+                a.bytes += r.bytes();
+                a.packets += r.packets();
+                a.flows += r.flows();
+            }
+        },
+        |a, b| a.merge(b),
+    )
     .map_err(|e| err(e.to_string()))?;
+    let OvAcc {
+        total,
+        by_proto,
+        series,
+        tops,
+    } = acc;
 
     let mut protos: Vec<_> = by_proto
         .into_iter()
@@ -508,23 +596,31 @@ async fn matrix(
         .unwrap_or(100)
         .min(1000);
     let needed = query::rollup_needed(&f, &[sd, dd]);
-    let mut map: HashMap<(u128, u128), Agg> = HashMap::new();
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        let k = (query::dim_key(sd, r), query::dim_key(dd, r));
-        let a = map.entry(k).or_default();
-        a.bytes += r.bytes();
-        a.packets += r.packets();
-        a.flows += r.flows();
-        ControlFlow::Continue(())
-    })
+    // Pair map can be large — key-sharded parallel aggregation keeps
+    // memory at one global map's size while decoding in parallel.
+    let shards = query::rollup_scan_sharded(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        &f,
+        bgflow_store::scan_threads(),
+        |r| {
+            Some((
+                (query::dim_key(sd, r), query::dim_key(dd, r)),
+                Agg {
+                    bytes: r.bytes(),
+                    packets: r.packets(),
+                    flows: r.flows(),
+                },
+            ))
+        },
+        |a: &mut Agg, b: Agg| agg_add(a, &b),
+    )
     .map_err(|e| err(e.to_string()))?;
 
-    let mut rows: Vec<((u128, u128), Agg)> = map.into_iter().collect();
-    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows)));
-    rows.truncate(limit);
+    let rows = shard_top(shards, limit);
     let items: Vec<_> = rows
         .into_iter()
         .map(|((s, d), a)| {
@@ -565,18 +661,25 @@ async fn timeseries(
     let f = rollup_filter(&q, &st.ctx)?;
     let size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
     let needed = query::rollup_needed(&f, &[]);
-    let mut buckets: HashMap<u64, Agg> = HashMap::new();
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        let b = (r.bucket_ms() / size) * size;
-        let a = buckets.entry(b).or_default();
-        a.bytes += r.bytes();
-        a.packets += r.packets();
-        a.flows += r.flows();
-        ControlFlow::Continue(())
-    })
+    let buckets: HashMap<u64, Agg> = query::rollup_scan_par::<HashMap<u64, Agg>>(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        Default::default,
+        |buckets, r| {
+            if !f.matches(r) {
+                return;
+            }
+            let b = (r.bucket_ms() / size) * size;
+            let a = buckets.entry(b).or_default();
+            a.bytes += r.bytes();
+            a.packets += r.packets();
+            a.flows += r.flows();
+        },
+        |a, b| merge_agg_map(a, b),
+    )
     .map_err(|e| err(e.to_string()))?;
 
     let mut rows: Vec<_> = buckets
@@ -611,24 +714,32 @@ async fn top(
     let f = rollup_filter(&q, &st.ctx)?;
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(1000);
 
-    let mut map: HashMap<u128, Agg> = HashMap::new();
+    // Full-cardinality dim map (ports/IPs can be huge) — key-sharded
+    // parallel aggregation: memory stays at one map's size.
     let needed = query::rollup_needed(&f, &[by]);
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        let k = query::dim_key(by, r);
-        let a = map.entry(k).or_default();
-        a.bytes += r.bytes();
-        a.packets += r.packets();
-        a.flows += r.flows();
-        ControlFlow::Continue(())
-    })
+    let shards = query::rollup_scan_sharded(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        &f,
+        bgflow_store::scan_threads(),
+        |r| {
+            Some((
+                query::dim_key(by, r),
+                Agg {
+                    bytes: r.bytes(),
+                    packets: r.packets(),
+                    flows: r.flows(),
+                },
+            ))
+        },
+        |a: &mut Agg, b: Agg| agg_add(a, &b),
+    )
     .map_err(|e| err(e.to_string()))?;
 
-    let mut rows: Vec<(u128, Agg)> = map.into_iter().collect();
-    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows)));
-    rows.truncate(limit);
+    let rows = shard_top(shards, limit);
     let out: Vec<_> = rows
         .into_iter()
         .map(|(k, a)| {
@@ -652,25 +763,39 @@ async fn conversations(
     let set = rollup_set(&q);
     let f = rollup_filter(&q, &st.ctx)?;
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20).min(500);
-    type ConvKey = (u128, u128, u16, u16, u8);
-    let mut map: HashMap<ConvKey, Agg> = HashMap::new();
+    // Conversation keys are near-unique per flow — millions of entries.
+    // Key-sharded parallel aggregation: each key lives in exactly one
+    // shard, so memory equals a single map (not one per worker).
     let needed = query::rollup_needed(&f, &["src_ip", "dst_ip", "src_port", "dst_port", "proto"]);
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        let k = (r.src_ip(), r.dst_ip(), r.src_port(), r.dst_port(), r.protocol());
-        let a = map.entry(k).or_default();
-        a.bytes += r.bytes();
-        a.packets += r.packets();
-        a.flows += r.flows();
-        ControlFlow::Continue(())
-    })
+    let shards = query::rollup_scan_sharded(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        &f,
+        bgflow_store::scan_threads(),
+        |r| {
+            Some((
+                (
+                    r.src_ip(),
+                    r.dst_ip(),
+                    r.src_port(),
+                    r.dst_port(),
+                    r.protocol(),
+                ),
+                Agg {
+                    bytes: r.bytes(),
+                    packets: r.packets(),
+                    flows: r.flows(),
+                },
+            ))
+        },
+        |a: &mut Agg, b: Agg| agg_add(a, &b),
+    )
     .map_err(|e| err(e.to_string()))?;
 
-    let mut rows: Vec<(ConvKey, Agg)> = map.into_iter().collect();
-    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
-    rows.truncate(limit);
+    let rows = shard_top(shards, limit);
     let out: Vec<_> = rows
         .into_iter()
         .map(|((s, d, sp, dp, p), a)| {
@@ -738,7 +863,8 @@ async fn anomalies(
     let top_n: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(100);
     let needed = query::rollup_needed(&f, &[by]);
 
-    // key -> bucket -> bytes
+    // key -> bucket -> bytes. Nested per-key series can be large —
+    // sequential aggregate.
     let mut series: HashMap<u128, HashMap<u64, u64>> = HashMap::new();
     query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
         if !f.matches(r) {
@@ -806,18 +932,26 @@ async fn label_stats(
     let set = rollup_set(&q);
     let f = rollup_filter(&q, &st.ctx)?;
     let needed = query::rollup_needed(&f, &["label"]);
-    let mut map: HashMap<u128, Agg> = HashMap::new();
-    query::rollup_scan(&st.ctx, set, from, to, &needed, |r| {
-        if !f.matches(r) {
-            return ControlFlow::Continue(());
-        }
-        let k = r.label_id() as u128;
-        let a = map.entry(k).or_default();
-        a.bytes += r.bytes();
-        a.packets += r.packets();
-        a.flows += r.flows();
-        ControlFlow::Continue(())
-    })
+    // Label count is bounded by the ruleset — small state, parallel-safe.
+    let map: HashMap<u128, Agg> = query::rollup_scan_par::<HashMap<u128, Agg>>(
+        &st.ctx,
+        set,
+        from,
+        to,
+        &needed,
+        Default::default,
+        |map, r| {
+            if !f.matches(r) {
+                return;
+            }
+            let k = r.label_id() as u128;
+            let a = map.entry(k).or_default();
+            a.bytes += r.bytes();
+            a.packets += r.packets();
+            a.flows += r.flows();
+        },
+        |a, b| merge_agg_map(a, b),
+    )
     .map_err(|e| err(e.to_string()))?;
     let mut rows: Vec<(u128, Agg)> = map.into_iter().collect();
     rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));

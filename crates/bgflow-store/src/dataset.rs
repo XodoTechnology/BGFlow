@@ -487,7 +487,7 @@ impl<R: Record> Dataset<R> {
 }
 
 /// Decode worker count for parallel segment scans.
-fn scan_threads() -> usize {
+pub fn scan_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)

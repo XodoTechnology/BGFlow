@@ -21,7 +21,7 @@ BGFLOW_INSTALL_DIR=/opt/bgflow
 Then:
 
 ```bash
-sudoedit /etc/bgflow/bgflow.toml
+sudo nano /etc/bgflow/bgflow.toml
 sudo systemctl enable --now bgflowd
 ```
 
@@ -67,7 +67,7 @@ cargo build --release -p bgflowd
 sudo install -m755 target/release/bgflowd /usr/local/bin/
 sudo mkdir -p /etc/bgflow /var/lib/bgflow
 sudo cp bgflow.example.toml /etc/bgflow/bgflow.toml
-sudoedit /etc/bgflow/bgflow.toml
+sudo nano /etc/bgflow/bgflow.toml
 ```
 
 Then install the systemd unit (see `deploy/bgflowd.service`) or run
@@ -101,7 +101,7 @@ flow monitor BM
 curl http://localhost:8080/api/v1/health        # ok
 curl http://localhost:8080/api/v1/status       # storage + host stats
 curl http://localhost:8080/metrics | head      # prometheus
-open http://localhost:8080                     # UI
+xdg-open http://localhost:8080                     # UI
 ```
 
 Try the built-in demo while learning the UI:
@@ -120,7 +120,7 @@ exposing it** — `bgflowd` logs a warning when it detects this:
 bgflowd hash-password
 
 # 2. Paste the printed hash into /etc/bgflow/bgflow.toml:
-sudoedit /etc/bgflow/bgflow.toml
+sudo nano /etc/bgflow/bgflow.toml
 #   [[users]]
 #   name = "admin"
 #   password_hash = "pbkdf2-sha256$600000$...."

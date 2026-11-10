@@ -57,13 +57,13 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
 curl -fsSL https://raw.githubusercontent.com/XodoTechnology/BGFlow/main/install.sh | sudo bash
 
 # 2. Configure
-sudoedit /etc/bgflow/bgflow.toml     # set data_dir, listen addrs, enrichers
+sudo nano /etc/bgflow/bgflow.toml     # set data_dir, listen addrs, enrichers
 
 # 3. Run
 sudo systemctl enable --now bgflowd
 
 # 4. Open the UI
-open http://localhost:8080
+xdg-open http://localhost:8080
 ```
 
 Or run the demo to see it ingest synthetic NetFlow:

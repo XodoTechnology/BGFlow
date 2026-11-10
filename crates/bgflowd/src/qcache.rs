@@ -33,7 +33,7 @@ const MAX_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
-struct CachedResp {
+pub(crate) struct CachedResp {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -54,9 +54,20 @@ impl CachedResp {
     }
 }
 
-#[derive(Default)]
 pub struct QueryCache {
     map: Mutex<HashMap<String, CachedResp>>,
+    /// Bound concurrent background recomputes — each scan can use every
+    /// core, so unbounded refreshes would starve ingest and each other.
+    refresh_sem: tokio::sync::Semaphore,
+}
+
+impl Default for QueryCache {
+    fn default() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            refresh_sem: tokio::sync::Semaphore::new(2),
+        }
+    }
 }
 
 pub enum Lookup {
@@ -194,6 +205,10 @@ where
     S::Error: Send + 'static,
 {
     tokio::spawn(async move {
+        // Queue behind other refreshes — scans are CPU-hungry.
+        let Ok(_permit) = cache.refresh_sem.acquire().await else {
+            return;
+        };
         // Ensure the inner service is ready before calling (tower contract).
         let _ = std::future::poll_fn(|cx| svc.poll_ready(cx)).await;
         match svc.call(req).await {
