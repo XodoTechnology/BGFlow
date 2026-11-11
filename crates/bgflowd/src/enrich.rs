@@ -122,6 +122,30 @@ struct CountryRecord {
     /// `country_code` at top level instead of nested `country.iso_code`).
     #[serde(rename = "country_code")]
     country_code: Option<String>,
+    // City-level geo — present in *-city-*.mmdb databases. DB-IP uses flat
+    // `city`/`state1`/`latitude`/`longitude` scalars; MaxMind nests
+    // `city.names.en`, `subdivisions[].iso_code`, and
+    // `location.{latitude,longitude}`. Accept both layouts.
+    city: Option<serde_json::Value>,
+    #[serde(rename = "state1")]
+    state1: Option<String>,
+    subdivisions: Option<Vec<Subdivision>>,
+    location: Option<Location>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct Subdivision {
+    #[serde(rename = "iso_code")]
+    iso_code: Option<String>,
+    names: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct Location {
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +162,41 @@ impl CountryRecord {
             .and_then(|cc| cc.iso_code.as_deref())
             .or(self.country_code.as_deref())
             .unwrap_or("")
+    }
+
+    /// City name: DB-IP flat string, or MaxMind `city.names.en`.
+    fn city_name(&self) -> Option<&str> {
+        match self.city.as_ref()? {
+            serde_json::Value::String(s) => Some(s.as_str()),
+            v => v.pointer("/names/en").and_then(|n| n.as_str()),
+        }
+    }
+
+    /// Region/subdivision display name: DB-IP `state1` (already a name like
+    /// "Hesse"), else first MaxMind subdivision's `names.en`, else its
+    /// `iso_code` (e.g. "CA").
+    fn region_name(&self) -> Option<&str> {
+        self.state1
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let sub = self.subdivisions.as_ref()?.first()?;
+                sub.names
+                    .as_ref()
+                    .and_then(|n| n.pointer("/en"))
+                    .and_then(|n| n.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(sub.iso_code.as_deref().filter(|s| !s.is_empty()))
+            })
+    }
+
+    fn lat(&self) -> Option<f64> {
+        self.latitude.or_else(|| self.location.as_ref()?.latitude)
+    }
+
+    fn lon(&self) -> Option<f64> {
+        self.longitude.or_else(|| self.location.as_ref()?.longitude)
     }
 }
 
@@ -172,11 +231,18 @@ pub struct MmdbGeo {
     asn: Vec<GeoReader>,
     country: Vec<GeoReader>,
     orgs: Arc<StringTable>,
+    /// City names interned separately from org names.
+    cities: Arc<StringTable>,
     metrics: Arc<Metrics>,
 }
 
 impl MmdbGeo {
-    pub fn open(cfg: &GeoIpConfig, orgs: Arc<StringTable>, metrics: Arc<Metrics>) -> Self {
+    pub fn open(
+        cfg: &GeoIpConfig,
+        orgs: Arc<StringTable>,
+        cities: Arc<StringTable>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         let open_all = |paths: DbPaths| -> Vec<GeoReader> {
             paths
                 .paths()
@@ -205,7 +271,7 @@ impl MmdbGeo {
                 country.len()
             );
         }
-        MmdbGeo { asn, country, orgs, metrics }
+        MmdbGeo { asn, country, orgs, cities, metrics }
     }
 
     pub fn enabled(&self) -> bool {
@@ -226,6 +292,10 @@ impl MmdbGeo {
         let mut asn_v = serde_json::Value::Null;
         let mut org_v = serde_json::Value::Null;
         let mut country_v = serde_json::Value::Null;
+        let mut city_v = serde_json::Value::Null;
+        let mut region_v = serde_json::Value::Null;
+        let mut lat_v = serde_json::Value::Null;
+        let mut lon_v = serde_json::Value::Null;
         for g in self.asn.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(a)) = g.r.lookup::<Option<AsnRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
@@ -245,13 +315,33 @@ impl MmdbGeo {
                 if !code.is_empty() {
                     country_v = serde_json::json!(code);
                 }
+                if let Some(ci) = c.city_name().map(str::trim).filter(|s| !s.is_empty()) {
+                    city_v = serde_json::json!(ci);
+                }
+                if let Some(s1) = c.region_name() {
+                    region_v = serde_json::json!(s1);
+                }
+                if let Some(la) = c.lat() {
+                    lat_v = serde_json::json!(la);
+                }
+                if let Some(lo) = c.lon() {
+                    lon_v = serde_json::json!(lo);
+                }
                 break;
             }
         }
-        if asn_v.is_null() && org_v.is_null() && country_v.is_null() {
+        if asn_v.is_null()
+            && org_v.is_null()
+            && country_v.is_null()
+            && city_v.is_null()
+            && lat_v.is_null()
+        {
             return None;
         }
-        Some(serde_json::json!({"asn": asn_v, "org": org_v, "country": country_v}))
+        Some(serde_json::json!({
+            "asn": asn_v, "org": org_v, "country": country_v,
+            "city": city_v, "region": region_v, "lat": lat_v, "lon": lon_v,
+        }))
     }
 
     /// Enrich one IP's fields in the record. Only fills fields that are
@@ -290,6 +380,52 @@ impl MmdbGeo {
                         rec.src_country = packed;
                     } else if !is_src && rec.dst_country == 0 {
                         rec.dst_country = packed;
+                    }
+                }
+                // City-level geo — only *-city-*.mmdb databases carry these.
+                let city = c
+                    .city_name()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| self.cities.intern(s))
+                    .unwrap_or(0);
+                let region = c
+                    .region_name()
+                    .map(|s| self.cities.intern(s))
+                    .unwrap_or(0);
+                let lat = c
+                    .lat()
+                    .map(|v| ((v + 90.0) * 100000.0).clamp(0.0, u32::MAX as f64) as u32)
+                    .unwrap_or(0);
+                let lon = c
+                    .lon()
+                    .map(|v| ((v + 180.0) * 100000.0).clamp(0.0, u32::MAX as f64) as u32)
+                    .unwrap_or(0);
+                if is_src {
+                    if rec.src_city == 0 {
+                        rec.src_city = city;
+                    }
+                    if rec.src_region == 0 {
+                        rec.src_region = region;
+                    }
+                    if rec.src_lat == 0 {
+                        rec.src_lat = lat;
+                    }
+                    if rec.src_lon == 0 {
+                        rec.src_lon = lon;
+                    }
+                } else {
+                    if rec.dst_city == 0 {
+                        rec.dst_city = city;
+                    }
+                    if rec.dst_region == 0 {
+                        rec.dst_region = region;
+                    }
+                    if rec.dst_lat == 0 {
+                        rec.dst_lat = lat;
+                    }
+                    if rec.dst_lon == 0 {
+                        rec.dst_lon = lon;
                     }
                 }
                 break;
@@ -1200,5 +1336,47 @@ route: 9.9.9.0/24 origin: AS13335
             .lookup(ip_to_u128(&"2001:db8::5".parse::<IpAddr>().unwrap()))
             .unwrap();
         assert_eq!(v6hit.asn, Some(64496));
+    }
+
+    #[test]
+    fn country_record_both_geo_layouts() {
+        // DB-IP flat layout (ip-database/mmdb "city" files).
+        let flat: CountryRecord = serde_json::from_value(serde_json::json!({
+            "country_code": "US",
+            "state1": "CA",
+            "city": "Mountain View",
+            "latitude": 37.4192,
+            "longitude": -122.0574
+        }))
+        .unwrap();
+        assert_eq!(flat.iso_code(), "US");
+        assert_eq!(flat.city_name(), Some("Mountain View"));
+        assert_eq!(flat.region_name(), Some("CA"));
+        assert_eq!(flat.lat(), Some(37.4192));
+        assert_eq!(flat.lon(), Some(-122.0574));
+
+        // MaxMind GeoLite2 nested layout.
+        let mm: CountryRecord = serde_json::from_value(serde_json::json!({
+            "country": {"iso_code": "DE"},
+            "city": {"names": {"en": "Berlin", "de": "Berlin"}},
+            "subdivisions": [{"iso_code": "BE", "names": {"en": "Berlin"}}],
+            "location": {"latitude": 52.52, "longitude": 13.405, "time_zone": "Europe/Berlin"}
+        }))
+        .unwrap();
+        assert_eq!(mm.iso_code(), "DE");
+        assert_eq!(mm.city_name(), Some("Berlin"));
+        // names.en preferred over iso_code for display.
+        assert_eq!(mm.region_name(), Some("Berlin"));
+        assert_eq!(mm.lat(), Some(52.52));
+        assert_eq!(mm.lon(), Some(13.405));
+
+        // ASN-only record (no city fields) still parses.
+        let bare: CountryRecord = serde_json::from_value(serde_json::json!({
+            "country": {"iso_code": "FR"}
+        }))
+        .unwrap();
+        assert_eq!(bare.iso_code(), "FR");
+        assert!(bare.city_name().is_none());
+        assert!(bare.lat().is_none());
     }
 }

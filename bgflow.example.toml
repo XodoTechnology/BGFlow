@@ -64,7 +64,8 @@ coarse_retention_days = 365
 
 [geoip]
 # GeoIP MMDB databases (optional) — fills in ASN/org/country for flows
-# whose exporter didn't provide them. Any MaxMind-compatible MMDB works:
+# whose exporter didn't provide them. Point country_db at a *-city-*.mmdb
+# to also get city/region/lat-lon per endpoint. Any MaxMind-compatible MMDB works:
 #   * DB-IP Lite (free, no account): https://db-ip.com/db/download/
 #   * MaxMind GeoLite2 (free account + license key): https://www.maxmind.com
 #   * ip-database/mmdb mirror (GeoLite2 per-family, no key):

@@ -308,7 +308,7 @@ async fn flows(
     }
 
     if q.get("format").map(|s| s.as_str()) == Some("csv") {
-        return csv_response(&recs);
+        return csv_response(&st.ctx, &recs);
     }
     let out: Vec<_> = recs.iter().map(|f| query::flow_json(&st.ctx, f)).collect();
     Ok(Json(serde_json::json!({
@@ -326,16 +326,19 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn csv_response(recs: &[bgflow_types::FlowRecord]) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+fn csv_response(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // CSV export — returned as JSON {"csv": "..."} so the UI can download it
     // without a second content-type path; API clients can also request
     // format=csv&raw=1 for a text body (see below).
     let mut s = String::from(
-        "ts,src_ip,dst_ip,src_port,dst_port,protocol,bytes,packets,exporter,src_asn,dst_asn,label_id\n",
+        "ts,src_ip,dst_ip,src_port,dst_port,protocol,bytes,packets,exporter,src_asn,dst_asn,src_city,dst_city,src_region,dst_region,src_lat,src_lon,dst_lat,dst_lon,label_id\n",
     );
     for f in recs {
+        let coord = |v: u32, bias: f64| {
+            if v == 0 { String::new() } else { format!("{:.5}", v as f64 / 100000.0 - bias) }
+        };
         s.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             f.ts_ms,
             csv_escape(&bgflow_types::ip_string(f.src_ip)),
             csv_escape(&bgflow_types::ip_string(f.dst_ip)),
@@ -347,6 +350,14 @@ fn csv_response(recs: &[bgflow_types::FlowRecord]) -> Result<Json<serde_json::Va
             csv_escape(&bgflow_types::ip_string(f.exporter)),
             f.src_asn,
             f.dst_asn,
+            csv_escape(ctx.cities.name(f.src_city).as_deref().unwrap_or("")),
+            csv_escape(ctx.cities.name(f.dst_city).as_deref().unwrap_or("")),
+            csv_escape(ctx.cities.name(f.src_region).as_deref().unwrap_or("")),
+            csv_escape(ctx.cities.name(f.dst_region).as_deref().unwrap_or("")),
+            coord(f.src_lat, 90.0),
+            coord(f.src_lon, 180.0),
+            coord(f.dst_lat, 90.0),
+            coord(f.dst_lon, 180.0),
             f.label_id,
         ));
     }

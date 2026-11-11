@@ -499,10 +499,16 @@ async function vFlows(){
    '<div class="panel"><h3>Raw Flows (newest first)</h3><div id="tbl"></div></div>';
   const lim=$('#f_limit')?.value||500;
   const data=await api('/api/v1/flows?'+q({limit:lim}));
+  const tip=(f,side)=>{const p=side;const bits=[];
+    const ptr=f[p+'_ptr'];if(ptr)bits.push(ptr);
+    const city=f[p+'_city'];const region=f[p+'_region'];const lat=f[p+'_lat'];const lon=f[p+'_lon'];
+    if(city||region)bits.push([city,region].filter(Boolean).join(', '));
+    if(lat&&lon)bits.push(Number(lat).toFixed(3)+', '+Number(lon).toFixed(3));
+    return bits.join(' · ');};
   const rows=(data.flows||[]).map(f=>`<tr>
     <td class="muted">${f.ts?new Date(f.ts*1000).toLocaleTimeString():'-'}</td>
-    <td><span class="clickable" title="${esc(f.src_ptr||'')}" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted">:${f.src_port}</span></td>
-    <td><span class="clickable" title="${esc(f.dst_ptr||'')}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted">:${f.dst_port}</span></td>
+    <td><span class="clickable" title="${esc(tip(f,'src'))}" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted">:${f.src_port}</span></td>
+    <td><span class="clickable" title="${esc(tip(f,'dst'))}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted">:${f.dst_port}</span></td>
     <td>${protoBadge(f.protocol_name||protoName(f.protocol))}</td>
     <td class="num">${fmtB(f.bytes)}</td><td class="num">${fmtN(f.packets)}</td>
     <td class="muted">AS${f.src_asn||'-'} → AS${f.dst_asn||'-'}</td>

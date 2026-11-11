@@ -127,7 +127,8 @@ async fn main() -> Result<()> {
     // --- Shared state ---
     let metrics = Arc::new(Metrics::default());
     let orgs = Arc::new(StringTable::open(cfg.storage.data_dir.join("orgs.txt"))?);
-    let geo = Arc::new(MmdbGeo::open(&cfg.geoip, orgs.clone(), metrics.clone()));
+    let cities = Arc::new(StringTable::open(cfg.storage.data_dir.join("cities.txt"))?);
+    let geo = Arc::new(MmdbGeo::open(&cfg.geoip, orgs.clone(), cities.clone(), metrics.clone()));
     let http_enrich = Arc::new(HttpEnrichers::new(
         &cfg.enrichers,
         metrics.clone(),
@@ -236,6 +237,7 @@ async fn main() -> Result<()> {
             rollup_index: shared.rollup_index.clone(),
             hourly_index: shared.hourly_index.clone(),
             orgs: orgs.clone(),
+            cities: cities.clone(),
             rules: rules.clone(),
             exporter_names: exporter_names.clone(),
             interface_names: interface_names.clone(),

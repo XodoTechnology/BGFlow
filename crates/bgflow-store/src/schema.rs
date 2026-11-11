@@ -104,9 +104,58 @@ macro_rules! col {
 use ColType::*;
 use Encoding::*;
 
-/// Schema id 2: raw flow records (32 columns). id 0 was the v1 layout
-/// (26 cols); old segments are skipped on open since ids no longer match.
+/// Schema id 4: raw flow records (36 columns). Appended geo columns keep
+/// indices 0..31 identical to id 2 so old segments decode with zeroed geo.
 pub const RAW_SCHEMA: Schema = Schema {
+    id: 4,
+    name: "flows",
+    columns: &[
+        col!("ts_ms", U64, Delta, ts),
+        col!("duration_ms", U32, Plain),
+        col!("src_ip", U128, Plain),
+        col!("dst_ip", U128, Plain),
+        col!("src_port", U16, Plain),
+        col!("dst_port", U16, Plain),
+        col!("protocol", U8, Dict),
+        col!("tcp_flags", U8, Plain),
+        col!("ingress_if", U32, Dict),
+        col!("egress_if", U32, Dict),
+        col!("next_hop", U128, Plain),
+        col!("src_asn", U32, Dict),
+        col!("dst_asn", U32, Dict),
+        col!("src_country", U16, Dict),
+        col!("dst_country", U16, Dict),
+        col!("src_org", U32, Dict),
+        col!("dst_org", U32, Dict),
+        col!("vlan", U16, Dict),
+        col!("bytes", U64, Plain),
+        col!("packets", U64, Plain),
+        col!("exporter", U128, Dict),
+        col!("engine_id", U8, Dict),
+        col!("engine_type", U8, Dict),
+        col!("sampler_interval", U32, Dict),
+        col!("tcp_state", U8, Dict),
+        col!("label_id", U32, Dict),
+        col!("ip_ttl", U8, Dict),
+        col!("flow_end_reason", U8, Dict),
+        col!("icmp_type", U8, Dict),
+        col!("icmp_code", U8, Dict),
+        col!("post_nat_src", U128, Dict),
+        col!("post_nat_dst", U128, Dict),
+        col!("src_city", U32, Dict),
+        col!("dst_city", U32, Dict),
+        col!("src_region", U32, Dict),
+        col!("dst_region", U32, Dict),
+        col!("src_lat", U32, Plain),
+        col!("dst_lat", U32, Plain),
+        col!("src_lon", U32, Plain),
+        col!("dst_lon", U32, Plain),
+    ],
+};
+
+/// Schema id 2: raw flow records before geo columns (32 columns). Kept so
+/// existing segments remain readable — geo fields decode as 0.
+pub const RAW_SCHEMA_V1: Schema = Schema {
     id: 2,
     name: "flows",
     columns: &[
@@ -179,6 +228,14 @@ pub mod raw_idx {
     pub const ICMP_CODE: usize = 29;
     pub const POST_NAT_SRC: usize = 30;
     pub const POST_NAT_DST: usize = 31;
+    pub const SRC_CITY: usize = 32;
+    pub const DST_CITY: usize = 33;
+    pub const SRC_REGION: usize = 34;
+    pub const DST_REGION: usize = 35;
+    pub const SRC_LAT: usize = 36;
+    pub const DST_LAT: usize = 37;
+    pub const SRC_LON: usize = 38;
+    pub const DST_LON: usize = 39;
 }
 
 /// Schema id 3: rollup records (19 columns). id 1 was the v1 layout.
@@ -233,8 +290,9 @@ pub mod rollup_idx {
 
 pub fn schema_by_id(id: u16) -> Option<&'static Schema> {
     match id {
-        2 => Some(&RAW_SCHEMA),
+        2 => Some(&RAW_SCHEMA_V1),
         3 => Some(&ROLLUP_SCHEMA),
+        4 => Some(&RAW_SCHEMA),
         _ => None,
     }
 }

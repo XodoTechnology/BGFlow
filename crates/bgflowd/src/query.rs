@@ -91,6 +91,8 @@ pub struct Ctx {
     /// Coarse hourly rollups (/24·/48-masked IPs, long retention).
     pub hourly_index: SegmentIndex,
     pub orgs: Arc<StringTable>,
+    /// City-name string table for geo_city ids.
+    pub cities: Arc<StringTable>,
     pub rules: Arc<Ruleset>,
     pub exporter_names: Arc<RwLock<ExporterNames>>,
     pub interface_names: Arc<RwLock<InterfaceNames>>,
@@ -862,7 +864,7 @@ where
 /// to rule names.
 pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
     let label = ctx.rules.name_of(f.label_id);
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "ts": f.ts_ms / 1000,
         "ts_ms": f.ts_ms,
         "duration_ms": f.duration_ms,
@@ -902,7 +904,25 @@ pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
         "post_nat_dst": if f.post_nat_dst != 0 { serde_json::json!(ip_string(f.post_nat_dst)) } else { serde_json::Value::Null },
         "label": label,
         "label_id": f.label_id,
-    })
+    });
+    // MMDB city geo (schema ≥4 segments only; 0 = unknown) — merged in
+    // separately to keep the json! macro under its recursion limit.
+    let geo = serde_json::json!({
+        "src_city": ctx.cities.name(f.src_city),
+        "dst_city": ctx.cities.name(f.dst_city),
+        "src_region": ctx.cities.name(f.src_region),
+        "dst_region": ctx.cities.name(f.dst_region),
+        "src_lat": if f.src_lat != 0 { serde_json::json!(f.src_lat as f64 / 100000.0 - 90.0) } else { serde_json::Value::Null },
+        "dst_lat": if f.dst_lat != 0 { serde_json::json!(f.dst_lat as f64 / 100000.0 - 90.0) } else { serde_json::Value::Null },
+        "src_lon": if f.src_lon != 0 { serde_json::json!(f.src_lon as f64 / 100000.0 - 180.0) } else { serde_json::Value::Null },
+        "dst_lon": if f.dst_lon != 0 { serde_json::json!(f.dst_lon as f64 / 100000.0 - 180.0) } else { serde_json::Value::Null },
+    });
+    if let (Some(dst), Some(src)) = (out.as_object_mut(), geo.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    out
 }
 
 /// Grouping key for a top-N dimension.

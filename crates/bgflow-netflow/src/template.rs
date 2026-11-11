@@ -177,6 +177,14 @@ impl FlowBuilder {
             icmp_code: self.icmp_code,
             post_nat_src: self.post_nat_src,
             post_nat_dst: self.post_nat_dst,
+            src_city: 0,
+            dst_city: 0,
+            src_region: 0,
+            dst_region: 0,
+            src_lat: 0,
+            dst_lat: 0,
+            src_lon: 0,
+            dst_lon: 0,
         }
     }
 }

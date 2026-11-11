@@ -114,8 +114,12 @@ bgflowd --demo 127.0.0.1:2055 --demo-pps 20 --demo-secs 300
 
 ASN/org/country lookup works out of the box for flows whose exporter
 provides the fields, plus HTTP enrichers (e.g. `irrd3.net`) and table
-dumps. For **MMDB-backed enrichment of everything else**, the easiest
-path is the built-in downloader:
+dumps. **City/region/coordinates** come from *-city-*.mmdb databases —
+point `country_db` at a city database (the `geoip-update --source
+github` city files, DB-IP Lite city, or GeoLite2-City) and flows gain
+`src_city`/`dst_city`, region names, and lat/lon in the API, CSV export,
+and flow-row tooltips. For **MMDB-backed enrichment of everything else**,
+the easiest path is the built-in downloader:
 
 ```sh
 bgflowd geoip-update                    # DB-IP Lite → /usr/share/GeoIP

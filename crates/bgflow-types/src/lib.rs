@@ -57,6 +57,19 @@ pub struct FlowRecord {
     /// (IE 225/226 v4, 281/282 v6). 0 = not reported.
     pub post_nat_src: u128,
     pub post_nat_dst: u128,
+    /// Geo enrichment from MMDB city databases (0 = unknown), per endpoint:
+    /// `src_city`/`dst_city`/`src_region`/`dst_region` are StringTable ids
+    /// (cities.txt — region holds full names like "Hesse"/"California"),
+    /// and lat/lon are degrees ×1e5 biased into u32
+    /// ((v+90)*1e5 / (v+180)*1e5).
+    pub src_city: u32,
+    pub dst_city: u32,
+    pub src_region: u32,
+    pub dst_region: u32,
+    pub src_lat: u32,
+    pub dst_lat: u32,
+    pub src_lon: u32,
+    pub dst_lon: u32,
 }
 
 /// Pre-aggregated rollup record: one row per (minute, exporter, protocol,

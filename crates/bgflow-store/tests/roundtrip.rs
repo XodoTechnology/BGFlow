@@ -36,6 +36,14 @@ fn sample_flow(i: u64) -> FlowRecord {
         icmp_code: (i % 256) as u8,
         post_nat_src: 0,
         post_nat_dst: 0,
+        src_city: 0,
+        dst_city: 0,
+        src_region: 0,
+        dst_region: 0,
+        src_lat: 0,
+        dst_lat: 0,
+        src_lon: 0,
+        dst_lon: 0,
     }
 }
 

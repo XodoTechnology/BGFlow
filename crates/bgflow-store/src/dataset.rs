@@ -91,6 +91,14 @@ impl Record for FlowRecord {
         cols[ix::ICMP_CODE].push(self.icmp_code);
         cols[ix::POST_NAT_SRC].extend_from_slice(&self.post_nat_src.to_le_bytes());
         cols[ix::POST_NAT_DST].extend_from_slice(&self.post_nat_dst.to_le_bytes());
+        cols[ix::SRC_CITY].extend_from_slice(&self.src_city.to_le_bytes());
+        cols[ix::DST_CITY].extend_from_slice(&self.dst_city.to_le_bytes());
+        cols[ix::SRC_REGION].extend_from_slice(&self.src_region.to_le_bytes());
+        cols[ix::DST_REGION].extend_from_slice(&self.dst_region.to_le_bytes());
+        cols[ix::SRC_LAT].extend_from_slice(&self.src_lat.to_le_bytes());
+        cols[ix::DST_LAT].extend_from_slice(&self.dst_lat.to_le_bytes());
+        cols[ix::SRC_LON].extend_from_slice(&self.src_lon.to_le_bytes());
+        cols[ix::DST_LON].extend_from_slice(&self.dst_lon.to_le_bytes());
     }
 
     fn from_scan(scan: &ScanResult, i: usize) -> Self {
@@ -129,6 +137,16 @@ impl Record for FlowRecord {
             icmp_code: c[ix::ICMP_CODE].value_at(i) as u8,
             post_nat_src: c[ix::POST_NAT_SRC].value_at(i),
             post_nat_dst: c[ix::POST_NAT_DST].value_at(i),
+            // Geo columns exist only in schema id ≥4 — older segments
+            // decode them as 0.
+            src_city: c.get(ix::SRC_CITY).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            dst_city: c.get(ix::DST_CITY).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            src_region: c.get(ix::SRC_REGION).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            dst_region: c.get(ix::DST_REGION).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            src_lat: c.get(ix::SRC_LAT).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            dst_lat: c.get(ix::DST_LAT).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            src_lon: c.get(ix::SRC_LON).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            dst_lon: c.get(ix::DST_LON).map(|col| col.value_at(i) as u32).unwrap_or(0),
         }
     }
 }
