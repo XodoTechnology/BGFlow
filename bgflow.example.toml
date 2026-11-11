@@ -79,6 +79,15 @@ coarse_retention_days = 365
 # Leave empty to disable MMDB enrichment.
 asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"
 country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
+# Optional auto-update: periodically download fresh databases and hot-swap
+# readers (no restart). update_source = "dbip" (DB-IP Lite, no account) or
+# "github" (per-family GeoLite2 mirror). Downloads go to update_dir —
+# empty means the directory of the first db path above. update_secs is the
+# interval (0 = weekly). Replaced .mmdb files are always picked up within
+# ~60s even without auto-update.
+# update_source = "github"
+# update_secs = 604800
+# update_dir = "/usr/share/GeoIP"
 
 # Optional: friendly interface names shown in the UI flows view.
 # [interface_names]

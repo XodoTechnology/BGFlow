@@ -144,6 +144,30 @@ pub struct GeoIpConfig {
     pub asn_db: DbPaths,
     /// MaxMind Country database path(s) (mmdb). Empty disables.
     pub country_db: DbPaths,
+    /// Auto-download source: "" (off, default) | "dbip" | "github".
+    /// Downloads land in `update_dir` every `update_secs` and the daemon
+    /// hot-swaps its readers — no restart needed.
+    pub update_source: String,
+    /// Seconds between auto-downloads. 0 = weekly (only used when
+    /// `update_source` is set).
+    pub update_secs: u64,
+    /// Download directory. Empty = parent directory of the first
+    /// configured database path.
+    pub update_dir: String,
+}
+
+impl GeoIpConfig {
+    /// Every configured database path (asn + country), trimmed, non-empty.
+    pub fn all_db_paths(&self) -> Vec<std::path::PathBuf> {
+        self.asn_db
+            .paths()
+            .into_iter()
+            .chain(self.country_db.paths())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -325,6 +349,9 @@ impl Default for GeoIpConfig {
         GeoIpConfig {
             asn_db: DbPaths::One("/usr/share/GeoIP/GeoLite2-ASN.mmdb".into()),
             country_db: DbPaths::One("/usr/share/GeoIP/GeoLite2-Country.mmdb".into()),
+            update_source: String::new(),
+            update_secs: 0,
+            update_dir: String::new(),
         }
     }
 }

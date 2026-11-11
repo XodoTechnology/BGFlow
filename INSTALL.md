@@ -143,6 +143,23 @@ drop any MaxMind-compatible `.mmdb` at the configured paths:
 Then `systemctl reload bgflow` (or restart) — the log shows
 `geoip enrichment enabled` when the DBs load.
 
+**Updates are automatic.** The daemon watches the configured `.mmdb`
+files and hot-swaps readers within ~60s of any change — so a manual
+`bgflowd geoip-update`, package upgrade, or `geoip-update` timer all
+apply without a restart. For fully unattended updates, enable the
+built-in downloader:
+
+```toml
+[geoip]
+update_source = "github"    # or "dbip"
+update_secs = 604800        # weekly (0 = weekly default)
+# update_dir = "/usr/share/GeoIP"   # optional; defaults to the dir of
+                                    # the first configured db path
+```
+
+A cron/systemd timer running `bgflowd geoip-update` works too — the
+daemon notices the new files on its next tick.
+
 ## Securing a public deployment
 
 If the UI/API will be reachable beyond localhost, **set up auth before

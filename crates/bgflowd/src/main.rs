@@ -229,7 +229,17 @@ async fn main() -> Result<()> {
         interface_names: interface_names.clone(),
         auth: auth.clone(),
         alerts: alerts_cfg.clone(),
+        geo: geo.clone(),
     });
+
+    // MMDB maintenance: hot-swap readers when .mmdb files change on disk,
+    // and auto-download fresh databases when [geoip] update_source is set.
+    {
+        let g = geo.clone();
+        let cp = config::resolve_path(args.config.as_ref());
+        let fb = cfg.geoip.clone();
+        tokio::spawn(async move { geoip::refresh_loop(g, cp, fb).await });
+    }
 
     let app_state = Arc::new(AppState {
         ctx: query::Ctx {

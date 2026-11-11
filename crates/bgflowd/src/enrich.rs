@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 // ---------------------------------------------------------------------------
 // Organization string table (interning + persistence)
@@ -225,15 +225,68 @@ impl GeoReader {
     }
 }
 
-pub struct MmdbGeo {
+/// The set of open MMDB readers — replaced atomically on reload so
+/// in-flight lookups never see a half-built set.
+#[derive(Default)]
+struct GeoReaders {
     /// One reader per configured path — split IPv4/IPv6 databases are
     /// tried in order; first hit wins.
     asn: Vec<GeoReader>,
     country: Vec<GeoReader>,
+}
+
+/// Fingerprint of a database file at load time: (mtime, len), or `None`
+/// when the file was absent. Lets the refresh loop detect externally
+/// replaced files (e.g. `bgflowd geoip-update`, package upgrades).
+type FileStamp = Option<(Option<SystemTime>, u64)>;
+
+pub struct MmdbGeo {
+    readers: RwLock<GeoReaders>,
+    /// Configured path → stamp recorded at the last reader build.
+    stamps: RwLock<HashMap<PathBuf, FileStamp>>,
     orgs: Arc<StringTable>,
     /// City names interned separately from org names.
     cities: Arc<StringTable>,
     metrics: Arc<Metrics>,
+}
+
+/// Build readers + file stamps for a geoip config. Shared by `open` and
+/// `swap`.
+fn build_readers(cfg: &GeoIpConfig) -> (GeoReaders, HashMap<PathBuf, FileStamp>) {
+    let mut stamps = HashMap::new();
+    // Stamp every configured path (even unreadable/missing ones) so
+    // files_changed() only fires on real differences.
+    for p in cfg.all_db_paths() {
+        let stamp = std::fs::metadata(&p)
+            .ok()
+            .map(|md| (md.modified().ok(), md.len()));
+        stamps.insert(p, stamp);
+    }
+    let open_all = |paths: DbPaths| -> Vec<GeoReader> {
+        paths
+            .paths()
+            .into_iter()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| match maxminddb::Reader::open_readfile(p) {
+                Ok(r) => {
+                    let ip_version = r.metadata.ip_version;
+                    Some(GeoReader { r, ip_version })
+                }
+                Err(e) => {
+                    tracing::warn!("geoip: cannot open {}: {}", p, e);
+                    None
+                }
+            })
+            .collect()
+    };
+    (
+        GeoReaders {
+            asn: open_all(cfg.asn_db.clone()),
+            country: open_all(cfg.country_db.clone()),
+        },
+        stamps,
+    )
 }
 
 impl MmdbGeo {
@@ -243,39 +296,68 @@ impl MmdbGeo {
         cities: Arc<StringTable>,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let open_all = |paths: DbPaths| -> Vec<GeoReader> {
-            paths
-                .paths()
-                .into_iter()
-                .filter(|p| !p.is_empty())
-                .filter_map(|p| match maxminddb::Reader::open_readfile(p) {
-                    Ok(r) => {
-                        let ip_version = r.metadata.ip_version;
-                        Some(GeoReader { r, ip_version })
-                    }
-                    Err(e) => {
-                        tracing::warn!("geoip: cannot open {}: {}", p, e);
-                        None
-                    }
-                })
-                .collect()
-        };
-        let asn = open_all(cfg.asn_db.clone());
-        let country = open_all(cfg.country_db.clone());
-        if asn.is_empty() && country.is_empty() {
+        let (readers, stamps) = build_readers(cfg);
+        let n = readers.asn.len() + readers.country.len();
+        if n == 0 {
             tracing::info!("geoip: no MMDB databases loaded");
         } else {
             tracing::info!(
                 "geoip enrichment enabled ({} asn db(s), {} country db(s))",
-                asn.len(),
-                country.len()
+                readers.asn.len(),
+                readers.country.len()
             );
         }
-        MmdbGeo { asn, country, orgs, cities, metrics }
+        MmdbGeo {
+            readers: RwLock::new(readers),
+            stamps: RwLock::new(stamps),
+            orgs,
+            cities,
+            metrics,
+        }
+    }
+
+    /// Rebuild readers from `cfg` and swap them in atomically. Old
+    /// readers stay alive until the last in-flight lookup finishes.
+    pub fn swap(&self, cfg: &GeoIpConfig) {
+        let (readers, stamps) = build_readers(cfg);
+        let n = readers.asn.len() + readers.country.len();
+        *self.readers.write().unwrap() = readers;
+        *self.stamps.write().unwrap() = stamps;
+        if n == 0 {
+            tracing::warn!("geoip: no MMDB readers after reload — geo enrichment disabled");
+        } else {
+            tracing::info!("geoip: {} MMDB reader(s) (re)loaded", n);
+        }
+    }
+
+    /// True when any configured file's mtime/size differs from the stamp
+    /// recorded at the last build, or the configured path set changed.
+    pub fn files_changed(&self, cfg: &GeoIpConfig) -> bool {
+        let configured: HashSet<PathBuf> = cfg.all_db_paths().into_iter().collect();
+        let stamps = self.stamps.read().unwrap();
+        // A stamped path no longer configured means the config changed.
+        if stamps.keys().any(|k| !configured.contains(k)) {
+            return true;
+        }
+        for p in &configured {
+            let cur: FileStamp = std::fs::metadata(p)
+                .ok()
+                .map(|md| (md.modified().ok(), md.len()));
+            if stamps.get(p) != Some(&cur) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Total open readers (for the admin reload report).
+    pub fn db_count(&self) -> usize {
+        let r = self.readers.read().unwrap();
+        r.asn.len() + r.country.len()
     }
 
     pub fn enabled(&self) -> bool {
-        !self.asn.is_empty() || !self.country.is_empty()
+        self.db_count() > 0
     }
 
     /// Per-IP detail for the /api/v1/lookup endpoint — same field shape as
@@ -284,6 +366,7 @@ impl MmdbGeo {
         if !self.enabled() {
             return None;
         }
+        let readers = self.readers.read().unwrap();
         // v4-mapped v6 input (::ffff:a.b.c.d) is really a v4 lookup.
         let ip = match ip {
             IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
@@ -296,7 +379,7 @@ impl MmdbGeo {
         let mut region_v = serde_json::Value::Null;
         let mut lat_v = serde_json::Value::Null;
         let mut lon_v = serde_json::Value::Null;
-        for g in self.asn.iter().filter(|g| g.serves(&ip)) {
+        for g in readers.asn.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(a)) = g.r.lookup::<Option<AsnRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
                 if let Some(n) = a.asn {
@@ -308,7 +391,7 @@ impl MmdbGeo {
                 break;
             }
         }
-        for g in self.country.iter().filter(|g| g.serves(&ip)) {
+        for g in readers.country.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(c)) = g.r.lookup::<Option<CountryRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
                 let code = c.iso_code();
@@ -346,9 +429,9 @@ impl MmdbGeo {
 
     /// Enrich one IP's fields in the record. Only fills fields that are
     /// still unset (0), so exporter-provided values win.
-    fn enrich_ip(&self, ip_u128: u128, is_src: bool, rec: &mut FlowRecord) {
+    fn enrich_ip(&self, readers: &GeoReaders, ip_u128: u128, is_src: bool, rec: &mut FlowRecord) {
         let ip = u128_to_ip(ip_u128);
-        for g in self.asn.iter().filter(|g| g.serves(&ip)) {
+        for g in readers.asn.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(a)) = g.r.lookup::<Option<AsnRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let asn = a.asn.unwrap_or(0) as u32;
@@ -371,7 +454,7 @@ impl MmdbGeo {
                 break;
             }
         }
-        for g in self.country.iter().filter(|g| g.serves(&ip)) {
+        for g in readers.country.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(c)) = g.r.lookup::<Option<CountryRecord>>(ip) {
                 self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let packed = country_pack(c.iso_code());
@@ -435,11 +518,12 @@ impl MmdbGeo {
 
     /// Enrich both endpoints of a record.
     pub fn enrich(&self, rec: &mut FlowRecord) {
-        if !self.enabled() {
+        let readers = self.readers.read().unwrap();
+        if readers.asn.is_empty() && readers.country.is_empty() {
             return;
         }
-        self.enrich_ip(rec.src_ip, true, rec);
-        self.enrich_ip(rec.dst_ip, false, rec);
+        self.enrich_ip(&readers, rec.src_ip, true, rec);
+        self.enrich_ip(&readers, rec.dst_ip, false, rec);
     }
 }
 
@@ -1193,7 +1277,7 @@ impl PtrCache {
     /// Sync cache read. `Some(Some(name))` = hostname, `Some(None)` =
     /// known no-PTR, `None` = unknown (enqueued for background resolve).
     pub fn get(&self, ip_u128: u128) -> Option<Option<String>> {
-        let mut g = self.map.read().unwrap();
+        let g = self.map.read().unwrap();
         if let Some(e) = g.get(&ip_u128) {
             let ttl = if e.name.is_some() { PTR_POS_TTL } else { PTR_NEG_TTL };
             if e.at.elapsed() < ttl {
@@ -1378,5 +1462,40 @@ route: 9.9.9.0/24 origin: AS13335
         assert_eq!(bare.iso_code(), "FR");
         assert!(bare.city_name().is_none());
         assert!(bare.lat().is_none());
+    }
+
+    #[test]
+    fn files_changed_detects_replaced_and_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.mmdb");
+        std::fs::write(&db, b"v1").unwrap();
+        let cfg = GeoIpConfig {
+            asn_db: crate::config::DbPaths::One(db.to_string_lossy().into()),
+            ..Default::default()
+        };
+        let geo = MmdbGeo {
+            readers: RwLock::new(GeoReaders::default()),
+            stamps: RwLock::new(HashMap::new()),
+            orgs: Arc::new(StringTable::open(dir.path().join("orgs.txt")).unwrap()),
+            cities: Arc::new(StringTable::open(dir.path().join("cities.txt")).unwrap()),
+            metrics: Arc::new(Metrics::default()),
+        };
+        geo.swap(&cfg);
+        assert!(!geo.files_changed(&cfg));
+
+        // Content change → detected.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&db, b"v2-longer").unwrap();
+        assert!(geo.files_changed(&cfg));
+        geo.swap(&cfg);
+        assert!(!geo.files_changed(&cfg));
+
+        // File removed → detected; re-added → detected.
+        std::fs::remove_file(&db).unwrap();
+        assert!(geo.files_changed(&cfg));
+        geo.swap(&cfg);
+        assert!(!geo.files_changed(&cfg));
+        std::fs::write(&db, b"v3").unwrap();
+        assert!(geo.files_changed(&cfg));
     }
 }
