@@ -178,12 +178,41 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Displayed version: BGFLOW_VERSION env > [server] version > compile-time
+/// git-derived string. Lets operators stamp distro/custom builds without
+/// rebuilding (e.g. when .git wasn't present at build time).
+fn version_display(cfg: &crate::config::Config) -> String {
+    if let Ok(v) = std::env::var("BGFLOW_VERSION") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    if !cfg.server.version.is_empty() {
+        return cfg.server.version.clone();
+    }
+    env!("BGFLOW_VERSION_DISPLAY").to_string()
+}
+
+/// Git-describe string for the status tooltip: BGFLOW_GIT_DESCRIBE env >
+/// [server] git_describe > compile-time value.
+fn git_describe(cfg: &crate::config::Config) -> String {
+    if let Ok(v) = std::env::var("BGFLOW_GIT_DESCRIBE") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    if !cfg.server.git_describe.is_empty() {
+        return cfg.server.git_describe.clone();
+    }
+    env!("BGFLOW_GIT_DESCRIBE").to_string()
+}
+
 fn status_payload(st: &AppState) -> serde_json::Value {
     let s = st.status.read().unwrap().clone();
     let system = crate::sys::sample(&st.config.storage.data_dir);
     serde_json::json!({
-        "version": env!("BGFLOW_VERSION_DISPLAY"),
-        "git": env!("BGFLOW_GIT_DESCRIBE"),
+        "version": version_display(&st.config),
+        "git": git_describe(&st.config),
         "system": system,
         "status": s,
         "orgs": st.ctx.orgs.len(),

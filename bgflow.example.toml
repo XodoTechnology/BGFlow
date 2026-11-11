@@ -41,6 +41,12 @@ http_listen = "0.0.0.0:8080"
 # Strongly recommended when auth is enabled — passwords and session
 # cookies are plaintext over HTTP. tls_cert = "/etc/bgflow/tls.crt"
 # tls_key  = "/etc/bgflow/tls.key"
+# Version stamp shown in the UI footer + /api/v1/status. Empty = the
+# compile-time git-derived string. Useful for distro packages or builds
+# without .git. The BGFLOW_VERSION / BGFLOW_GIT_DESCRIBE environment
+# variables override these (env wins over config).
+# version = "v1.2.3-packaged"
+# git_describe = "pkg/release@abc1234"
 
 [storage]
 # Data directory for .bfs segments + org string table.

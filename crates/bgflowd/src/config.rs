@@ -87,6 +87,13 @@ pub struct ServerConfig {
     pub session_secret: Option<String>,
     /// Session lifetime in seconds (default 86400 = 24h).
     pub session_ttl_secs: Option<u64>,
+    /// Override the version string shown in the UI/status footer.
+    /// Empty = the compile-time git-derived value. The BGFLOW_VERSION
+    /// environment variable takes precedence over this.
+    pub version: String,
+    /// Override the git-describe string shown in the status tooltip.
+    /// Empty = compile-time value. BGFLOW_GIT_DESCRIBE env wins.
+    pub git_describe: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -324,6 +331,8 @@ impl Default for ServerConfig {
             tls_key: None,
             session_secret: None,
             session_ttl_secs: None,
+            version: String::new(),
+            git_describe: String::new(),
         }
     }
 }
