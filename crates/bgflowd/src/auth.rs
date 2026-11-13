@@ -249,6 +249,32 @@ impl AuthState {
         }
     }
 
+    /// Load a persisted session secret, creating one on first run.
+    /// Keeps sessions valid across daemon restarts/upgrades without
+    /// requiring an explicit `server.session_secret`. Returns None when
+    /// the file can't be read or written — caller falls back to an
+    /// ephemeral random secret (sessions then die on restart, as before).
+    pub fn load_or_create_secret(path: &std::path::Path) -> Option<String> {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let s = s.trim();
+            if s.len() >= 32 {
+                return Some(s.to_string());
+            }
+        }
+        let mut k = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut k);
+        let hex: String = k.iter().map(|b| format!("{:02x}", b)).collect();
+        if std::fs::write(path, &hex).is_err() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Some(hex)
+    }
+
     /// True when nothing protects the UI/API.
     pub fn is_open(&self) -> bool {
         self.users.read().unwrap().is_empty() && self.legacy.is_none()
@@ -464,6 +490,7 @@ impl AuthState {
     /// (Viewer still gets all GET data endpoints.)
     pub fn requires_admin(path: &str) -> bool {
         path.starts_with("/api/v1/admin/")
+            || path.starts_with("/api/v1/exporters/")
             || path == "/api/v1/config"
             || path == "/api/v1/enrichers"
     }

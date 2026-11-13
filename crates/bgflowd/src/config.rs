@@ -30,6 +30,36 @@ pub struct Config {
     /// Generate hashes with `bgflowd hash-password`. Roles: admin | viewer.
     #[serde(default)]
     pub users: Vec<crate::auth::UserConfig>,
+    /// Exporter admission policy ([exporters] section).
+    #[serde(default)]
+    pub exporters: ExportersConfig,
+}
+
+/// Exporter admission control. New senders can be required to wait for
+/// admin approval before their flows are accepted; decisions persist in
+/// <data_dir>/exporters.json and can also be managed via the API/UI.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ExportersConfig {
+    /// When true, an exporter IP not seen before starts as "pending" and
+    /// its datagrams are dropped (counted) until approved via
+    /// POST /api/v1/exporters/{ip}/approve or the UI. Suspended/rejected
+    /// exporters are always dropped. Default false = accept everyone
+    /// (pre-feature behavior).
+    pub require_approval: bool,
+    /// Exporter IPs/CIDRs always accepted, bypassing approval
+    /// (e.g. "10.0.0.1", "192.168.0.0/16"). An explicit suspend/reject
+    /// entry still wins over trusted.
+    pub trusted: Vec<String>,
+}
+
+impl Default for ExportersConfig {
+    fn default() -> Self {
+        Self {
+            require_approval: false,
+            trusted: vec![],
+        }
+    }
 }
 
 /// Synthetic demo traffic (NetFlow v5) — for trying out the UI.
@@ -321,6 +351,7 @@ impl Default for Config {
             exporter_names: Default::default(),
             interface_names: Default::default(),
             users: vec![],
+            exporters: ExportersConfig::default(),
         }
     }
 }

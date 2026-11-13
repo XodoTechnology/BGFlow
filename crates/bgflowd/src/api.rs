@@ -8,7 +8,7 @@ use crate::metrics::Metrics;
 use crate::query::{self, Ctx, FlowQuery, RollupFilter, RollupSet};
 use crate::writer::StatusSnapshot;
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{sse::Sse, Html, IntoResponse, Response},
@@ -30,6 +30,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub auth: Arc<AuthState>,
     pub admin: Arc<AdminShared>,
+    pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
 }
 
 type Q = HashMap<String, String>;
@@ -1064,21 +1065,92 @@ async fn conversations(
 async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let map = st.metrics.exporters.lock().unwrap();
     let names = st.ctx.exporter_names.read().unwrap();
-    let items: Vec<_> = map
-        .iter()
-        .map(|(ip, e)| {
-            let u = ip_to_u128(ip);
+    let policy = st.exporter_policy.entries();
+    let require = st.exporter_policy.require_approval();
+    // Union of observed senders (metrics) and policy-known IPs — pending
+    // exporters appear here even though their traffic is dropped.
+    let ips: std::collections::BTreeSet<IpAddr> =
+        map.keys().chain(policy.keys()).copied().collect();
+    let mut items: Vec<_> = ips
+        .into_iter()
+        .map(|ip| {
+            let e = map.get(&ip);
+            let p = policy.get(&ip);
+            let u = ip_to_u128(&ip);
+            // Same precedence as the ingest decision: explicit
+            // suspend/reject wins, then trusted, then entry state.
+            let state = match p.map(|p| p.state) {
+                Some(crate::exporter_policy::ExporterState::Suspended) => "suspended",
+                Some(crate::exporter_policy::ExporterState::Rejected) => "rejected",
+                _ if st.exporter_policy.is_trusted(ip) => "trusted",
+                Some(s) => s.as_str(),
+                None if require => "pending",
+                None => "active",
+            };
             serde_json::json!({
                 "ip": ip.to_string(),
                 "name": names.name_of(u),
-                "datagrams": e.datagrams,
-                "records": e.records,
-                "bytes_in": e.bytes_in,
-                "last_seen_ms": e.last_seen_ms,
+                "datagrams": e.map(|x| x.datagrams).unwrap_or(0),
+                "records": e.map(|x| x.records).unwrap_or(0),
+                "bytes_in": e.map(|x| x.bytes_in).unwrap_or(0),
+                "last_seen_ms": e.map(|x| x.last_seen_ms)
+                    .or_else(|| p.map(|x| x.last_seen_ms))
+                    .unwrap_or(0),
+                "state": state,
+                "first_seen_ms": p.map(|x| x.first_seen_ms).unwrap_or(0),
+                "approved_at_ms": p.map(|x| x.approved_at_ms).unwrap_or(0),
+                "note": p.and_then(|x| x.note.clone()),
+                "dropped_datagrams": p.map(|x| x.dropped_datagrams).unwrap_or(0),
+                "dropped_bytes": p.map(|x| x.dropped_bytes).unwrap_or(0),
             })
         })
         .collect();
-    Json(serde_json::json!({"items": items}))
+    // Surface attention-needed senders first: pending, then suspended/
+    // rejected, then active/approved by recent activity.
+    items.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "pending" => 0,
+            "suspended" => 1,
+            "rejected" => 2,
+            _ => 3,
+        };
+        rank(a["state"].as_str().unwrap_or(""))
+            .cmp(&rank(b["state"].as_str().unwrap_or("")))
+            .then(b["last_seen_ms"].as_u64().cmp(&a["last_seen_ms"].as_u64()))
+    });
+    Json(serde_json::json!({
+        "items": items,
+        "require_approval": require,
+    }))
+}
+
+/// POST /api/v1/exporters/{ip}/{action} — approve|suspend|reject|remove.
+/// Admin role only (enforced by middleware path check).
+async fn exporter_action(
+    State(st): State<Arc<AppState>>,
+    Path((ip_s, action)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::exporter_policy::ExporterState;
+    let ip: IpAddr = ip_s
+        .parse()
+        .map_err(|_| err(format!("bad exporter ip: {}", ip_s)))?;
+    let now = crate::metrics::now_ms();
+    let st_out = match action.as_str() {
+        "approve" => st.exporter_policy.set_state(ip, ExporterState::Approved, now, None),
+        "suspend" => st.exporter_policy.set_state(ip, ExporterState::Suspended, now, None),
+        "reject" => st.exporter_policy.set_state(ip, ExporterState::Rejected, now, None),
+        "remove" => {
+            let removed = st.exporter_policy.remove(ip);
+            return Ok(Json(serde_json::json!({"ok": removed, "ip": ip_s})));
+        }
+        _ => return Err(err("action must be approve|suspend|reject|remove")),
+    };
+    tracing::info!("exporter {} -> {}", ip, st_out.as_str());
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ip": ip_s,
+        "state": st_out.as_str(),
+    })))
 }
 
 async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1373,7 +1445,10 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "granularity", "in": "query"},
             ]}},
             "/api/v1/label_stats": {"get": {"summary": "Traffic per label"}},
-            "/api/v1/exporters": {"get": {"summary": "Exporter ingest stats"}},
+            "/api/v1/exporters": {"get": {"summary": "Exporter ingest stats + admission state (pending/approved/suspended/rejected)", "parameters": [
+                {"name": "require_approval", "in": "query", "description": "returned in payload"},
+            ]}},
+            "/api/v1/exporters/{ip}/{action}": {"post": {"summary": "Exporter admission action (admin): approve|suspend|reject|remove"}},
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
             "/api/v1/geo": {"get": {"summary": "Geo bubbles: lat/lon aggregates of recent raw flows (needs city MMDB + schema ≥4)", "parameters": [
@@ -1617,7 +1692,40 @@ async fn auth_mw(
         }
     }
 
-    next.run(req).await
+    // Sliding session renewal: cookie-authed GET/HEAD requests past half
+    // their TTL get a fresh Set-Cookie, so active users never hit the
+    // fixed expiry. Safe methods only — mutating endpoints set their own
+    // cookies (login/logout) and shouldn't get a second one appended.
+    let mut renew_cookie: Option<String> = None;
+    if matches!(req.method().as_str(), "GET" | "HEAD") {
+        if let Some(c) = cookie.as_deref() {
+            for part in c.split(';') {
+                let part = part.trim();
+                if let Some(tok) = part.strip_prefix("bgflow_session=") {
+                    if let Some((u, r, left)) = st.auth.verify_token(tok) {
+                        if left.saturating_mul(2) < st.auth.session_ttl() {
+                            let nt = st.auth.issue_token(&u, r);
+                            renew_cookie = Some(format!(
+                                "bgflow_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+                                nt,
+                                st.auth.session_ttl(),
+                                if st.auth.secure_cookie { "; Secure" } else { "" }
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut resp = next.run(req).await;
+    if let Some(c) = renew_cookie {
+        if let Ok(v) = header::HeaderValue::from_str(&c) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
 }
 
 /// Baseline security headers on every response.
@@ -1675,6 +1783,7 @@ pub fn router(st: Arc<AppState>) -> Router {
                 .layer(crate::qcache::SwrCacheLayer::new()),
         )
         .route("/api/v1/exporters", get(exporters))
+        .route("/api/v1/exporters/:ip/:action", post(exporter_action))
         .route("/api/v1/interfaces", get(interfaces))
         .route("/api/v1/labels", get(labels))
         .route("/api/v1/enrichers", get(enrichers))

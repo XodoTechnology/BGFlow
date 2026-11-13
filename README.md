@@ -29,6 +29,12 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   for filtering and classification; hot-reloadable via SIGHUP.
 - **Exporter names** — `[exporter_names]` maps exporter IPs to friendly
   names shown across the UI/API; filters accept IPs or names.
+- **Exporter admission control** — `[exporters] require_approval = true`
+  makes unknown senders start as `pending`: their datagrams are dropped
+  (and counted) until an admin approves them in the Exporters view or via
+  `POST /api/v1/exporters/{ip}/{approve|suspend|reject|remove}`. Trusted
+  IPs/CIDRs (`[exporters] trusted`) bypass approval; suspend/reject always
+  wins. State persists in `<data_dir>/exporters.json`.
 - **Threshold alerts** — rate-based rules over rollups (bytes/packets/flows/
   mbps per window, optional group-by + fold-change), log + metric + webhook.
 - **Analytics** — top-N by 15 dimensions (IP, ASN, org, port, protocol,
@@ -107,9 +113,10 @@ role = "admin"               # admin | viewer
 - The UI shows a login page when auth is configured; API clients can use
   the session cookie **or** HTTP Basic auth with the same credentials.
 - Login attempts are throttled per source IP (5 failures → lockout).
-- Session cookies are `HttpOnly` + `SameSite=Strict` (+ `Secure` under TLS).
-  `server.session_secret` pins the signing key across restarts; unset =
-  random per boot.
+- Session cookies are `HttpOnly` + `SameSite=Strict` (+ `Secure` under TLS)
+  and renew sliding while in use. `server.session_secret` pins the signing
+  key; unset = a generated key persisted in `<data_dir>/session.secret`,
+  so sessions survive restarts.
 - Legacy single-credential mode still works: `server.auth = "user:pass"`
   (always admin). Prefer `[[users]]` for anything beyond a toy deployment.
 - `/api/v1/health` and `/metrics` stay unauthenticated for scrapers —

@@ -3,6 +3,7 @@
 
 use crate::config::{proto_hint, InputConfig};
 use crate::enrich::{enrich_record, HttpEnrichers, MmdbGeo, StringTable};
+use crate::exporter_policy::{Decision, ExporterPolicy};
 use crate::metrics::{now_ms, Metrics};
 use crate::rules::Ruleset;
 use bgflow_netflow::{parse_datagram, IpfixTcpDecoder, ProtoHint, SessionState};
@@ -21,6 +22,7 @@ pub struct IngestShared {
     pub rules: Arc<Ruleset>,
     pub orgs: Arc<StringTable>,
     pub metrics: Arc<Metrics>,
+    pub policy: Arc<ExporterPolicy>,
 }
 
 /// Spawn listener tasks per configured input (UDP and/or TCP per `transport`).
@@ -76,13 +78,40 @@ impl IngestShared {
             rules: self.rules.clone(),
             orgs: self.orgs.clone(),
             metrics: self.metrics.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// Admission check: drop datagrams from exporters the policy rejects.
+/// Returns true when the packet may be processed.
+fn admitted(ip: IpAddr, bytes: usize, shared: &IngestShared) -> bool {
+    match shared.policy.decide(ip, now_ms()) {
+        Decision::Accept => true,
+        Decision::Drop(state) => {
+            // Still record the attempt so the exporters view shows the
+            // sender and its (dropped) volume — records=0 marks it.
+            shared.metrics.note_datagram(ip, bytes, 0);
+            shared.policy.note_drop(ip, 1, bytes as u64, now_ms());
+            shared
+                .metrics
+                .exporter_drops
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("exporter {} dropped ({})", ip, state.as_str());
+            false
         }
     }
 }
 
 /// Enrich + label + forward a single record (or count a drop).
-fn emit(rec: FlowRecord, tx: &mpsc::Sender<FlowRecord>, shared: &IngestShared) {
-    let mut rec = rec;
+fn emit(mut rec: FlowRecord, tx: &mpsc::Sender<FlowRecord>, shared: &IngestShared) {
+    // Sanity-clamp timestamps: broken exporter clocks (or malformed
+    // records) can produce ts far outside any query window, making the
+    // flow invisible forever. Receipt time is the safest fallback.
+    let now = now_ms();
+    if rec.ts_ms > now + 600_000 || rec.ts_ms + 2_592_000_000 < now {
+        rec.ts_ms = now;
+    }
     enrich_record(&mut rec, &shared.geo, &shared.http);
     rec.label_id = shared.rules.label(&rec, |id| shared.orgs.name(id));
     if tx.try_send(rec).is_err() {
@@ -131,6 +160,9 @@ async fn run_udp(
             }
         };
         if !allowed.is_empty() && !allowed.contains(&src.ip()) {
+            continue;
+        }
+        if !admitted(src.ip(), n, &shared) {
             continue;
         }
         let payload = &buf[..n];
@@ -182,6 +214,11 @@ async fn run_tcp(
             drop(sock);
             continue;
         }
+        // Shed non-admitted exporters before spending a connection permit.
+        if !admitted(peer.ip(), 0, &shared) {
+            drop(sock);
+            continue;
+        }
         // try_acquire: shed load instantly rather than queueing accepts.
         let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
             tracing::warn!("tcp {}: connection limit reached, dropping {}", cfg.listen, peer);
@@ -220,6 +257,11 @@ async fn handle_tcp_conn(
         };
         if n == 0 {
             return Ok(()); // peer closed
+        }
+        // Re-check per batch: an exporter suspended mid-connection stops
+        // producing records without needing a reconnect.
+        if !admitted(exporter, n, &shared) {
+            continue;
         }
         let now = now_ms();
         let records = dec.feed(&buf[..n], now);

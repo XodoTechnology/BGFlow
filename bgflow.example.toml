@@ -243,6 +243,17 @@ dst_port = 53
 # "10.0.0.1" = "edge-rtr-1"
 # "10.0.0.2" = "core-rtr"
 
+# --- Exporter admission control ----------------------------------------------
+# When require_approval = true, any exporter IP not seen before starts as
+# "pending": its datagrams are dropped (and counted) until an admin
+# approves it — via the Exporters view buttons or
+#   POST /api/v1/exporters/<ip>/approve        (also: suspend|reject|remove)
+# Suspended/rejected exporters are always dropped. Decisions persist in
+# <data_dir>/exporters.json. "trusted" IPs bypass approval entirely.
+# [exporters]
+# require_approval = true
+# trusted = ["10.0.0.1", "192.168.1.1"]
+
 # [[users]]
 # name = "admin"
 # password_hash = "pbkdf2-sha256$600000$<salt_b64>$<hash_b64>"

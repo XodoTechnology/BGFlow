@@ -32,6 +32,9 @@ pub struct Metrics {
     /// retention). The writer survives these — this counter is the signal.
     pub write_errors: AtomicU64,
     pub unknown_proto: AtomicU64,
+    /// Datagrams dropped by the exporter admission policy (pending,
+    /// suspended, rejected senders).
+    pub exporter_drops: AtomicU64,
     pub flushes: AtomicU64,
     pub bytes_stored: AtomicU64,
     pub rows_stored: AtomicU64,
@@ -82,6 +85,8 @@ impl Metrics {
         s.push_str(&format!("bgflow_write_errors_total {}\n", g(&self.write_errors)));
         s.push_str("# HELP bgflow_unknown_proto_total Datagrams with unknown protocol\n# TYPE bgflow_unknown_proto_total counter\n");
         s.push_str(&format!("bgflow_unknown_proto_total {}\n", g(&self.unknown_proto)));
+        s.push_str("# HELP bgflow_exporter_drops_total Datagrams dropped by exporter policy\n# TYPE bgflow_exporter_drops_total counter\n");
+        s.push_str(&format!("bgflow_exporter_drops_total {}\n", g(&self.exporter_drops)));
         s.push_str("# HELP bgflow_enrich_http_lookups_total HTTP enrichment lookups\n# TYPE bgflow_enrich_http_lookups_total counter\n");
         s.push_str(&format!("bgflow_enrich_http_lookups_total {}\n", g(&self.http_lookups)));
         s.push_str("# HELP bgflow_enrich_http_errors_total HTTP enrichment errors\n# TYPE bgflow_enrich_http_errors_total counter\n");

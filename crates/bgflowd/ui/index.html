@@ -208,10 +208,10 @@ function ago(ms){if(!ms)return'-';const s=(Date.now()-ms)/1000;if(s<60)return Ma
 const API_TIMEOUT=20000;
 let ME=null; // {user,role,auth} or {open:true}
 function showLogin(){$('#login').style.display='flex';setTimeout(()=>$('#lu')?.focus(),50)}
-async function api(p){
+async function api(p,opt){
   const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),API_TIMEOUT);
   let r;
-  try{r=await fetch(p,{signal:ctl.signal})}
+  try{r=await fetch(p,{method:(opt&&opt.method)||'GET',signal:ctl.signal})}
   catch(e){clearTimeout(to);throw new Error(e.name==='AbortError'?'request timed out ('+API_TIMEOUT/1000+'s)':e.message)}
   clearTimeout(to);
   if(r.status===401&&ME&&!ME.open){showLogin();throw new Error('authentication required')}
@@ -620,14 +620,40 @@ function ifLabel(i){if(!i)return'—';const n=ifNames[i];return n?`${esc(n)} <sp
 async function vExporters(){
   const [ex,st]=await Promise.all([api('/api/v1/exporters'),api('/api/v1/status')]);
   loadExpNames();
-  const rows=(ex.items||[]).map(e=>`<tr><td class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${e.name?`<b>${esc(e.name)}</b> <span class="muted">${esc(e.ip)}</span>`:esc(e.ip)}</td><td class="num">${fmtN(e.datagrams)}</td><td class="num">${fmtN(e.records)}</td><td class="num">${fmtB(e.bytes_in)}</td><td class="muted">${ago(e.last_seen_ms)}</td></tr>`).join('');
+  const isAdmin=ME&&ME.role==='admin';
+  const stateBadge=s=>{
+    const m={pending:'<span class="tag" style="background:#7c5a10;color:#ffd97a">PENDING</span>',approved:'<span class="tag" style="background:#14532d;color:#86efac">APPROVED</span>',active:'<span class="tag" style="background:#14532d;color:#86efac">ACTIVE</span>',trusted:'<span class="tag" style="background:#1e3a5f;color:#93c5fd">TRUSTED</span>',suspended:'<span class="tag" style="background:#5b1a1a;color:#fca5a5">SUSPENDED</span>',rejected:'<span class="tag" style="background:#3f3f46;color:#a1a1aa">REJECTED</span>'};
+    return m[s]||`<span class="tag">${esc(s)}</span>`;
+  };
+  const acts=e=>{
+    if(!isAdmin)return '';
+    const ip=encodeURIComponent(e.ip);
+    const btn=(a,l,dis)=>`<button class="btn" style="padding:2px 8px;font-size:11px" ${dis?'disabled':''} onclick="expAction('${ip}','${a}')">${l}</button>`;
+    if(e.state==='pending')return btn('approve','Approve')+' '+btn('reject','Reject');
+    if(e.state==='approved'||e.state==='active')return btn('suspend','Suspend')+' '+btn('reject','Reject');
+    if(e.state==='trusted')return btn('suspend','Suspend')+' '+btn('reject','Reject');
+    if(e.state==='suspended'||e.state==='rejected')return btn('approve','Approve')+' '+btn('remove','Remove');
+    return '';
+  };
+  const rows=(ex.items||[]).map(e=>`<tr${e.state==='pending'?' style="background:rgba(251,191,36,.06)"':''}>
+    <td><span class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${stateBadge(e.state)} ${e.name?`<b>${esc(e.name)}</b> <span class="muted">${esc(e.ip)}</span>`:esc(e.ip)}</span>${e.note?` <span class="muted">· ${esc(e.note)}</span>`:''}</td>
+    <td class="num">${fmtN(e.datagrams)}</td><td class="num">${fmtN(e.records)}</td><td class="num">${fmtB(e.bytes_in)}</td>
+    ${e.dropped_datagrams?`<td class="num" style="color:var(--red)" title="${fmtB(e.dropped_bytes)} dropped">${fmtN(e.dropped_datagrams)} dropped</td>`:'<td class="num muted">-</td>'}
+    <td class="muted">${ago(e.last_seen_ms)}</td>
+    <td>${acts(e)}</td></tr>`).join('');
   content.innerHTML=filterBar()+`<div class="cards">
     <div class="card"><div class="lbl">Exporters</div><div class="val">${(ex.items||[]).length}</div></div>
+    <div class="card"><div class="lbl">Pending approval</div><div class="val" style="${(ex.items||[]).some(e=>e.state==='pending')?'color:#fbbf24':''}">${(ex.items||[]).filter(e=>e.state==='pending').length}</div></div>
     <div class="card"><div class="lbl">Uptime</div><div class="val">${Math.floor(st.status.uptime_secs/60)}m</div></div>
     <div class="card"><div class="lbl">Flow segments</div><div class="val">${st.status.flow_segments}</div><div class="sub">${fmtB(st.status.flow_bytes)}</div></div>
     <div class="card"><div class="lbl">Rollup + hourly</div><div class="val">${st.status.rollup_segments}+${st.status.hourly_segments}</div><div class="sub">${fmtB(st.status.rollup_bytes+st.status.hourly_bytes)}</div></div></div>
-   <div class="panel"><h3>Exporters <span class="muted" style="text-transform:none">(click to filter all views)</span></h3><table><tr><th>IP</th><th class="num">Datagrams</th><th class="num">Records</th><th class="num">Bytes in</th><th>Last seen</th></tr>${rows||'<tr><td colspan=5 class=muted>No exporters seen yet</td></tr>'}</table></div>`;
+   ${ex.require_approval?'<div class="hint" style="color:#fbbf24">Exporter approval is ON — new senders appear as PENDING and their flows are dropped until approved.</div>':''}
+   <div class="panel"><h3>Exporters <span class="muted" style="text-transform:none">(click IP to filter all views · ${isAdmin?'admin: approve/suspend/reject':'read-only'})</span></h3><table><tr><th>IP</th><th class="num">Datagrams</th><th class="num">Records</th><th class="num">Bytes in</th><th class="num">Dropped</th><th>Last seen</th>${isAdmin?'<th></th>':''}</tr>${rows||'<tr><td colspan=7 class=muted>No exporters seen yet</td></tr>'}</table></div>`;
   readFilters();
+}
+async function expAction(ip,action){
+  try{await api(`/api/v1/exporters/${ip}/${action}`,{method:'POST'});toast(`${ip}: ${action} ok`);load(true)}
+  catch(e){toast('action failed: '+e.message)}
 }
 
 async function vLabels(){

@@ -8,6 +8,7 @@ mod backup;
 mod config;
 mod demo;
 mod enrich;
+mod exporter_policy;
 mod geoip;
 mod ingest;
 mod metrics;
@@ -157,10 +158,22 @@ async fn main() -> Result<()> {
     if !users.is_empty() {
         tracing::info!("auth: {} user(s) configured", users.len());
     }
+    // Session secret: explicit config wins; otherwise persist a generated
+    // one in the data dir so restarts don't log everyone out.
+    let session_secret = cfg
+        .server
+        .session_secret
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            auth::AuthState::load_or_create_secret(
+                &cfg.storage.data_dir.join("session.secret"),
+            )
+        });
     let auth = Arc::new(AuthState::new(
         users,
         cfg.server.auth.clone(),
-        cfg.server.session_secret.clone(),
+        session_secret,
         cfg.server.session_ttl_secs,
         tls_enabled,
     ));
@@ -196,6 +209,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Exporter admission policy: new senders pend for admin approval when
+    // [exporters] require_approval is set; state persists in data dir.
+    let exporter_policy = Arc::new(exporter_policy::ExporterPolicy::open(
+        cfg.storage.data_dir.join("exporters.json"),
+        cfg.exporters.require_approval,
+        cfg.exporters.trusted.clone(),
+    ));
+    if cfg.exporters.require_approval {
+        tracing::info!(
+            "exporter approval required ({} trusted IP(s) bypass)",
+            cfg.exporters.trusted.len()
+        );
+    }
+
     ingest::spawn_all(
         cfg.inputs.clone(),
         tx.clone(),
@@ -205,6 +232,7 @@ async fn main() -> Result<()> {
             rules: rules.clone(),
             orgs: orgs.clone(),
             metrics: metrics.clone(),
+            policy: exporter_policy.clone(),
         },
     );
 
@@ -230,6 +258,7 @@ async fn main() -> Result<()> {
         auth: auth.clone(),
         alerts: alerts_cfg.clone(),
         geo: geo.clone(),
+        exporter_policy: exporter_policy.clone(),
     });
 
     // MMDB maintenance: hot-swap readers when .mmdb files change on disk,
@@ -260,6 +289,7 @@ async fn main() -> Result<()> {
         config: Arc::new(cfg.clone()),
         auth: auth.clone(),
         admin: admin.clone(),
+        exporter_policy: exporter_policy.clone(),
     });
 
     // Alert evaluation loop (reloadable; no-op scan when no rules configured).

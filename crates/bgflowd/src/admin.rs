@@ -23,6 +23,9 @@ pub struct AdminShared {
     /// MMDB geo readers — swapped on reload so geoip config/path changes
     /// and replaced database files apply without a restart.
     pub geo: Arc<MmdbGeo>,
+    /// Exporter admission policy — knobs (require_approval, trusted)
+    /// refresh on reload; learned entries are untouched.
+    pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -86,6 +89,10 @@ impl AdminShared {
         // MMDB readers: rebuild from the (possibly new) geoip config.
         self.geo.swap(&cfg.geoip);
         rep.geo_dbs = self.geo.db_count();
+
+        // Exporter policy knobs (entries themselves persist untouched).
+        self.exporter_policy
+            .set_knobs(cfg.exporters.require_approval, cfg.exporters.trusted.clone());
 
         tracing::info!(
             "config reloaded: {} rules, {} enrichers, {} exporter names, {} users, {} alert rules, {} geo db(s)",
