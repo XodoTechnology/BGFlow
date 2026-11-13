@@ -1017,7 +1017,12 @@ async fn conversations(
     // Conversation keys are near-unique per flow — millions of entries.
     // Key-sharded parallel aggregation: each key lives in exactly one
     // shard, so memory equals a single map (not one per worker).
-    let needed = query::rollup_needed(&f, &["src_ip", "dst_ip", "src_port", "dst_port", "proto"]);
+    let needed = query::rollup_needed(
+        &f,
+        &[
+            "src_ip", "dst_ip", "src_port", "dst_port", "proto", "src_asn", "dst_asn",
+        ],
+    );
     let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
@@ -1035,6 +1040,8 @@ async fn conversations(
                     r.src_port(),
                     r.dst_port(),
                     r.protocol(),
+                    r.src_asn(),
+                    r.dst_asn(),
                 ),
                 Agg {
                     bytes: r.bytes(),
@@ -1053,11 +1060,12 @@ async fn conversations(
     let rows = shard_top(shards, limit);
     let out: Vec<_> = rows
         .into_iter()
-        .map(|((s, d, sp, dp, p), a)| {
+        .map(|((s, d, sp, dp, p, sa, da), a)| {
             serde_json::json!({
                 "src_ip": bgflow_types::ip_string(s),
                 "dst_ip": bgflow_types::ip_string(d),
                 "src_port": sp, "dst_port": dp,
+                "src_asn": sa, "dst_asn": da,
                 "protocol": p, "protocol_name": bgflow_types::protocol_name(p),
                 "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
             })

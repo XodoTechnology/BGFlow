@@ -277,10 +277,10 @@ const PCOL={TCP:'#3b82f6',UDP:'#22c55e',ICMP:'#f59e0b','ICMPv6':'#f59e0b',GRE:'#
 function protoBadge(n){return `<span class="pbadge" style="--pc:${PCOL[n]||'#64748b'}">${esc(n)}</span>`}
 // dim-aware key rendering: flags, proto badges, ipver/asn styling
 // org name or country code → flag when it's a 2-letter country code
-function ocCell(v){v=v||'';return /^[A-Z]{2}$/.test(v)?`<span class="flg">${flag(v)}</span>${esc(v)}`:esc(v)}
+function ocCell(v){v=v||'';return /^[A-Z]{2}$/.test(v)?countryHtml(v):esc(v)}
 function dimLabel(dim,key){
   const k=typeof key==='object'?JSON.stringify(key):String(key??'');
-  if(dim.includes('country'))return `<span class="flg">${flag(k)}</span>${esc(k)}`;
+  if(dim.includes('country'))return countryHtml(k);
   if(dim==='proto')return protoBadge(k);
   if(dim.includes('ipver')){const v6=/6/.test(k);return `<span class="vbadge${v6?' v6':''}">${v6?'IPv6':'IPv4'}</span>`}
   if(dim.includes('asn'))return k==='-'?'-':`<span class="asn" data-asn="${esc(k)}"><span class="muted">AS</span>${esc(k)}</span>`;
@@ -293,6 +293,14 @@ function looksIp(s){return typeof s==='string'&&/^[0-9a-fA-F.:]+$/.test(s)&&s.le
 const PORT_NAMES={20:'FTP-data',21:'FTP',22:'SSH',23:'Telnet',25:'SMTP',53:'DNS',67:'DHCP',68:'DHCP',69:'TFTP',80:'HTTP',110:'POP3',123:'NTP',135:'RPC',137:'NetBIOS',138:'NetBIOS',139:'NetBIOS',143:'IMAP',161:'SNMP',162:'SNMP-trap',389:'LDAP',443:'HTTPS',445:'SMB',465:'SMTPS',514:'Syslog',515:'Printer',520:'RIP',587:'SMTP-sub',631:'IPP',636:'LDAPS',873:'RSync',902:'VMware',989:'FTPS-data',990:'FTPS',993:'IMAPS',995:'POP3S',1025:'MSMQ',1080:'SOCKS',1194:'OpenVPN',1433:'MSSQL',1434:'MSSQL-udp',1521:'Oracle',1701:'L2TP',1723:'PPTP',1812:'RADIUS',1813:'RADIUS-acct',1883:'MQTT',2049:'NFS',2082:'cPanel',2083:'cPanel-ssl',2086:'WHM',2087:'WHM-ssl',2375:'Docker',2376:'Docker-TLS',2483:'Oracle-https',3000:'Grafana',3128:'Squid',3260:'iSCSI',3306:'MySQL',3389:'RDP',3690:'SVN',4369:'EPMD',4443:'HTTPS-alt',4500:'IPsec-nat',4567:'tram',4662:'EDONKEY',4786:'GENEVE',4848:'wss?',5000:'UPnP',5001:'Synology',5060:'SIP',5061:'SIPS',5222:'XMPP',5432:'PostgreSQL',5601:'Kibana',5672:'AMQP',5718:'memcached',5900:'VNC',5938:'TeamViewer',5985:'WinRM',5986:'WinRM-TLS',6000:'X11',6379:'Redis',6443:'K8s-API',6667:'IRC',7001:'WebLogic',7070:'RTSP-alt',7474:'Neo4j',7547:'TR-069',7777:'game?',8000:'HTTP-alt',8008:'HTTP-alt',8009:'AJP',8080:'HTTP-proxy',8081:'HTTP-alt',8086:'InfluxDB',8088:'HTTP-alt',8090:'Confluence',8091:'Couchbase',8161:'ActiveMQ',8200:'Vault',8222:'Docker-swarm',8333:'Bitcoin',8400:'Asterisk',8443:'HTTPS-alt',8500:'Consul',8600:'iSCSI',8834:'Nessus',8883:'MQTT-TLS',8888:'HTTP-alt',8983:'Solr',9000:'PHP-FPM',9001:'Portainer',9042:'Cassandra',9090:'Prometheus',9091:'Cockpit',9092:'Kafka',9100:'Node-Exporter',9200:'Elasticsearch',9300:'ES-transport',9418:'Git',9999:'mgmt',10000:'Webmin',11211:'Memcached',15672:'RabbitMQ-mgmt',27017:'MongoDB',27018:'MongoDB-shard',28017:'Mongo-http',50000:'SAP',50070:'Hadoop-NN',60010:'HBase',7077:'Spark'};
 function portName(p){return PORT_NAMES[Number(p)]||''}
 function portHtml(p){const n=portName(p);return n?`${esc(p)} <span class="muted" style="font-size:10px">${esc(n)}</span>`:esc(p)}
+const COUNTRY_NAMES={"AW":"Aruba","AF":"Afghanistan","AO":"Angola","AI":"Anguilla","AX":"Åland Islands","AL":"Albania","AD":"Andorra","AE":"United Arab Emirates","AR":"Argentina","AM":"Armenia","AS":"American Samoa","AQ":"Antarctica","TF":"French Southern Territories","AG":"Antigua and Barbuda","AU":"Australia","AT":"Austria","AZ":"Azerbaijan","BI":"Burundi","BE":"Belgium","BJ":"Benin","BQ":"Bonaire, Sint Eustatius and Saba","BF":"Burkina Faso","BD":"Bangladesh","BG":"Bulgaria","BH":"Bahrain","BS":"Bahamas","BA":"Bosnia and Herzegovina","BL":"Saint Barthélemy","BY":"Belarus","BZ":"Belize","BM":"Bermuda","BO":"Bolivia, Plurinational State of","BR":"Brazil","BB":"Barbados","BN":"Brunei Darussalam","BT":"Bhutan","BV":"Bouvet Island","BW":"Botswana","CF":"Central African Republic","CA":"Canada","CC":"Cocos (Keeling) Islands","CH":"Switzerland","CL":"Chile","CN":"China","CI":"Côte d'Ivoire","CM":"Cameroon","CD":"Congo, The Democratic Republic of the","CG":"Congo","CK":"Cook Islands","CO":"Colombia","KM":"Comoros","CV":"Cabo Verde","CR":"Costa Rica","CU":"Cuba","CW":"Curaçao","CX":"Christmas Island","KY":"Cayman Islands","CY":"Cyprus","CZ":"Czechia","DE":"Germany","DJ":"Djibouti","DM":"Dominica","DK":"Denmark","DO":"Dominican Republic","DZ":"Algeria","EC":"Ecuador","EG":"Egypt","ER":"Eritrea","EH":"Western Sahara","ES":"Spain","EE":"Estonia","ET":"Ethiopia","FI":"Finland","FJ":"Fiji","FK":"Falkland Islands (Malvinas)","FR":"France","FO":"Faroe Islands","FM":"Micronesia, Federated States of","GA":"Gabon","GB":"United Kingdom","GE":"Georgia","GG":"Guernsey","GH":"Ghana","GI":"Gibraltar","GN":"Guinea","GP":"Guadeloupe","GM":"Gambia","GW":"Guinea-Bissau","GQ":"Equatorial Guinea","GR":"Greece","GD":"Grenada","GL":"Greenland","GT":"Guatemala","GF":"French Guiana","GU":"Guam","GY":"Guyana","HK":"Hong Kong","HM":"Heard Island and McDonald Islands","HN":"Honduras","HR":"Croatia","HT":"Haiti","HU":"Hungary","ID":"Indonesia","IM":"Isle of Man","IN":"India","IO":"British Indian Ocean Territory","IE":"Ireland","IR":"Iran, Islamic Republic of","IQ":"Iraq","IS":"Iceland","IL":"Israel","IT":"Italy","JM":"Jamaica","JE":"Jersey","JO":"Jordan","JP":"Japan","KZ":"Kazakhstan","KE":"Kenya","KG":"Kyrgyzstan","KH":"Cambodia","KI":"Kiribati","KN":"Saint Kitts and Nevis","KR":"Korea, Republic of","KW":"Kuwait","LA":"Lao People's Democratic Republic","LB":"Lebanon","LR":"Liberia","LY":"Libya","LC":"Saint Lucia","LI":"Liechtenstein","LK":"Sri Lanka","LS":"Lesotho","LT":"Lithuania","LU":"Luxembourg","LV":"Latvia","MO":"Macao","MF":"Saint Martin (French part)","MA":"Morocco","MC":"Monaco","MD":"Moldova, Republic of","MG":"Madagascar","MV":"Maldives","MX":"Mexico","MH":"Marshall Islands","MK":"North Macedonia","ML":"Mali","MT":"Malta","MM":"Myanmar","ME":"Montenegro","MN":"Mongolia","MP":"Northern Mariana Islands","MZ":"Mozambique","MR":"Mauritania","MS":"Montserrat","MQ":"Martinique","MU":"Mauritius","MW":"Malawi","MY":"Malaysia","YT":"Mayotte","NA":"Namibia","NC":"New Caledonia","NE":"Niger","NF":"Norfolk Island","NG":"Nigeria","NI":"Nicaragua","NU":"Niue","NL":"Netherlands","NO":"Norway","NP":"Nepal","NR":"Nauru","NZ":"New Zealand","OM":"Oman","PK":"Pakistan","PA":"Panama","PN":"Pitcairn","PE":"Peru","PH":"Philippines","PW":"Palau","PG":"Papua New Guinea","PL":"Poland","PR":"Puerto Rico","KP":"Korea, Democratic People's Republic of","PT":"Portugal","PY":"Paraguay","PS":"Palestine, State of","PF":"French Polynesia","QA":"Qatar","RE":"Réunion","RO":"Romania","RU":"Russian Federation","RW":"Rwanda","SA":"Saudi Arabia","SD":"Sudan","SN":"Senegal","SG":"Singapore","GS":"South Georgia and the South Sandwich Islands","SH":"Saint Helena, Ascension and Tristan da Cunha","SJ":"Svalbard and Jan Mayen","SB":"Solomon Islands","SL":"Sierra Leone","SV":"El Salvador","SM":"San Marino","SO":"Somalia","PM":"Saint Pierre and Miquelon","RS":"Serbia","SS":"South Sudan","ST":"Sao Tome and Principe","SR":"Suriname","SK":"Slovakia","SI":"Slovenia","SE":"Sweden","SZ":"Eswatini","SX":"Sint Maarten (Dutch part)","SC":"Seychelles","SY":"Syrian Arab Republic","TC":"Turks and Caicos Islands","TD":"Chad","TG":"Togo","TH":"Thailand","TJ":"Tajikistan","TK":"Tokelau","TM":"Turkmenistan","TL":"Timor-Leste","TO":"Tonga","TT":"Trinidad and Tobago","TN":"Tunisia","TR":"Türkiye","TV":"Tuvalu","TW":"Taiwan, Province of China","TZ":"Tanzania, United Republic of","UG":"Uganda","UA":"Ukraine","UM":"United States Minor Outlying Islands","UY":"Uruguay","US":"United States","UZ":"Uzbekistan","VA":"Holy See (Vatican City State)","VC":"Saint Vincent and the Grenadines","VE":"Venezuela, Bolivarian Republic of","VG":"Virgin Islands, British","VI":"Virgin Islands, U.S.","VN":"Viet Nam","VU":"Vanuatu","WF":"Wallis and Futuna","WS":"Samoa","YE":"Yemen","ZA":"South Africa","ZM":"Zambia","ZW":"Zimbabwe","UK":"United Kingdom"};
+function countryName(cc){return COUNTRY_NAMES[String(cc||'').toUpperCase()]||''}
+function countryHtml(cc){
+  const c=String(cc||'').toUpperCase();
+  if(!/^[A-Z]{2}$/.test(c))return esc(cc);
+  const n=COUNTRY_NAMES[c];
+  return `<span class="flg" title="${c}">${flag(c)}</span>${n?esc(n):esc(c)}`;
+}
 
 // ---------- enrichment hover cards + ASN names ----------
 const _ipCache={};
@@ -307,7 +315,7 @@ function ipTipHtml(ip,d){
   if(d.ptr)L.push(`<div class="ipt-sub">${esc(d.ptr)}</div>`);
   const asn=m.asn?`AS${m.asn}`:'';
   if(asn||m.org)L.push(`<div>${asn?`<b>${esc(asn)}</b>`:''} ${m.org?`<span class="ipt-org">${esc(m.org)}</span>`:''}</div>`);
-  if(m.country)L.push(`<div class="ipt-sub">${flag(m.country)} ${esc(m.country)}${m.city?` · ${esc(m.city)}`:''}${m.region?`, ${esc(m.region)}`:''}</div>`);
+  if(m.country)L.push(`<div class="ipt-sub">${countryHtml(m.country)}${m.city?` · ${esc(m.city)}`:''}${m.region?`, ${esc(m.region)}`:''}</div>`);
   if(m.lat&&m.lon)L.push(`<div class="ipt-sub">${Number(m.lat).toFixed(3)}, ${Number(m.lon).toFixed(3)}</div>`);
   return L.join('');
 }
@@ -631,7 +639,7 @@ async function vCountries(){
     api('/api/v1/top?'+q({by:'src_country',limit:n})),
     api('/api/v1/top?'+q({by:'dst_country',limit:n}))]);
   const max=Math.max(...(a.items||[]).map(t=>t.bytes),...(b.items||[]).map(t=>t.bytes),1);
-  const row=(t,side)=>{const pct=t.bytes/max*100;return `<tr><td><span class="clickable" onclick="setFilter('${side}','${esc(t.key)}')"><span class="flg">${flag(t.key)}</span>${esc(t.key)}</span></td>
+  const row=(t,side)=>{const pct=t.bytes/max*100;return `<tr><td><span class="clickable" onclick="setFilter('${side}','${esc(t.key)}')">${countryHtml(t.key)}</span></td>
     <td style="width:40%"><span class="heat" style="width:${Math.max(2,pct)}%;background:linear-gradient(90deg,#1d4ed8,#22d3ee)"></span></td>
     <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`};
   const ta=(a.items||[]).map(t=>row(t,'src_country')).join(''),tb=(b.items||[]).map(t=>row(t,'dst_country')).join('');
@@ -643,9 +651,10 @@ async function vConv(){
   content.innerHTML=filterBar('<span class="hint" style="margin:0">click IPs to filter</span>')+'<div class="panel"><h3>Top Conversations</h3><div id="tbl"></div></div>';
   readFilters();
   const data=await api('/api/v1/conversations?'+q({limit:50}));
+  const asnLine=a=>a?`<div class="muted" style="font-size:11px"><span class="asn" data-asn="${a}">AS${a}</span></div>`:'';
   const rows=(data.items||[]).map(c=>`<tr>
-    <td><span class="clickable" data-ip="${esc(c.src_ip)}" onclick="setFilter('src','${esc(c.src_ip)}')">${esc(c.src_ip)}</span><span class="muted" title="${esc(portName(c.src_port))}">:${c.src_port}</span></td>
-    <td><span class="clickable" data-ip="${esc(c.dst_ip)}" onclick="setFilter('dst','${esc(c.dst_ip)}')">${esc(c.dst_ip)}</span><span class="muted" title="${esc(portName(c.dst_port))}">:${c.dst_port}</span></td>
+    <td><span class="clickable" data-ip="${esc(c.src_ip)}" onclick="setFilter('src','${esc(c.src_ip)}')">${esc(c.src_ip)}</span><span class="muted" title="${esc(portName(c.src_port))}">:${c.src_port}</span>${asnLine(c.src_asn)}</td>
+    <td><span class="clickable" data-ip="${esc(c.dst_ip)}" onclick="setFilter('dst','${esc(c.dst_ip)}')">${esc(c.dst_ip)}</span><span class="muted" title="${esc(portName(c.dst_port))}">:${c.dst_port}</span>${asnLine(c.dst_asn)}</td>
     <td>${protoBadge(c.protocol_name)}</td>
     <td class="num">${fmtB(c.bytes)}</td><td class="num">${fmtN(c.packets)}</td><td class="num">${fmtN(c.flows)}</td></tr>`).join('');
   $('#tbl').innerHTML=`<table><tr><th>Source</th><th>Destination</th><th>Proto</th><th class="num">Bytes</th><th class="num">Packets</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=6 class=muted>No data</td></tr>'}</table>`;
@@ -751,21 +760,25 @@ async function vGeo(){
     const W=cv.clientWidth,H=cv.clientHeight;cv.width=W*devicePixelRatio;cv.height=H*devicePixelRatio;
     ctx2.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
     ctx2.clearRect(0,0,W,H);
+    // Equirectangular with correct 2:1 world aspect — scale is degrees→px,
+    // letterboxed inside the canvas so shapes aren't stretched.
+    const sc=Math.min(W/360,H/180),ox=(W-360*sc)/2,oy=(H-180*sc)/2;
+    const px=lon=>ox+(lon+180)*sc, py=lat=>oy+(90-lat)*sc;
     // world map land (normalized 0..1 path coords)
     try{
       const land=new Path2D(WORLD_PATH);
-      ctx2.save();ctx2.scale(W,H);
+      ctx2.save();ctx2.translate(ox,oy);ctx2.scale(360*sc,180*sc);
       ctx2.fillStyle='rgba(110,130,165,0.13)';ctx2.fill(land,'evenodd');
       ctx2.strokeStyle='rgba(110,130,165,0.30)';ctx2.lineWidth=0.0011;ctx2.stroke(land);
       ctx2.restore();
     }catch(e){}
-    // equirectangular graticule
+    // graticule
     ctx2.strokeStyle='var(--border,#333)';ctx2.lineWidth=1;ctx2.globalAlpha=0.5;
-    for(let lo=-180;lo<=180;lo+=30){const x=(lo+180)/360*W;ctx2.beginPath();ctx2.moveTo(x,0);ctx2.lineTo(x,H);ctx2.stroke()}
-    for(let la=-60;la<=60;la+=30){const y=(90-la)/180*H;ctx2.beginPath();ctx2.moveTo(0,y);ctx2.lineTo(W,y);ctx2.stroke()}
+    for(let lo=-180;lo<=180;lo+=30){const x=px(lo);ctx2.beginPath();ctx2.moveTo(x,oy);ctx2.lineTo(x,oy+180*sc);ctx2.stroke()}
+    for(let la=-60;la<=60;la+=30){const y=py(la);ctx2.beginPath();ctx2.moveTo(ox,y);ctx2.lineTo(ox+360*sc,y);ctx2.stroke()}
     ctx2.globalAlpha=1;
     const maxB=Math.max(1,...pts.map(p=>p.bytes||0));
-    cv._pts=pts.map(p=>({...p,x:(p.lon+180)/360*W,y:(90-p.lat)/180*H,r:3+Math.sqrt((p.bytes||0)/maxB)*22}));
+    cv._pts=pts.map(p=>({...p,x:px(p.lon),y:py(p.lat),r:3+Math.sqrt((p.bytes||0)/maxB)*22}));
     for(const p of cv._pts){
       ctx2.beginPath();ctx2.arc(p.x,p.y,p.r,0,7);
       ctx2.fillStyle='rgba(79,140,255,.35)';ctx2.fill();
@@ -918,7 +931,7 @@ function drawSankey(items){
   const hovSide=hov?hov.side:null,hovKey=hov?hov.key:null;
   const nodeLabel=(dim,k)=>{
     let s=k;
-    if(dim.includes('country'))s=flag(k)+k;
+    if(dim.includes('country'))s=flag(k);
     else if(dim.includes('asn'))s='AS'+k;
     return String(s).slice(0,Math.max(8,Math.floor(lblW/6.5)));
   };
