@@ -284,10 +284,15 @@ function dimLabel(dim,key){
   if(dim==='proto')return protoBadge(k);
   if(dim.includes('ipver')){const v6=/6/.test(k);return `<span class="vbadge${v6?' v6':''}">${v6?'IPv6':'IPv4'}</span>`}
   if(dim.includes('asn'))return k==='-'?'-':`<span class="asn" data-asn="${esc(k)}"><span class="muted">AS</span>${esc(k)}</span>`;
+  if(dim==='src_port'||dim==='dst_port')return portHtml(k);
   if((dim==='src_ip'||dim==='dst_ip'||dim==='exporter')&&looksIp(k))return `<span class="iplink" data-ip="${esc(k)}">${esc(k)}</span>`;
   return esc(k);
 }
 function looksIp(s){return typeof s==='string'&&/^[0-9a-fA-F.:]+$/.test(s)&&s.length<46&&/[.:]/.test(s)}
+// Well-known port → service name (IANA common assignments).
+const PORT_NAMES={20:'FTP-data',21:'FTP',22:'SSH',23:'Telnet',25:'SMTP',53:'DNS',67:'DHCP',68:'DHCP',69:'TFTP',80:'HTTP',110:'POP3',123:'NTP',135:'RPC',137:'NetBIOS',138:'NetBIOS',139:'NetBIOS',143:'IMAP',161:'SNMP',162:'SNMP-trap',389:'LDAP',443:'HTTPS',445:'SMB',465:'SMTPS',514:'Syslog',515:'Printer',520:'RIP',587:'SMTP-sub',631:'IPP',636:'LDAPS',873:'RSync',902:'VMware',989:'FTPS-data',990:'FTPS',993:'IMAPS',995:'POP3S',1025:'MSMQ',1080:'SOCKS',1194:'OpenVPN',1433:'MSSQL',1434:'MSSQL-udp',1521:'Oracle',1701:'L2TP',1723:'PPTP',1812:'RADIUS',1813:'RADIUS-acct',1883:'MQTT',2049:'NFS',2082:'cPanel',2083:'cPanel-ssl',2086:'WHM',2087:'WHM-ssl',2375:'Docker',2376:'Docker-TLS',2483:'Oracle-https',3000:'Grafana',3128:'Squid',3260:'iSCSI',3306:'MySQL',3389:'RDP',3690:'SVN',4369:'EPMD',4443:'HTTPS-alt',4500:'IPsec-nat',4567:'tram',4662:'EDONKEY',4786:'GENEVE',4848:'wss?',5000:'UPnP',5001:'Synology',5060:'SIP',5061:'SIPS',5222:'XMPP',5432:'PostgreSQL',5601:'Kibana',5672:'AMQP',5718:'memcached',5900:'VNC',5938:'TeamViewer',5985:'WinRM',5986:'WinRM-TLS',6000:'X11',6379:'Redis',6443:'K8s-API',6667:'IRC',7001:'WebLogic',7070:'RTSP-alt',7474:'Neo4j',7547:'TR-069',7777:'game?',8000:'HTTP-alt',8008:'HTTP-alt',8009:'AJP',8080:'HTTP-proxy',8081:'HTTP-alt',8086:'InfluxDB',8088:'HTTP-alt',8090:'Confluence',8091:'Couchbase',8161:'ActiveMQ',8200:'Vault',8222:'Docker-swarm',8333:'Bitcoin',8400:'Asterisk',8443:'HTTPS-alt',8500:'Consul',8600:'iSCSI',8834:'Nessus',8883:'MQTT-TLS',8888:'HTTP-alt',8983:'Solr',9000:'PHP-FPM',9001:'Portainer',9042:'Cassandra',9090:'Prometheus',9091:'Cockpit',9092:'Kafka',9100:'Node-Exporter',9200:'Elasticsearch',9300:'ES-transport',9418:'Git',9999:'mgmt',10000:'Webmin',11211:'Memcached',15672:'RabbitMQ-mgmt',27017:'MongoDB',27018:'MongoDB-shard',28017:'Mongo-http',50000:'SAP',50070:'Hadoop-NN',60010:'HBase',7077:'Spark'};
+function portName(p){return PORT_NAMES[Number(p)]||''}
+function portHtml(p){const n=portName(p);return n?`${esc(p)} <span class="muted" style="font-size:10px">${esc(n)}</span>`:esc(p)}
 
 // ---------- enrichment hover cards + ASN names ----------
 const _ipCache={};
@@ -403,10 +408,11 @@ async function load(silent){
 }
 
 // click-safe filter: value rides in data-k (esc handles HTML), JS reads it back
-function topTbl(items, fk){
+function topTbl(items, dim){
+  const fk=DIM2F[dim]||dim;
   return `<table><tr><th></th><th>Key</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${
     (items||[]).map((t,i)=>`<tr><td class="num muted">${i+1}</td>
-      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${esc(t.key)}</td>
+      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${dimLabel(dim,t.key)}</td>
       <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`).join('')
     ||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table>`;
 }
@@ -439,8 +445,8 @@ async function vOverview(){
          ${['1m','5m','15m','1h','6h','1d'].map(b=>`<option value="${b}" ${state.bucket===b?'selected':''}>${b}</option>`).join('')}
        </select></span></h3><canvas id="chart" style="height:280px"></canvas></div>
     <div class="grid2">
-      <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click to filter)</span></h3>${topTbl(s.items,'src')}</div>
-      <div class="panel"><h3>Top Destinations</h3>${topTbl(d.items,'dst')}</div>
+      <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click to filter)</span></h3>${topTbl(s.items,'src_ip')}</div>
+      <div class="panel"><h3>Top Destinations</h3>${topTbl(d.items,'dst_ip')}</div>
     </div>
     <div class="grid2">
       <div class="panel"><h3>Top Source ASNs</h3>${topTbl(sa.items,'src_asn')}</div>
@@ -448,7 +454,7 @@ async function vOverview(){
     </div>
     <div class="grid2">
       <div class="panel"><h3>By Protocol</h3><table><tr><th>Proto</th><th class="num">Flows</th><th class="num">Bytes</th><th class="num">Packets</th></tr>${protos||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table></div>
-      <div class="panel"><h3>Top Destination Ports</h3>${topTbl(dp.items,'dport')}</div>
+      <div class="panel"><h3>Top Destination Ports</h3>${topTbl(dp.items,'dst_port')}</div>
     </div>`;
   document.querySelectorAll('[data-m]').forEach(ch=>ch.onclick=()=>{state.metric=ch.dataset.m;document.querySelectorAll('[data-m]').forEach(x=>x.classList.toggle('on',x===ch));syncHash();drawChart(state.chartSeries)});
   const bb=$('#b_bucket');if(bb)bb.onchange=()=>{state.bucket=bb.value;load()};
@@ -569,8 +575,8 @@ async function vFlows(){
   _fl=data.flows||[];
   const rows=_fl.map((f,i)=>`<tr>
     <td class="muted clickable" title="click for detail" onclick="flowDetail(${i})">${f.ts?new Date(f.ts*1000).toLocaleTimeString():'-'}</td>
-    <td><span class="clickable" data-ip="${esc(f.src_ip)}" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted">:${f.src_port}</span></td>
-    <td><span class="clickable" data-ip="${esc(f.dst_ip)}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted">:${f.dst_port}</span></td>
+    <td><span class="clickable" data-ip="${esc(f.src_ip)}" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted" title="${esc(portName(f.src_port))}">:${f.src_port}</span></td>
+    <td><span class="clickable" data-ip="${esc(f.dst_ip)}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted" title="${esc(portName(f.dst_port))}">:${f.dst_port}</span></td>
     <td>${protoBadge(f.protocol_name||protoName(f.protocol))}</td>
     <td class="num">${fmtB(f.bytes)}</td><td class="num">${fmtN(f.packets)}</td>
     <td class="muted">${f.src_asn?`<span class="asn" data-asn="${f.src_asn}"><span class="muted">AS</span>${f.src_asn}</span>`:'-'} → ${f.dst_asn?`<span class="asn" data-asn="${f.dst_asn}"><span class="muted">AS</span>${f.dst_asn}</span>`:'-'}</td>
@@ -638,8 +644,8 @@ async function vConv(){
   readFilters();
   const data=await api('/api/v1/conversations?'+q({limit:50}));
   const rows=(data.items||[]).map(c=>`<tr>
-    <td><span class="clickable" data-ip="${esc(c.src_ip)}" onclick="setFilter('src','${esc(c.src_ip)}')">${esc(c.src_ip)}</span><span class="muted">:${c.src_port}</span></td>
-    <td><span class="clickable" data-ip="${esc(c.dst_ip)}" onclick="setFilter('dst','${esc(c.dst_ip)}')">${esc(c.dst_ip)}</span><span class="muted">:${c.dst_port}</span></td>
+    <td><span class="clickable" data-ip="${esc(c.src_ip)}" onclick="setFilter('src','${esc(c.src_ip)}')">${esc(c.src_ip)}</span><span class="muted" title="${esc(portName(c.src_port))}">:${c.src_port}</span></td>
+    <td><span class="clickable" data-ip="${esc(c.dst_ip)}" onclick="setFilter('dst','${esc(c.dst_ip)}')">${esc(c.dst_ip)}</span><span class="muted" title="${esc(portName(c.dst_port))}">:${c.dst_port}</span></td>
     <td>${protoBadge(c.protocol_name)}</td>
     <td class="num">${fmtB(c.bytes)}</td><td class="num">${fmtN(c.packets)}</td><td class="num">${fmtN(c.flows)}</td></tr>`).join('');
   $('#tbl').innerHTML=`<table><tr><th>Source</th><th>Destination</th><th>Proto</th><th class="num">Bytes</th><th class="num">Packets</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=6 class=muted>No data</td></tr>'}</table>`;
@@ -657,7 +663,7 @@ async function vAnomalies(){
   const data=await api('/api/v1/anomalies?'+q({by,sigma:sig,limit:50,compare:1}));
   const maxZ=(data.items||[])[0]?.zscore||1;
   const rows=(data.items||[]).map(a=>`<tr><td class="muted">${fmtT(a.t*1000)}</td>
-    <td class="clickable"${looksIp(String(a.key))?` data-ip="${esc(a.key)}"`:''} onclick='clickDimRaw(${JSON.stringify(by)},${a.key_raw},${JSON.stringify(String(a.key))})'>${a.is_new?'<span class="tag" style="margin-right:5px">NEW</span>':''}${esc(a.key)}</td>
+    <td class="clickable" onclick='clickDimRaw(${JSON.stringify(by)},${a.key_raw},${JSON.stringify(String(a.key))})'>${a.is_new?'<span class="tag" style="margin-right:5px">NEW</span>':''}${dimLabel(by,a.key)}</td>
     <td><span class="heat" style="width:${Math.min(100,a.zscore/maxZ*100)}%;background:linear-gradient(90deg,#fbbf24,#f87171)"></span></td>
     <td class="num">${a.zscore}σ</td><td class="num">${fmtB(a.bytes)}</td></tr>`).join('');
   $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Key</th><th></th><th class="num">Z</th><th class="num">Bytes</th></tr>${rows||'<tr><td colspan=5 class=muted>No anomalies — widen the range or lower sigma</td></tr>'}</table>`;
