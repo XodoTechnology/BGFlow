@@ -58,6 +58,16 @@ pub struct PolicyEntry {
     /// Per-exporter interface names (ifIndex → label).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub interfaces: BTreeMap<u32, String>,
+    /// Per-exporter SNMPv2c community — overrides the global [snmp]
+    /// community for this device only. None = use global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snmp_community: Option<String>,
+    /// Per-exporter SNMP port override (non-161 agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snmp_port: Option<u16>,
+    /// Skip SNMP polling for this exporter even when globally enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snmp_disabled: bool,
     /// Datagrams/bytes dropped by this policy since process start
     /// (not persisted — informational only).
     #[serde(skip)]
@@ -267,6 +277,30 @@ impl ExporterPolicy {
         self.save();
     }
 
+    /// Replace this exporter's SNMP overrides. `community: None` and
+    /// `port: None` fall back to the global [snmp] settings; an empty
+    /// community string is treated as None. `disabled` skips polling.
+    pub fn set_snmp(
+        &self,
+        ip: IpAddr,
+        community: Option<String>,
+        port: Option<u16>,
+        disabled: bool,
+        now_ms: u64,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let e = g.map.entry(ip).or_insert_with(|| PolicyEntry {
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+            ..Default::default()
+        });
+        e.snmp_community = community.filter(|s| !s.trim().is_empty());
+        e.snmp_port = port.filter(|p| *p > 0);
+        e.snmp_disabled = disabled;
+        drop(g);
+        self.save();
+    }
+
     /// All per-exporter VLAN names (ip → vid → name), for name merging.
     pub fn vlan_labels(&self) -> HashMap<IpAddr, BTreeMap<u16, String>> {
         self.inner
@@ -328,6 +362,9 @@ impl ExporterPolicy {
                     || e.name.is_some()
                     || !e.vlans.is_empty()
                     || !e.interfaces.is_empty()
+                    || e.snmp_community.is_some()
+                    || e.snmp_port.is_some()
+                    || e.snmp_disabled
                     || e.approved_at_ms > 0
             })
             .map(|(k, v)| {
@@ -344,6 +381,15 @@ impl ExporterPolicy {
         if let Ok(bytes) = serde_json::to_vec_pretty(&f) {
             let tmp = self.path.with_extension("json.tmp");
             if std::fs::write(&tmp, bytes).is_ok() {
+                // May contain per-exporter SNMP communities — owner-only.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &tmp,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }

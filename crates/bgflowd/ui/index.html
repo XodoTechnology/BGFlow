@@ -522,7 +522,7 @@ async function vOverview(){
     <div class="card"><div class="lbl">Packets</div><div class="val" title="${fmtN(sum.packets)}">${fmtN(sum.packets)}</div><div class="sub">avg ${(sum.packets/Math.max(1,sum.flows)).toFixed(1)}/flow${dlt(sum.packets,pv.packets)}</div></div>
     <div class="card"><div class="lbl">Stored</div><div class="val">${fmtB(st.status.flow_bytes+st.status.rollup_bytes+st.status.hourly_bytes)}</div><div class="sub">${fmtN(st.status.flow_rows+st.status.rollup_rows+st.status.hourly_rows)} rows · ${st.status.uptime_secs}s up</div></div>
   </div>`;
-  const protos=(sum.by_protocol||[]).slice(0,6).map(p=>`<tr><td>${protoBadge(p.name)}</td><td class="num">${fmtN(p.flows)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.packets)}</td></tr>`).join('');
+  const protos=(sum.by_protocol||[]).slice(0,6).map(p=>`<tr class="clickable" onclick="drillProto(${p.protocol})" title="show conversations on ${esc(p.name)}" style="cursor:pointer"><td>${protoBadge(p.name)}</td><td class="num">${fmtN(p.flows)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.packets)}</td></tr>`).join('');
   // live rate from the most recent bucket that actually has data (the
   // trailing bucket is the still-open minute — rollups emit on close)
   const sers=ts.series||[];
@@ -684,6 +684,8 @@ function clickDim(by,key){const f=DIM2F[by];if(!f)return;F[f]=key;load()}
 // talking to"). IP dims drill; everything else just filters in place.
 function drillTalker(by,key){const f=DIM2F[by];if(!f)return;F[f]=key;goView('conv')}
 function drillCountry(side,code){F[side]=code;goView('conv')}
+// Protocol rows on the dashboard → conversations on that protocol.
+function drillProto(n){F.proto=String(n);goView('conv')}
 // raw key for filtering when formatted key is a display string
 function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
   if((by==='src_ip'||by==='dst_ip')&&looksIp(fmtKey)){drillTalker(by,fmtKey);return}
@@ -691,6 +693,7 @@ function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
   if(by==='src_ipver'||by==='dst_ipver'){F[f]=fmtKey==='IPv6'?'6':'4'}
   else if(by==='label'){F[f]=fmtKey} // label name preferred
   else if(by==='src_org'||by==='dst_org'){F[f]=keyRaw} // numeric org id as string — API parses u32
+  else if(by==='proto'){F[f]=keyRaw} // numeric protocol — fmtKey is badge HTML
   else{F[f]=fmtKey}
   load()}
 
@@ -837,13 +840,14 @@ let vlanNames={};
 async function loadVlanNames(){try{const d=await api('/api/v1/vlans');vlanNames={};(d.items||[]).forEach(e=>{if(e.name)vlanNames[e.vlan]=e.name})}catch(e){}}
 function vlanLabel(v,exp){
   v=Number(v);if(!v)return'<span class="muted">-</span>';
-  // Per-exporter manual label wins, then merged global map, then
-  // SNMP-learned name for this exporter.
-  const n=(exp&&expVlans[exp]&&expVlans[exp][v])||vlanNames[v]||(exp&&expSnmpVlans[exp]&&expSnmpVlans[exp][v]);
+  // Precedence: per-exporter manual > SNMP-learned (device truth) >
+  // global [vlan_names] fallback (VIDs can mean different things per box).
+  const n=(exp&&expVlans[exp]&&expVlans[exp][v])||(exp&&expSnmpVlans[exp]&&expSnmpVlans[exp][v])||vlanNames[v];
   return`<span class="clickable" onclick="setFilter('vlan','${v}')" title="click to filter">VID ${v}${n?` <span class="muted">— ${esc(n)}</span>`:''}</span>`}
 function ifLabel(i,exp){
   if(i===null||i===undefined)return'—';
-  const n=(exp&&expIfs[exp]&&expIfs[exp][i])||ifNames[i]||(exp&&expSnmpIfs[exp]&&expSnmpIfs[exp][i]);
+  // Same order — ifIndex is device-local, so SNMP beats a global guess.
+  const n=(exp&&expIfs[exp]&&expIfs[exp][i])||(exp&&expSnmpIfs[exp]&&expSnmpIfs[exp][i])||ifNames[i];
   return n?`${esc(n)} <span class="muted">#${i}</span>`:`<span class="muted">#${i}</span>`}
 
 async function vExporters(){
@@ -908,7 +912,8 @@ function expToggle(ip){
   if(show&&!row.dataset.loaded){
     row.dataset.loaded='1';
     const e=(_exItems||[]).find(x=>x.ip===ip)||{};
-    expEdit[ip]={vlans:{...(e.vlans||{})},interfaces:{...(e.interfaces||{})}};
+    expEdit[ip]={vlans:{...(e.vlans||{})},interfaces:{...(e.interfaces||{})},
+      snmp:{community:'',clearComm:false,port:e.snmp_port??'',disabled:!!e.snmp_disabled,communitySet:!!e.snmp_community_set}};
     expPaint(ip);
   }
 }
@@ -929,13 +934,24 @@ function expEditHtml(ip){
     ${sn.sys_descr?`<b>${esc(sn.sys_descr)}</b> · `:''}
     ${Object.keys(sn.interfaces||{}).length} interfaces · ${Object.keys(sn.vlans||{}).length} VLANs learned${sn.polled_ms?` · polled ${ago(sn.polled_ms)}`:''}
     <div class="muted" style="font-size:10.5px;margin-top:3px">SNMP-learned names fill gaps automatically — labels set here always win</div></div>`:'';
-  return snmpHtml+`<div class="grid2" style="gap:18px">
+  const snmpEd=m.snmp||{community:'',port:'',disabled:false,communitySet:false,clearComm:false};
+  const snmpForm=`<div class="hint" style="margin-bottom:10px;border:1px solid var(--border);border-radius:6px;padding:8px 10px">
+    <b style="font-size:11.5px">SNMP credentials</b> <span class="muted" style="font-size:10.5px">— per-device override of the global [snmp] settings; empty fields keep current values</span><br>
+    <span style="display:inline-flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+      <input id="exsnmp-comm-${ip}" type="password" value="${esc(snmpEd.community)}" placeholder="${snmpEd.communitySet?'••• configured — type to replace':'global default community'}" style="width:170px" oninput="expSnmpSet('${ip}','community',this.value)">
+      ${snmpEd.communitySet&&!snmpEd.clearComm?`<a href="#" style="font-size:11px" onclick="expSnmpClearComm('${ip}');return false">use global</a>`:''}
+      <input id="exsnmp-port-${ip}" type="number" min="1" max="65535" value="${esc(snmpEd.port)}" placeholder="port (global)" style="width:110px" oninput="expSnmpSet('${ip}','port',this.value)">
+      <label class="chk" style="font-size:11.5px"><input type="checkbox" id="exsnmp-dis-${ip}" ${snmpEd.disabled?'checked':''} onchange="expSnmpSet('${ip}','disabled',this.checked)"> don't poll</label>
+    </span></div>`;
+  return snmpHtml+snmpForm+`<div class="grid2" style="gap:18px">
     ${tbl('vlans','VLAN names <span class="muted">(VID → label)</span>','VID',m.vlans)}
     ${tbl('interfaces','Interface names <span class="muted">(ifIndex → label)</span>','#',m.interfaces)}
    </div>
    <div style="margin-top:10px"><button class="btn" style="padding:3px 14px;font-size:11px" onclick="expSaveLabels('${ip}')">Save labels</button>
    <span class="muted" style="font-size:11px"> — per-exporter names win on flow rows; a name identical on every exporter merges into top dims</span></div>`;
 }
+function expSnmpClearComm(ip){const m=expEdit[ip];if(m&&m.snmp){m.snmp.clearComm=true;m.snmp.community='';expPaint(ip)}}
+function expSnmpSet(ip,k,v){const m=expEdit[ip];if(m&&m.snmp){m.snmp[k]=v;if(k==='community'&&v)m.snmp.clearComm=false}}
 function expSet(ip,kind,k,v){const m=expEdit[ip];if(!m)return;const t=v.trim();if(t)m[kind][k]=t;else delete m[kind][k]}
 function expDel(ip,kind,k){const m=expEdit[ip];if(m)delete m[kind][k];expPaint(ip)}
 function expAdd(ip,kind){
@@ -951,6 +967,16 @@ async function expSaveLabels(ip){
   try{
     await api(`/api/v1/exporters/${encodeURIComponent(ip)}/vlans`,{method:'POST',body:{vlans:m.vlans}});
     await api(`/api/v1/exporters/${encodeURIComponent(ip)}/interfaces`,{method:'POST',body:{interfaces:m.interfaces}});
+    // SNMP overrides — PATCH semantics: community omitted = unchanged
+    // (secret never round-trips), port empty = back to global.
+    const sn=m.snmp;
+    if(sn){
+      const body={disabled:!!sn.disabled};
+      if(sn.clearComm)body.community='';
+      else if(sn.community)body.community=sn.community;
+      body.port=sn.port?+sn.port:null;
+      await api(`/api/v1/exporters/${encodeURIComponent(ip)}/snmp`,{method:'POST',body});
+    }
     toast(`${ip}: labels saved`);loadExpNames();load(true);
   }catch(e){toast('save failed: '+e.message)}
 }

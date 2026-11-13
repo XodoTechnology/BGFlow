@@ -1,5 +1,8 @@
 //! bgflowd — BGFlow daemon: flow collector, storage engine, API, UI.
 
+// The embedded OpenAPI spec is one large json! literal.
+#![recursion_limit = "256"]
+
 mod admin;
 mod alerts;
 mod api;

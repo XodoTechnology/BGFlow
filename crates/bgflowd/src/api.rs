@@ -1250,6 +1250,11 @@ async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
                 "note": p.and_then(|x| x.note.clone()),
                 "vlans": p.map(|x| x.vlans.clone()).unwrap_or_default(),
                 "interfaces": p.map(|x| x.interfaces.clone()).unwrap_or_default(),
+                // SNMP overrides — community itself is never echoed,
+                // only whether a per-exporter one is set.
+                "snmp_community_set": p.map(|x| x.snmp_community.is_some()).unwrap_or(false),
+                "snmp_port": p.and_then(|x| x.snmp_port),
+                "snmp_disabled": p.map(|x| x.snmp_disabled).unwrap_or(false),
                 "dropped_datagrams": p.map(|x| x.dropped_datagrams).unwrap_or(0),
                 "dropped_bytes": p.map(|x| x.dropped_bytes).unwrap_or(0),
                 "snmp": snmp_map.get(&ip),
@@ -1372,6 +1377,69 @@ async fn exporter_interfaces(
     Ok(Json(
         serde_json::json!({"ok": true, "ip": ip_s, "interfaces": map}),
     ))
+}
+
+/// POST /api/v1/exporters/{ip}/snmp — PATCH-style SNMP overrides.
+/// Each field is independent: absent = unchanged, null/"" = clear back
+/// to the global [snmp] settings, value = set. The community is a
+/// secret — it is never returned by the API, and an absent field
+/// preserves whatever is stored without the caller needing to know it.
+/// Admin only.
+async fn exporter_snmp(
+    State(st): State<Arc<AppState>>,
+    Path(ip_s): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ip: IpAddr = ip_s
+        .parse()
+        .map_err(|_| err(format!("bad exporter ip: {}", ip_s)))?;
+    // Current overrides — absent request fields inherit these so the
+    // secret community survives PATCHes that don't mention it.
+    let cur = st.exporter_policy.entries().remove(&ip);
+    let (cur_comm, cur_port, cur_dis) = cur
+        .map(|e| (e.snmp_community, e.snmp_port, e.snmp_disabled))
+        .unwrap_or_default();
+
+    let community = match body.get("community") {
+        Some(serde_json::Value::String(s)) => Some(s.trim().to_string()),
+        Some(serde_json::Value::Null) => None,
+        None => cur_comm,
+        _ => return Err(err("community must be a string")),
+    };
+    if let Some(c) = &community {
+        if c.len() > 256 {
+            return Err(err("community too long"));
+        }
+    }
+    let port = match body.get("port") {
+        Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let p = v
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .filter(|p| *p > 0)
+                .ok_or_else(|| err("port must be 1-65535"))?;
+            Some(p)
+        }
+        None => cur_port,
+    };
+    let disabled = match body.get("disabled") {
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| err("disabled must be a bool"))?,
+        None => cur_dis,
+    };
+    let comm_set = community.as_ref().is_some_and(|c| !c.is_empty());
+    let now = crate::metrics::now_ms();
+    st.exporter_policy
+        .set_snmp(ip, community, port, disabled, now);
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ip": ip_s,
+        "snmp_community_set": comm_set,
+        "snmp_port": port,
+        "snmp_disabled": disabled,
+    })))
 }
 
 /// POST /api/v1/exporters/{ip}/{action} — approve|suspend|reject|remove.
@@ -1778,6 +1846,7 @@ fn openapi_spec() -> serde_json::Value {
             "/api/v1/exporters/{ip}/name": {"post": {"summary": "Set exporter display name (admin)"}},
             "/api/v1/exporters/{ip}/vlans": {"post": {"summary": "Replace exporter VLAN name map (admin): {\"vlans\":{\"250\":\"Cogent\"}}"}},
             "/api/v1/exporters/{ip}/interfaces": {"post": {"summary": "Replace exporter interface name map (admin): {\"interfaces\":{\"1\":\"xe-0/0/0\"}}"}},
+            "/api/v1/exporters/{ip}/snmp": {"post": {"summary": "Replace exporter SNMP overrides (admin): {\"community\":\"…\",\"port\":1161,\"disabled\":false} — empty clears to global"}},
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
             "/api/v1/vlans": {"get": {"summary": "Configured VLAN names ([vlan_names])"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
@@ -2424,6 +2493,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/exporters/:ip/name", post(exporter_rename))
         .route("/api/v1/exporters/:ip/vlans", post(exporter_vlans))
         .route("/api/v1/exporters/:ip/interfaces", post(exporter_interfaces))
+        .route("/api/v1/exporters/:ip/snmp", post(exporter_snmp))
         .route("/api/v1/exporters/:ip/:action", post(exporter_action))
         .route("/api/v1/interfaces", get(interfaces))
         .route("/api/v1/vlans", get(vlans))

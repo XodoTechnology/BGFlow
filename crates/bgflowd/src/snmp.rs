@@ -63,7 +63,9 @@ pub async fn run(store: SnmpStore, policy: Arc<ExporterPolicy>, cfg: SnmpConfig)
     tick.tick().await; // skip the immediate first tick — give exporters a moment
     loop {
         tick.tick().await;
-        let ips: Vec<IpAddr> = policy
+        // Resolve credentials per exporter: entry overrides win over the
+        // global [snmp] community/port; snmp_disabled opts out entirely.
+        let targets: Vec<(IpAddr, String, u16)> = policy
             .entries()
             .iter()
             .filter(|(_, e)| {
@@ -71,18 +73,26 @@ pub async fn run(store: SnmpStore, policy: Arc<ExporterPolicy>, cfg: SnmpConfig)
                     e.state,
                     crate::exporter_policy::ExporterState::Approved
                         | crate::exporter_policy::ExporterState::Pending
+                ) && !e.snmp_disabled
+            })
+            .map(|(ip, e)| {
+                (
+                    *ip,
+                    e.snmp_community
+                        .clone()
+                        .unwrap_or_else(|| cfg.community.clone()),
+                    e.snmp_port.unwrap_or(cfg.port),
                 )
             })
-            .map(|(ip, _)| *ip)
             .collect();
-        if ips.is_empty() {
+        if targets.is_empty() {
             continue;
         }
         let st = store.clone();
         let c = cfg.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            for ip in ips {
-                let mut info = poll_exporter(ip, &c);
+            for (ip, community, port) in targets {
+                let mut info = poll_exporter(ip, &community, port, &c);
                 info.polled_ms = now_ms();
                 st.write().unwrap().insert(ip, info);
             }
@@ -162,16 +172,16 @@ fn walk_col<F: FnMut(u64, &Value)>(
     }
 }
 
-fn poll_exporter(ip: IpAddr, cfg: &SnmpConfig) -> ExporterSnmp {
+fn poll_exporter(ip: IpAddr, community: &str, port: u16, cfg: &SnmpConfig) -> ExporterSnmp {
     let mut info = ExporterSnmp::default();
     let addr = if ip.is_ipv6() {
-        format!("[{}]:{}", ip, cfg.port)
+        format!("[{}]:{}", ip, port)
     } else {
-        format!("{}:{}", ip, cfg.port)
+        format!("{}:{}", ip, port)
     };
     let mut sess = match SyncSession::new_v2c(
         &addr,
-        cfg.community.as_bytes(),
+        community.as_bytes(),
         Some(Duration::from_secs(cfg.timeout_secs.max(1))),
         0,
     ) {
