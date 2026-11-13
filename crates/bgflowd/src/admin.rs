@@ -14,6 +14,9 @@ use std::sync::{Arc, RwLock};
 pub struct AdminShared {
     /// Config file path the daemon was started with (None = defaults/env).
     pub config_path: Option<PathBuf>,
+    /// Live effective config — swapped on every successful load so API
+    /// readers see post-reload values without a restart.
+    pub config: Arc<RwLock<config::Config>>,
     pub rules: Arc<Ruleset>,
     pub enrich: Arc<HttpEnrichers>,
     pub exporter_names: Arc<RwLock<ExporterNames>>,
@@ -28,6 +31,10 @@ pub struct AdminShared {
     /// Exporter admission policy — knobs (require_approval, trusted)
     /// refresh on reload; learned entries are untouched.
     pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
+    /// Storage knobs (retention days, disk cap) — swapped on reload so
+    /// the writer's next sweep uses them without a restart. Open-time
+    /// settings (dirs, segment sizing) still need a restart.
+    pub storage_cfg: Arc<RwLock<crate::config::StorageConfig>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -66,6 +73,9 @@ impl AdminShared {
                 return rep;
             }
         };
+        // Publish the loaded config before applying subsystems — even if
+        // an individual subsystem fails, readers see the file's values.
+        *self.config.write().unwrap() = cfg.clone();
 
         self.rules.reload(&cfg.rules);
         rep.rules = cfg.rules.len();
@@ -108,6 +118,9 @@ impl AdminShared {
         // Exporter policy knobs (entries themselves persist untouched).
         self.exporter_policy
             .set_knobs(cfg.exporters.require_approval, cfg.exporters.trusted.clone());
+
+        // Storage knobs for the writer's retention/disk-cap sweeps.
+        *self.storage_cfg.write().unwrap() = cfg.storage.clone();
 
         tracing::info!(
             "config reloaded: {} rules, {} enrichers, {} exporter names, {} users, {} alert rules, {} geo db(s)",

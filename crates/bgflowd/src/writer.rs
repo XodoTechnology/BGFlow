@@ -63,28 +63,32 @@ impl WriterShared {
 const BATCH: usize = 8192;
 
 pub async fn run(
-    cfg: StorageConfig,
+    cfg: Arc<RwLock<StorageConfig>>,
     shared: WriterShared,
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<FlowRecord>,
 ) -> anyhow::Result<()> {
+    // Open-time settings snapshot — dataset dirs/segment sizing are
+    // fixed for the process lifetime. Retention knobs are re-read from
+    // the shared cell on every sweep so UI changes apply live.
+    let cfg0 = cfg.read().unwrap().clone();
     let opts = DatasetOpts {
-        segment_rows: cfg.segment_rows,
-        segment_interval: Duration::from_secs(cfg.segment_interval_secs),
+        segment_rows: cfg0.segment_rows,
+        segment_interval: Duration::from_secs(cfg0.segment_interval_secs),
     };
     let mut flows =
-        Dataset::<FlowRecord>::open(cfg.dataset_dir("flows", &cfg.flows_dir), opts.clone())?;
+        Dataset::<FlowRecord>::open(cfg0.dataset_dir("flows", &cfg0.flows_dir), opts.clone())?;
     let mut rollups = Dataset::<RollupRecord>::open(
-        cfg.dataset_dir("rollups", &cfg.rollups_dir),
+        cfg0.dataset_dir("rollups", &cfg0.rollups_dir),
         opts.clone(),
     )?;
     // Coarse dataset: hourly buckets with /24·/48-masked IPs — the
     // long-retention, low-cardinality stats layer.
     let mut hourly =
-        Dataset::<RollupRecord>::open(cfg.dataset_dir("hourly", &cfg.hourly_dir), opts)?;
-    let mut agg = RollupAggregator::new().with_sampling(cfg.sample_weighting);
-    let mut coarse_agg = RollupAggregator::coarse().with_sampling(cfg.sample_weighting);
-    let coarse_on = cfg.coarse_rollup;
+        Dataset::<RollupRecord>::open(cfg0.dataset_dir("hourly", &cfg0.hourly_dir), opts)?;
+    let mut agg = RollupAggregator::new().with_sampling(cfg0.sample_weighting);
+    let mut coarse_agg = RollupAggregator::coarse().with_sampling(cfg0.sample_weighting);
+    let coarse_on = cfg0.coarse_rollup;
 
     // Publish initial indexes (picks up segments from previous runs).
     publish(&shared, &flows, &rollups, &hourly, &agg, &coarse_agg, now_ms());
@@ -93,7 +97,7 @@ pub async fn run(
     let mut pending: Vec<FlowRecord> = Vec::with_capacity(BATCH);
     let mut tick = interval(Duration::from_secs(1));
     let mut last_retention = now_ms();
-    let retention_iv = Duration::from_secs(cfg.retention_interval_secs.max(30));
+    let retention_iv = Duration::from_secs(cfg0.retention_interval_secs.max(30));
     // Rollup buckets only become drainable at minute/hour boundaries — skip
     // the full-map scan on ticks that stay inside the same period.
     let mut last_drain_min = u64::MAX;
@@ -169,7 +173,8 @@ pub async fn run(
                 }
                 if now.saturating_sub(last_retention) >= retention_iv.as_millis() as u64 {
                     last_retention = now;
-                    if let Err(e) = retention(&mut flows, &mut rollups, &mut hourly, &cfg, &metrics) {
+                    let sc = cfg.read().unwrap().clone();
+                    if let Err(e) = retention(&mut flows, &mut rollups, &mut hourly, &sc, &metrics) {
                         write_err(&metrics, "retention", &e);
                     }
                 }

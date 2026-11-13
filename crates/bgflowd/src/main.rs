@@ -199,8 +199,11 @@ async fn main() -> Result<()> {
         cfg.storage.channel_capacity,
     );
     let shared = WriterShared::new();
+    // Shared storage config — the writer re-reads retention/disk-cap
+    // knobs each sweep so admin settings apply without a restart.
+    let storage_cfg = Arc::new(RwLock::new(cfg.storage.clone()));
     {
-        let cfg_s = cfg.storage.clone();
+        let cfg_s = storage_cfg.clone();
         let sh = shared.clone();
         let m = metrics.clone();
         tokio::spawn(async move {
@@ -264,10 +267,14 @@ async fn main() -> Result<()> {
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
     let snmp_store = snmp::new_store();
+    // Live config cell — reload() swaps in the freshly loaded Config so
+    // API/UI reads (settings view, status, CORS) see post-reload values.
+    let config_cell = Arc::new(RwLock::new(cfg.clone()));
 
     // Admin operations shared by SIGHUP and POST /api/v1/admin/reload.
     let admin = Arc::new(admin::AdminShared {
         config_path: config::resolve_path(args.config.as_ref()),
+        config: config_cell.clone(),
         rules: rules.clone(),
         enrich: http_enrich.clone(),
         exporter_names: exporter_names.clone(),
@@ -278,6 +285,7 @@ async fn main() -> Result<()> {
         alerts: alerts_cfg.clone(),
         geo: geo.clone(),
         exporter_policy: exporter_policy.clone(),
+        storage_cfg: storage_cfg.clone(),
     });
 
     // MMDB maintenance: hot-swap readers when .mmdb files change on disk,
@@ -307,7 +315,7 @@ async fn main() -> Result<()> {
         metrics: metrics.clone(),
         http_enrich: http_enrich.clone(),
         geo: geo.clone(),
-        config: Arc::new(cfg.clone()),
+        config: config_cell,
         auth: auth.clone(),
         admin: admin.clone(),
         exporter_policy: exporter_policy.clone(),

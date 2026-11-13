@@ -71,6 +71,9 @@ canvas{width:100%;height:260px;display:block}
 @media(max-width:1000px){.grid2{grid-template-columns:1fr}}
 pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;font-family:var(--mono);max-height:400px}
 .hint{color:var(--muted);font-size:12px;padding:8px 0}
+.flds{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px 18px}
+.fld label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+.fld input,.fld select,.fld textarea{background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12.5px;width:100%;box-sizing:border-box}
 .err{color:var(--red)}
 #toast{position:fixed;right:18px;bottom:18px;background:#3a1520;border:1px solid var(--red);color:#fecaca;padding:10px 16px;border-radius:8px;font-size:12.5px;max-width:440px;z-index:99;opacity:0;transform:translateY(8px);transition:.25s;pointer-events:auto;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.5)}
 #toast.show{opacity:1;transform:none}
@@ -110,6 +113,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <a data-v="exporters">⬒ Exporters</a>
     <a data-v="labels">⚑ Labels &amp; Enrichment</a>
     <a data-v="metrics">∿ Metrics</a>
+    <a data-v="settings" id="navsettings" style="display:none">⚙ Settings</a>
   </nav>
   <div class="foot">BGFlow<br><span id="ver"></span></div>
 </div>
@@ -160,7 +164,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 <script>
 "use strict";
 const $=s=>document.querySelector(s), content=$('#content');
-const state={view:'overview',range:'-24h',refreshMs:15000,metric:'bytes',bucket:'5m',topby:'src_ip',topn:15,granularity:'minute',updated:0,chartSeries:null,hoverI:-1,rate:null,msrc:'src_country',mdst:'dst_country',mlim:100,mapData:null,mapHover:-1,mapHoverNode:null};
+const state={view:'overview',range:'-24h',refreshMs:15000,metric:'bytes',bucket:'5m',topby:'src_ip',topn:15,granularity:'minute',updated:0,chartSeries:null,hoverI:-1,rate:null,msrc:'src_country',mdst:'dst_country',mlim:100,mapData:null,mapHover:-1,mapHoverNode:null,flowOff:0,flowLim:500};
 const F={}; // active filters
 
 // ---------- theme ----------
@@ -245,7 +249,7 @@ function showUser(){
   $('#userbox').style.display='flex';
   $('#uname').textContent=ME.user||'';
   const rb=$('#rolebadge');rb.textContent=ME.role||'';rb.className='rolebadge'+(ME.role==='admin'?' admin':'');
-  if(ME.role==='admin')$('#btnreload').style.display='';
+  if(ME.role==='admin'){$('#btnreload').style.display='';const ns=$('#navsettings');if(ns)ns.style.display=''}
 }
 async function doLogin(){
   const u=$('#lu').value.trim(),p=$('#lp').value,lerr=$('#lerr');
@@ -414,7 +418,8 @@ function savePreset(){const n=prompt('Preset name:');if(!n)return;const p=preset
 function delPreset(){const n=$('#preset_sel')?.value;if(!n||!presets()[n])return;const p=presets();delete p[n];savePresets(p);load()}
 
 // ---------- nav / topbar ----------
-document.querySelectorAll('#nav a').forEach(a=>a.onclick=()=>{document.querySelectorAll('#nav a').forEach(x=>x.classList.remove('on'));a.classList.add('on');state.view=a.dataset.v;$('#viewtitle').textContent=a.textContent.trim();document.title=a.textContent.trim()+' — BGFlow';load()});
+function goView(v){state.view=v;document.querySelectorAll('#nav a').forEach(x=>x.classList.toggle('on',x.dataset.v===v));const t=document.querySelector('#nav a[data-v="'+v+'"]');if(t)$('#viewtitle').textContent=t.textContent.trim();document.title=$('#viewtitle').textContent+' — BGFlow';load()}
+document.querySelectorAll('#nav a').forEach(a=>a.onclick=()=>goView(a.dataset.v));
 document.querySelectorAll('.chip[data-r]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-r]').forEach(x=>x.classList.remove('on'));c.classList.add('on');state.range=c.dataset.r;const cust=state.range==='custom';$('#fromin').style.display=cust?'':'none';$('#toin').style.display=cust?'':'none';load()});
 $('#refsel').onchange=e=>{state.refreshMs=+e.target.value;startAuto()};
 function startAuto(){clearInterval(timer);if(state.refreshMs>0)timer=setInterval(()=>{if(state.view!=='metrics')load(true)},state.refreshMs)}
@@ -433,6 +438,7 @@ async function load(silent){
   // exist (null.textContent crashes).
   if(loadBusy){loadNext={silent:(loadNext?loadNext.silent:true)&&!!silent};return}
   loadBusy=true;
+  if(!silent)state.flowOff=0; // explicit loads (filters, navigation) restart paging
   const keepScroll=silent?content.scrollTop:0;
   if(!silent)content.innerHTML='<div class="hint">Loading…</div>';
   try{
@@ -447,6 +453,7 @@ async function load(silent){
     else if(state.view==='exporters')await vExporters();
     else if(state.view==='labels')await vLabels();
     else if(state.view==='metrics')await vMetrics();
+    else if(state.view==='settings')await vSettings();
     state.updated=Date.now();state.lastErr=null;syncHash();
     if(silent)content.scrollTop=keepScroll;
     enhanceAsns();enhanceTopIps();
@@ -472,8 +479,9 @@ function topTbl(items, dim){
       // key cell (enhanceTopIps fills [data-topasn] lazily).
       const asn=isIp&&looksIp(k)?`<span class="asnpre" data-topasn="${esc(k)}">…</span>`:'';
       const lbl=dimLabel(dim,t.key);
+      const oc=isIp?`drillTalker('${dim}',this.dataset.k)`:`setFilter('${fk}',this.dataset.k)`;
       return `<tr>
-      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${asn}${lbl}</td>
+      <td class="clickable" data-k="${esc(t.key)}" onclick="${oc}">${asn}${lbl}</td>
       <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`}).join('')
     ||'<tr><td colspan=3 class=muted>No data</td></tr>'}</table>`;
 }
@@ -530,7 +538,7 @@ async function vOverview(){
          ${['1m','5m','15m','1h','6h','1d'].map(b=>`<option value="${b}" ${eb===b?'selected':''}>${b}</option>`).join('')}
        </select></span></h3><canvas id="chart" style="height:280px"></canvas></div>
     <div class="grid2">
-      <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click to filter)</span></h3>${topTbl(s.items,'src_ip')}</div>
+      <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click IP for conversations)</span></h3>${topTbl(s.items,'src_ip')}</div>
       <div class="panel"><h3>Top Destinations</h3>${topTbl(d.items,'dst_ip')}</div>
     </div>
     <div class="grid2">
@@ -672,8 +680,13 @@ function clearFilters(){for(const k in F)delete F[k];load()}
 // map a top-dim name to the filter param + value for click-to-filter
 const DIM2F={src_ip:'src',dst_ip:'dst',src_asn:'src_asn',dst_asn:'dst_asn',src_port:'sport',dst_port:'dport',proto:'proto',exporter:'exporter',src_country:'src_country',dst_country:'dst_country',label:'label',src_ipver:'src_ipver',dst_ipver:'dst_ipver',src_org:'src_org',dst_org:'dst_org',vlan:'vlan',ingress_if:'ingress_if',egress_if:'egress_if'};
 function clickDim(by,key){const f=DIM2F[by];if(!f)return;F[f]=key;load()}
+// Click a talker → jump to conversations filtered to it ("who is it
+// talking to"). IP dims drill; everything else just filters in place.
+function drillTalker(by,key){const f=DIM2F[by];if(!f)return;F[f]=key;goView('conv')}
+function drillCountry(side,code){F[side]=code;goView('conv')}
 // raw key for filtering when formatted key is a display string
 function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
+  if((by==='src_ip'||by==='dst_ip')&&looksIp(fmtKey)){drillTalker(by,fmtKey);return}
   // key_raw is a string (u128-safe); use fmtKey where semantics matter
   if(by==='src_ipver'||by==='dst_ipver'){F[f]=fmtKey==='IPv6'?'6':'4'}
   else if(by==='label'){F[f]=fmtKey} // label name preferred
@@ -684,11 +697,11 @@ function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
 const TOP_DIMS=['src_ip','dst_ip','src_ipver','dst_ipver','src_asn','dst_asn','src_org','dst_org','src_port','dst_port','proto','exporter','src_country','dst_country','label','vlan','ingress_if','egress_if'];
 
 async function vFlows(){
-  content.innerHTML=filterBar(`<select id="f_limit"><option>100</option><option selected>500</option><option>2000</option><option>10000</option></select>
+  const off=state.flowOff||0,lim=state.flowLim||500;
+  content.innerHTML=filterBar(`<select id="f_limit" onchange="flowLim(this.value)">${[100,250,500,1000].map(n=>`<option value="${n}" ${lim===n?'selected':''}>${n}/pg</option>`).join('')}</select>
    <button class="btn ghost" onclick="dlCsv()">CSV</button>`)+
-   '<div class="panel"><h3>Raw Flows (newest first)</h3><div id="tbl"></div></div>';
-  const lim=$('#f_limit')?.value||500;
-  const data=await api('/api/v1/flows?'+q({limit:lim}));
+   '<div class="panel"><h3>Raw Flows (newest first)</h3><div id="tbl"></div><div id="fpg"></div></div>';
+  const data=await api('/api/v1/flows?'+q({limit:lim,offset:off}));
   _fl=data.flows||[];
   const rows=_fl.map((f,i)=>`<tr>
     <td class="muted clickable" title="click for detail" onclick="flowDetail(${i})">${f.ts?new Date(f.ts*1000).toLocaleTimeString():'-'}</td>
@@ -702,9 +715,16 @@ async function vFlows(){
     <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td>
     <td>${vlanLabel(f.vlan,f.exporter)}</td>
     <td title="ingress → egress">${ifLabel(f.ingress_if,f.exporter)}<span class="muted"> → </span>${ifLabel(f.egress_if,f.exporter)}</td></tr>`).join('');
-  $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th><th>VID</th><th title="ingress → egress interface">Interfaces</th></tr>${rows||'<tr><td colspan=12 class=muted>No flows</td></tr>'}</table>
-   <div class="hint">${data.count} flows · <a href="#" onclick="dlCsv();return false">download CSV</a></div>`;
+  $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th><th>VID</th><th title="ingress → egress interface">Interfaces</th></tr>${rows||'<tr><td colspan=12 class=muted>No flows</td></tr>'}</table>`;
+  const n=_fl.length;
+  $('#fpg').innerHTML=n?`<div class="hint" style="display:flex;gap:14px;align-items:center;margin-top:10px">
+    <button class="btn ghost" style="padding:2px 12px;font-size:11px" ${off?'':'disabled'} onclick="flowPage(-1)">‹ Prev</button>
+    <span class="muted">rows ${off+1}–${off+n}${data.has_more?' · more available':''}</span>
+    <button class="btn ghost" style="padding:2px 12px;font-size:11px" ${data.has_more?'':'disabled'} onclick="flowPage(1)">Next ›</button>
+    <span class="muted" style="margin-left:auto">${data.count} rows · <a href="#" onclick="dlCsv();return false">download CSV</a></span></div>`:'';
 }
+function flowPage(d){state.flowOff=Math.max(0,(state.flowOff||0)+d*(state.flowLim||500));load(true)}
+function flowLim(v){state.flowLim=+v||500;state.flowOff=0;load(true)}
 async function dlCsv(){const r=await fetch('/api/v1/flows?'+q({limit:10000,format:'csv'}));const d=await r.json();const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([d.csv],{type:'text/csv'}));a.download='bgflow-flows.csv';a.click()}
 
 async function vTop(){
@@ -752,7 +772,7 @@ async function vCountries(){
     api('/api/v1/top?'+q({by:'src_country',limit:n})),
     api('/api/v1/top?'+q({by:'dst_country',limit:n}))]);
   const max=Math.max(...(a.items||[]).map(t=>t.bytes),...(b.items||[]).map(t=>t.bytes),1);
-  const row=(t,side)=>{const pct=t.bytes/max*100;return `<tr><td><span class="clickable" onclick="setFilter('${side}','${esc(t.key)}')">${countryHtml(t.key)}</span></td>
+  const row=(t,side)=>{const pct=t.bytes/max*100;return `<tr><td><span class="clickable" onclick="drillCountry('${side}','${esc(t.key)}')" title="show conversations">${countryHtml(t.key)}</span></td>
     <td style="width:40%"><span class="heat" style="width:${Math.max(2,pct)}%;background:linear-gradient(90deg,#1d4ed8,#22d3ee)"></span></td>
     <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`};
   const ta=(a.items||[]).map(t=>row(t,'src_country')).join(''),tb=(b.items||[]).map(t=>row(t,'dst_country')).join('');
@@ -1225,6 +1245,131 @@ function bindSankeyHover(){
 async function vMetrics(){
   const r=await fetch('/metrics',{signal:AbortSignal.timeout(API_TIMEOUT)});const t=await r.text();
   content.innerHTML=`<div class="panel"><h3>Prometheus Metrics</h3><pre>${esc(t)}</pre></div>`;
+}
+
+// ---------- settings (admin) ----------
+// Effective config comes from GET /api/v1/admin/settings (bgflow.toml +
+// settings.json + env merged server-side). Edits mutate _setCfg; Save
+// PUTs the whole object — the server deep-merges, validates, writes
+// <data_dir>/settings.json and hot-applies via the reload path.
+let _setCfg=null,_setMeta=null;
+const sv=p=>{let o=_setCfg;for(const k of p.split('.')){if(o==null)return undefined;o=o[k]}return o};
+const sset=(p,v)=>{const ks=p.split('.');let o=_setCfg;for(let i=0;i<ks.length-1;i++)o=o[ks[i]];if(o!=null)o[ks[ks.length-1]]=v};
+const ssetN=(p,v)=>sset(p,v===''||v==null?0:+v);
+const ssetGiB=(p,v)=>sset(p,v===''?0:Math.round(+v*1073741824));
+const giB=v=>v?(+v/1073741824).toFixed(1):'';
+const rst=p=>(_setMeta?.restart_required||[]).includes(p)?' <span class="tag" style="font-size:9.5px" title="applies on daemon restart">↻ restart</span>':'';
+const fld=(p,label,inner)=>`<div class="fld"><label>${label}${rst(p)}</label>${inner}</div>`;
+const num=(p,label)=>fld(p,label,`<input type="number" style="width:110px" value="${sv(p)??''}" oninput="ssetN('${p}',this.value)">`);
+const txt=(p,label,ph='')=>fld(p,label,`<input value="${esc(String(sv(p)??''))}" placeholder="${ph}" oninput="sset('${p}',this.value)">`);
+const chk=(p,label)=>`<label class="chk" style="display:flex;gap:8px;align-items:center;font-size:12.5px;margin:2px 0"><input type="checkbox" ${sv(p)?'checked':''} onchange="sset('${p}',this.checked)"> ${label}${rst(p)}</label>`;
+const ssetMap=(p,v)=>{const o={};for(const line of v.split('\n')){const m=line.match(/^\s*([^=]+?)\s*=\s*(.+?)\s*$/);if(m)o[m[1].trim()]=m[2].trim()}sset(p,o)};
+const mapArea=(p,title,ph)=>{const o=sv(p)||{};const body=Object.entries(o).map(([k,v])=>`${k} = ${v}`).join('\n');
+  return `<div class="fld" style="grid-column:1/-1"><label>${title}${rst(p)}</label><textarea rows="5" style="width:100%;font-family:var(--mono);font-size:11.5px" placeholder="${ph}" oninput="ssetMap('${p}',this.value)">${esc(body)}</textarea></div>`};
+
+async function vSettings(){
+  if(!ME||ME.role!=='admin'){content.innerHTML='<div class="err">Admin role required for settings</div>';return}
+  const d=await api('/api/v1/admin/settings');
+  _setCfg=d.config;_setMeta=d;
+  renderSettings();
+}
+function renderSettings(){
+  const c=_setCfg,s=c.storage||{},sn=c.snmp||{},an=c.analytics||{},ex=c.exporters||{},al=c.alerts||{},gv=c.geoip||{};
+  const inp=(c.inputs||[]).map(i=>`${i.listen} (${i.protocol||'auto'}/${i.transport||'udp'})`).join(', ')||'none';
+  const users=(_setCfg.users||[]).map((u,i)=>`<tr><td>${esc(u.name)}</td><td>${esc(u.role)}</td><td class="muted">set</td>
+    <td><input id="setpw_${i}" type="password" placeholder="new password" style="width:130px"></td>
+    <td><button class="btn ghost" style="padding:2px 8px;font-size:11px" onclick="setPw(${i})">Set</button>
+    <button class="btn ghost" style="padding:2px 8px;font-size:11px" onclick="delUser(${i})">Del</button></td></tr>`).join('');
+  content.innerHTML=`<div class="hint" style="margin-bottom:10px">Effective config = bgflow.toml + <b>settings.json</b> (${esc(_setMeta.settings_path||'')}) + env. Saving writes settings.json and hot-applies everything except fields tagged <span class="tag" style="font-size:9.5px">↻ restart</span>.</div>
+  <div class="grid2" style="gap:14px">
+   <div class="panel"><h3>Storage</h3><div class="flds">
+     ${num('storage.raw_retention_days','Raw flows retention (days)')}
+     ${num('storage.rollup_retention_days','Rollup retention (days)')}
+     ${num('storage.coarse_retention_days','Hourly rollup retention (days)')}
+     ${fld('storage.max_bytes','Max disk usage (GiB, 0 = unlimited)',`<input type="number" step="0.1" style="width:110px" value="${giB(s.max_bytes)}" placeholder="0" oninput="ssetGiB('storage.max_bytes',this.value)">`)}
+     ${chk('storage.sample_weighting','Sample-rate weighting')}
+     ${chk('storage.coarse_rollup','Coarse hourly rollups')}
+     ${txt('storage.data_dir','Data dir','/var/lib/bgflow')}
+     ${num('storage.segment_rows','Rows per segment')}
+     ${txt('storage.flows_dir','Flows dir override','optional')}
+     ${txt('storage.rollups_dir','Rollups dir override','optional')}
+     ${txt('storage.hourly_dir','Hourly dir override','optional')}
+    </div></div>
+   <div class="panel"><h3>Analytics</h3><div class="flds">
+     ${fld('analytics.local_asns','Local ASNs — drives in/out/transit split',`<input value="${esc((an.local_asns||[]).join(', '))}" placeholder="61138, 64512" oninput="sset('analytics.local_asns',this.value.split(',').map(x=>+x.trim()).filter(n=>n>0))">`)}
+    </div></div>
+   <div class="panel"><h3>SNMP enrichment <span class="muted" style="font-size:10px">(interface/VLAN names — optional)</span></h3><div class="flds">
+     ${chk('snmp.enabled','Enabled')}
+     ${txt('snmp.community','Community','public')}
+     ${num('snmp.port','Port')}
+     ${num('snmp.interval_secs','Poll interval (s)')}
+     ${num('snmp.timeout_secs','Timeout (s)')}
+     <div class="hint" style="font-size:10.5px">Poller starts at boot — changes apply on restart.</div>
+    </div></div>
+   <div class="panel"><h3>Exporters &amp; alerts</h3><div class="flds">
+     ${chk('exporters.require_approval','Require exporter approval')}
+     ${fld('exporters.trusted','Trusted exporter IPs (comma-sep)',`<input value="${esc((ex.trusted||[]).join(', '))}" oninput="sset('exporters.trusted',this.value.split(',').map(x=>x.trim()).filter(Boolean))}">`)}
+     ${num('alerts.eval_secs','Alert eval interval (s)')}
+     ${num('alerts.cooldown_secs','Alert cooldown (s)')}
+    </div></div>
+   <div class="panel"><h3>Names</h3><div class="flds">
+     ${mapArea('exporter_names','Exporter names','10.0.0.1 = core-rtr-01')}
+     ${mapArea('interface_names','Interface names','2 = ae0')}
+     ${mapArea('vlan_names','VLAN names','250 = Cogent')}
+    </div></div>
+   <div class="panel"><h3>Users</h3>
+    <table><thead><tr><th>Name</th><th>Role</th><th>Password</th><th></th><th></th></tr></thead><tbody id="utable">${users||'<tr><td colspan=5 class=muted>No users — auth disabled</td></tr>'}</tbody></table>
+    <div class="hint" style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+     <input id="setu_name" placeholder="username" style="width:120px">
+     <input id="setu_pass" type="password" placeholder="password" style="width:130px">
+     <select id="setu_role"><option value="viewer">viewer</option><option value="admin">admin</option></select>
+     <button class="btn" style="padding:3px 12px;font-size:11px" onclick="addUser()">Add user</button></div>
+    <div class="hint" style="font-size:10.5px;margin-top:4px">Hashes are stored server-side; the ••• marker keeps existing passwords on save.</div></div>
+   <div class="panel"><h3>Inputs &amp; server <span class="tag" style="font-size:9.5px">↻ restart</span></h3>
+    <div class="hint">HTTP: ${esc(String(sv('server.http_listen')||''))} · TLS: ${sv('server.tls_cert')?'configured':'off'} · inputs: ${esc(inp)}<br>
+    Sockets can't rebind live — edit these in the JSON editor below; they apply on restart.</div></div>
+   <div class="panel" style="grid-column:1/-1"><h3>Advanced — full config JSON</h3>
+    <textarea id="setjson" rows="14" style="width:100%;font-family:var(--mono);font-size:11.5px">${esc(JSON.stringify(_setCfg,null,2))}</textarea>
+    <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
+     <button class="btn" onclick="saveJson()">Save JSON</button>
+     <button class="btn ghost" onclick="renderSettings()">Reset form to saved</button>
+     <span class="muted" style="font-size:11px">every key from bgflow.example.toml is editable here — objects merge, arrays replace</span></div></div>
+  </div>
+  <div style="position:sticky;bottom:0;background:var(--bg);padding:12px 0;display:flex;gap:12px;align-items:center">
+   <button class="btn" style="padding:7px 22px" onclick="saveSettings()">Save settings</button>
+   <span id="setmsg" class="muted"></span></div>`;
+}
+function renderUsers(){
+  const tb=document.querySelector('#utable');if(!tb)return;
+  tb.innerHTML=(_setCfg.users||[]).map((u,i)=>`<tr><td>${esc(u.name)}</td><td>${esc(u.role)}</td><td class="muted">set</td>
+    <td><input id="setpw_${i}" type="password" placeholder="new password" style="width:130px"></td>
+    <td><button class="btn ghost" style="padding:2px 8px;font-size:11px" onclick="setPw(${i})">Set</button>
+    <button class="btn ghost" style="padding:2px 8px;font-size:11px" onclick="delUser(${i})">Del</button></td></tr>`).join('')||'<tr><td colspan=5 class=muted>No users</td></tr>';
+}
+
+function addUser(){
+  const n=$('#setu_name')?.value.trim(),p=$('#setu_pass')?.value,role=$('#setu_role')?.value||'viewer';
+  if(!n||!p){toast('need username + password');return}
+  _setCfg.users=_setCfg.users||[];
+  _setCfg.users=_setCfg.users.filter(u=>u.name!==n);
+  _setCfg.users.push({name:n,password:p,role});
+  renderSettings();toast(`user ${n} staged — Save settings to apply`);
+}
+function setPw(i){const p=$(`#setpw_${i}`)?.value;if(!p){toast('enter a password');return}_setCfg.users[i].password=p;toast('password staged — Save settings to apply')}
+function delUser(i){_setCfg.users.splice(i,1);renderUsers()}
+async function saveJson(){
+  try{_setCfg=JSON.parse($('#setjson').value)}catch(e){toast('invalid JSON: '+e.message);return}
+  await saveSettings();
+}
+async function saveSettings(){
+  const msg=$('#setmsg');if(msg)msg.textContent='saving…';
+  try{
+    const r=await api('/api/v1/admin/settings',{method:'PUT',body:_setCfg});
+    if(msg)msg.innerHTML=r.ok?'<span style="color:var(--green)">saved — hot-applied</span>':'<span style="color:#fbbf24">saved, but reload reported errors</span>';
+    toast(r.ok?'settings saved + applied':'settings saved — check reload errors');
+    // Refresh the form from the server's normalized view.
+    const d=await api('/api/v1/admin/settings');_setCfg=d.config;_setMeta=d;renderSettings();
+  }catch(e){if(msg)msg.innerHTML=`<span style="color:var(--red)">save failed: ${esc(e.message)}</span>`;toast('save failed: '+e.message)}
 }
 
 function fmtUp(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';return Math.floor(s/86400)+'d '+Math.floor(s%86400/3600)+'h'}

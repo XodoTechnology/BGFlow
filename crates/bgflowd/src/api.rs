@@ -29,7 +29,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub http_enrich: Arc<HttpEnrichers>,
     pub geo: Arc<MmdbGeo>,
-    pub config: Arc<Config>,
+    /// Live effective config — swapped by AdminShared::reload so reads
+    /// always reflect the last successfully loaded config.
+    pub config: Arc<RwLock<Config>>,
     pub auth: Arc<AuthState>,
     pub admin: Arc<AdminShared>,
     pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
@@ -226,19 +228,20 @@ fn git_describe(cfg: &crate::config::Config) -> String {
 
 fn status_payload(st: &AppState) -> serde_json::Value {
     let s = st.status.read().unwrap().clone();
-    let system = crate::sys::sample(&st.config.storage.data_dir);
+    let cfg = st.config.read().unwrap();
+    let system = crate::sys::sample(&cfg.storage.data_dir);
     serde_json::json!({
-        "version": version_display(&st.config),
-        "git": git_describe(&st.config),
+        "version": version_display(&cfg),
+        "git": git_describe(&cfg),
         "system": system,
         "status": s,
         "storage": {
             "bytes": s.flow_bytes + s.rollup_bytes + s.hourly_bytes,
-            "cap_bytes": st.config.storage.max_bytes,
+            "cap_bytes": cfg.storage.max_bytes,
         },
         "orgs": st.ctx.orgs.len(),
         "rules": st.ctx.rules.len(),
-        "inputs": st.config.inputs.iter().map(|i| i.listen.to_string()).collect::<Vec<_>>(),
+        "inputs": cfg.inputs.iter().map(|i| i.listen.to_string()).collect::<Vec<_>>(),
         "auth": {
             "enabled": !st.auth.is_open(),
             "users": st.auth.user_count(),
@@ -291,14 +294,17 @@ async fn flows(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
+    // Probe one row past the page size — `has_more` tells the UI whether
+    // a Next page exists without a separate count scan.
+    let want: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500)
+        .min(10_000);
     let mut fq = FlowQuery {
         from_ms: from,
         to_ms: to,
-        limit: q
-            .get("limit")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(500)
-            .min(10_000),
+        limit: want + 1,
         offset: q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0),
         newest_first: q.get("order").map(|s| s != "asc").unwrap_or(true),
         ..Default::default()
@@ -371,6 +377,8 @@ async fn flows(
     }
 
     let mut recs = query::flows(&st.ctx, &fq).map_err(|e| err(e.to_string()))?;
+    let has_more = recs.len() > want;
+    recs.truncate(want);
     // Enrich-at-read: fills org/country/asn fields the ingest-time pipeline
     // missed (pre-enrichment data, cold caches, table lookups).
     for f in recs.iter_mut() {
@@ -384,6 +392,7 @@ async fn flows(
     Ok(Json(serde_json::json!({
         "count": out.len(),
         "offset": fq.offset,
+        "has_more": has_more,
         "flows": out,
     })))
 }
@@ -1288,7 +1297,13 @@ async fn exporter_rename(
     let u = bgflow_types::ip_to_u128(&ip);
     let effective = match &name {
         Some(n) => Some(n.clone()),
-        None => st.config.exporter_names.get(&ip_s).cloned(),
+        None => st
+            .config
+            .read()
+            .unwrap()
+            .exporter_names
+            .get(&ip_s)
+            .cloned(),
     };
     st.ctx
         .exporter_names
@@ -1661,7 +1676,7 @@ async fn label_stats(
 
 /// Effective config for the UI settings view — secrets redacted.
 async fn config_view(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let mut v = serde_json::to_value(&*st.config).unwrap_or(serde_json::json!({}));
+    let mut v = serde_json::to_value(&*st.config.read().unwrap()).unwrap_or(serde_json::json!({}));
     if let Some(srv) = v.get_mut("server").and_then(|s| s.as_object_mut()) {
         if srv.contains_key("auth") {
             srv.insert("auth".into(), serde_json::json!("***"));
@@ -1781,6 +1796,7 @@ fn openapi_spec() -> serde_json::Value {
             "/api/v1/auth/logout": {"post": {"summary": "Logout (clears session cookie)"}},
             "/api/v1/auth/me": {"get": {"summary": "Current identity or 401"}},
             "/api/v1/admin/reload": {"post": {"summary": "Hot-reload rules/enrichers/users/alerts (admin)"}},
+            "/api/v1/admin/settings": {"get": {"summary": "Effective config JSON, secrets redacted (admin)"}, "put": {"summary": "Save settings → settings.json + hot-apply (admin)"}},
             "/metrics": {"get": {"summary": "Prometheus metrics"}},
         }
     })
@@ -2015,6 +2031,206 @@ async fn admin_reload(State(st): State<Arc<AppState>>) -> Json<serde_json::Value
 }
 
 // ---------------------------------------------------------------------------
+// Runtime settings (settings.json overlay)
+// ---------------------------------------------------------------------------
+
+/// Marker the GET endpoint emits in place of real password hashes; PUT
+/// maps it back to the existing hash so round-trips don't wipe passwords.
+const REDACTED: &str = "•••";
+
+/// Config keys the hot-reload path cannot apply — they take effect on
+/// the next daemon start. Surfaced to the UI so editors can badge them.
+const RESTART_KEYS: &[&str] = &[
+    "server",
+    "inputs",
+    "snmp",
+    "demo",
+    "storage.data_dir",
+    "storage.flows_dir",
+    "storage.rollups_dir",
+    "storage.hourly_dir",
+    "storage.segment_rows",
+    "storage.segment_interval_secs",
+    "storage.channel_capacity",
+    "storage.retention_interval_secs",
+    "storage.sample_weighting",
+    "storage.coarse_rollup",
+];
+
+/// Config paths whose scalar value is a credential — redacted in GET
+/// and restored from the live config when a PUT echoes the marker back.
+const SECRET_PATHS: &[&str] = &[
+    "/snmp/community",
+    "/session_secret",
+    "/alerts/webhook_url",
+];
+
+fn raw_settings(st: &AppState) -> serde_json::Value {
+    serde_json::to_value(&*st.config.read().unwrap()).unwrap_or(serde_json::json!({}))
+}
+
+fn effective_settings(st: &AppState) -> serde_json::Value {
+    let mut v = raw_settings(st);
+    redact_secrets(&mut v);
+    v
+}
+
+fn redact_secrets(v: &mut serde_json::Value) {
+    if let Some(users) = v.get_mut("users").and_then(|u| u.as_array_mut()) {
+        for u in users.iter_mut() {
+            if let Some(o) = u.as_object_mut() {
+                o.insert("password_hash".into(), serde_json::json!(REDACTED));
+            }
+        }
+    }
+    for ptr in SECRET_PATHS {
+        if let Some(slot) = v.pointer_mut(ptr) {
+            if !slot.is_null() {
+                *slot = serde_json::json!(REDACTED);
+            }
+        }
+    }
+    // Enricher headers can carry API keys/Authorization — redact each
+    // value but keep the key names visible.
+    if let Some(enrs) = v.get_mut("enrichers").and_then(|e| e.as_array_mut()) {
+        for e in enrs.iter_mut() {
+            if let Some(h) = e.get_mut("headers").and_then(|h| h.as_object_mut()) {
+                for val in h.values_mut() {
+                    *val = serde_json::json!(REDACTED);
+                }
+            }
+        }
+    }
+}
+
+/// Before deep-merging a PUT body, replace every REDACTED marker with
+/// the real value from `merged` (the current effective config), so a
+/// GET→edit→PUT round-trip never persists "•••" literally.
+fn restore_secrets(body: &mut serde_json::Value, merged: &serde_json::Value) {
+    for ptr in SECRET_PATHS {
+        if let Some(slot) = body.pointer_mut(ptr) {
+            if slot.as_str() == Some(REDACTED) {
+                if let Some(real) = merged.pointer(ptr) {
+                    *slot = real.clone();
+                }
+            }
+        }
+    }
+    // Enricher headers: match by enricher `name`, restore per header key.
+    let (Some(bb), Some(mb)) = (
+        body.get_mut("enrichers").and_then(|e| e.as_array_mut()),
+        merged.get("enrichers").and_then(|e| e.as_array()),
+    ) else {
+        return;
+    };
+    for b in bb.iter_mut() {
+        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let Some(m) = mb
+            .iter()
+            .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+        else {
+            continue;
+        };
+        let (Some(bh), Some(mh)) = (
+            b.get_mut("headers").and_then(|h| h.as_object_mut()),
+            m.get("headers").and_then(|h| h.as_object()),
+        ) else {
+            continue;
+        };
+        for (k, v) in bh.iter_mut() {
+            if v.as_str() == Some(REDACTED) {
+                if let Some(real) = mh.get(k) {
+                    *v = real.clone();
+                }
+            }
+        }
+    }
+}
+
+/// GET /api/v1/admin/settings — effective config (bgflow.toml +
+/// settings.json + env) with password hashes redacted.
+async fn admin_settings_get(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "config": effective_settings(&st),
+        "settings_path": crate::config::settings_path(st.admin.config_path.as_ref()),
+        "restart_required": RESTART_KEYS,
+    }))
+}
+
+/// PUT /api/v1/admin/settings — body is a partial or full config object,
+/// deep-merged onto the effective config, validated, persisted to
+/// <data_dir>/settings.json, then hot-applied via the reload path.
+async fn admin_settings_put(
+    State(st): State<Arc<AppState>>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !body.is_object() {
+        return Err(err("settings body must be a JSON object"));
+    }
+    // Merge onto the REAL config — the redacted view is GET-only;
+    // merging onto it would persist "•••" as literal password hashes.
+    let mut merged = raw_settings(&st);
+    // Users: plaintext `password` becomes a hash; the redaction marker
+    // restores the existing hash by name so GET→PUT round-trips are safe.
+    if let Some(ov_users) = body.get_mut("users").and_then(|u| u.as_array_mut()) {
+        for u in ov_users.iter_mut() {
+            let Some(o) = u.as_object_mut() else { continue };
+            if let Some(pw) = o.remove("password") {
+                if let Some(p) = pw.as_str().filter(|s| !s.is_empty()) {
+                    o.insert(
+                        "password_hash".into(),
+                        serde_json::json!(crate::auth::hash_password(p)),
+                    );
+                }
+            }
+            if o.get("password_hash").and_then(|h| h.as_str()) == Some(REDACTED) {
+                let name = o.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let old = merged
+                    .get("users")
+                    .and_then(|us| us.as_array())
+                    .and_then(|us| {
+                        us.iter().find(|x| {
+                            x.get("name").and_then(|n| n.as_str()) == Some(name)
+                        })
+                    })
+                    .and_then(|x| x.get("password_hash"))
+                    .cloned();
+                if let Some(h) = old {
+                    o.insert("password_hash".into(), h);
+                }
+            }
+        }
+    }
+    restore_secrets(&mut body, &merged);
+    crate::config::deep_merge(&mut merged, body);
+    // Validate the merged result before touching disk.
+    serde_json::from_value::<crate::config::Config>(merged.clone())
+        .map_err(|e| err(format!("invalid settings: {}", e)))?;
+    // Write where config::load will look on the next boot — resolved
+    // from the pre-overlay data_dir, not the (possibly overridden) live one.
+    let path = crate::config::settings_path(st.admin.config_path.as_ref());
+    let text = serde_json::to_string_pretty(&merged).map_err(|e| err(e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| err(format!("cannot write {}: {}", tmp.display(), e)))?;
+    // settings.json carries password hashes + secrets — owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| err(format!("cannot install {}: {}", path.display(), e)))?;
+    // Same path as SIGHUP — reload() re-reads config::load which now
+    // includes the overlay, so everything hot-appliable applies live.
+    let rep = st.admin.reload();
+    Ok(Json(serde_json::json!({
+        "ok": rep.ok,
+        "settings_path": path,
+        "report": rep,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
 
@@ -2221,9 +2437,19 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/admin/reload", post(admin_reload))
+    .route("/api/v1/admin/settings", get(admin_settings_get).put(admin_settings_put))
         .route("/metrics", get(metrics_handler));
 
-    let cors_enabled = st.config.server.cors;
+    // CORS is baked into the router at startup — snapshot once. Changes
+    // via settings apply on restart (listed under restart-required).
+    let (cors_enabled, cors_origins, cors_wildcard) = {
+        let c = st.config.read().unwrap();
+        (
+            c.server.cors,
+            c.server.cors_origins.clone(),
+            c.server.cors_origins.is_empty(),
+        )
+    };
     let app = Router::new()
         .merge(api)
         .route("/", get(index))
@@ -2235,17 +2461,11 @@ pub fn router(st: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(security_headers));
 
     if cors_enabled {
-        if st.config.server.cors_origins.is_empty() {
+        if cors_wildcard {
             tracing::warn!("server.cors=true with no cors_origins — wide-open CORS (dev only!)");
             app.layer(tower_http::cors::CorsLayer::permissive())
         } else {
-            let origins: Vec<_> = st
-                .config
-                .server
-                .cors_origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
+            let origins: Vec<_> = cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
             app.layer(
                 tower_http::cors::CorsLayer::new()
                     .allow_origin(origins)

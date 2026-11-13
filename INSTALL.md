@@ -8,21 +8,28 @@ curl -fsSL https://raw.githubusercontent.com/XodoTechnology/BGFlow/main/install.
 
 This downloads the latest release binary for your platform, installs it to
 `/usr/local/bin/bgflowd`, creates the `bgflow` user and `/var/lib/bgflow`
-data directory, installs the systemd unit, and drops a starter config at
-`/etc/bgflow/bgflow.toml`.
+data directory, installs a hardened systemd unit, generates an admin
+password (printed once at the end), validates the config, and drops a
+starter config at `/etc/bgflow/bgflow.toml`.
 
-Environment overrides:
+Options:
 
 ```bash
-BGFLOW_VERSION=v0.1.0       # pin a version
-BGFLOW_INSTALL_DIR=/opt/bgflow
+sh install.sh --start                 # also enable + start the service
+sh install.sh --http 127.0.0.1:8080   # bind address for the UI/API
+sh install.sh --admin-user netops     # admin username (default: admin)
+sh install.sh --demo                  # enable the built-in traffic demo
+sh install.sh --version v0.1.0        # pin a version
+sh install.sh --prefix /opt/bgflow    # install prefix
 ```
+
+Or via environment: `BGFLOW_VERSION`, `BGFLOW_INSTALL_DIR`.
 
 Then:
 
 ```bash
-sudo nano /etc/bgflow/bgflow.toml
-sudo systemctl enable --now bgflowd
+sudo systemctl enable --now bgflowd    # unless you passed --start
+# UI → http://<host>:8080 — log in with the generated admin password
 ```
 
 ## Option 2: Docker
@@ -160,13 +167,30 @@ update_secs = 604800        # weekly (0 = weekly default)
 A cron/systemd timer running `bgflowd geoip-update` works too — the
 daemon notices the new files on its next tick.
 
+## Changing settings
+
+Most configuration is editable **live in the UI** — open **Settings**
+(admin login). Saving writes `/var/lib/bgflow/settings.json`, which
+overrides `bgflow.toml` key-by-key, and hot-applies everything except
+fields tagged `↻ restart` (listeners, SNMP poller, storage layout).
+Delete `settings.json` to return to pure file configuration. Secrets
+(password hashes, SNMP community, API keys) are write-only in the UI —
+they show as `•••` and are preserved unless you type a new value.
+
+The same can be done by hand: edit `/etc/bgflow/bgflow.toml`, then
+`sudo systemctl reload bgflowd` (SIGHUP) — rules, enrichers, names,
+users, alerts, retention and the disk cap all apply without dropping
+ingest.
+
 ## Securing a public deployment
 
 If the UI/API will be reachable beyond localhost, **set up auth before
-exposing it** — `bgflowd` logs a warning when it detects this:
+exposing it** — `bgflowd` logs a warning when it detects this. The
+installer already creates an admin user; to add more or change
+passwords, either use **Settings → Users** in the UI or:
 
 ```bash
-# 1. Create users (prompts for password on stdin):
+# 1. Create a password hash (reads password from stdin):
 bgflowd hash-password
 
 # 2. Paste the printed hash into /etc/bgflow/bgflow.toml:
@@ -176,9 +200,8 @@ sudo nano /etc/bgflow/bgflow.toml
 #   password_hash = "pbkdf2-sha256$600000$...."
 #   role = "admin"
 
-# 3. Reload without restart (as an existing admin, or via SIGHUP):
+# 3. Reload without restart:
 sudo systemctl reload bgflowd     # or: sudo kill -HUP $(pidof bgflowd)
-#    — or use the UI's "⟳ cfg" button / POST /api/v1/admin/reload
 ```
 
 Then terminate TLS — either directly (`server.tls_cert`/`tls_key`) or at

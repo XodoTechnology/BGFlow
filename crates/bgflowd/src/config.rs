@@ -656,7 +656,63 @@ pub fn load(path: Option<&PathBuf>) -> Result<Config> {
         None => Config::default(),
     };
     apply_env_overrides(&mut cfg);
+    apply_settings_overlay(&mut cfg)?;
+    // Env vars are deployment-level intent — they win over UI settings too.
+    apply_env_overrides(&mut cfg);
     Ok(cfg)
+}
+
+/// Path of the runtime settings overlay. Resolved from the
+/// *pre-overlay* data_dir (toml + env) exactly as `load` does, so the
+/// admin API always writes where the next `load` will look — even if a
+/// previous settings save changed `storage.data_dir` itself.
+pub fn settings_path(config_path: Option<&PathBuf>) -> PathBuf {
+    let mut cfg = match resolve_path(config_path) {
+        Some(p) => std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|t| toml::from_str::<Config>(&t).ok())
+            .unwrap_or_default(),
+        None => Config::default(),
+    };
+    apply_env_overrides(&mut cfg);
+    cfg.storage.data_dir.join("settings.json")
+}
+
+/// Runtime settings saved from the admin UI live in
+/// `<data_dir>/settings.json` and deep-merge over bgflow.toml: objects
+/// merge key-by-key, scalars/arrays replace. Once the file exists it is
+/// authoritative for every key it contains — delete it to return to
+/// pure file configuration.
+fn apply_settings_overlay(cfg: &mut Config) -> Result<()> {
+    let p = cfg.storage.data_dir.join("settings.json");
+    if !p.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&p)
+        .with_context(|| format!("cannot read {}", p.display()))?;
+    let ov: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("cannot parse {}", p.display()))?;
+    let mut base = serde_json::to_value(cfg.clone()).context("cannot serialize config")?;
+    deep_merge(&mut base, ov);
+    *cfg = serde_json::from_value(base)
+        .context("settings.json produced an invalid config")?;
+    Ok(())
+}
+
+pub(crate) fn deep_merge(base: &mut serde_json::Value, ov: serde_json::Value) {
+    match (base, ov) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => deep_merge(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
 }
 
 /// Environment overrides (handy for containers): BGFLOW_HTTP_LISTEN,
@@ -672,5 +728,64 @@ fn apply_env_overrides(cfg: &mut Config) {
         if !v.is_empty() {
             cfg.storage.data_dir = std::path::PathBuf::from(v);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn deep_merge_objects_recursive() {
+        let mut base = json!({"a": {"x": 1, "y": 2}, "b": [1, 2], "c": "old"});
+        deep_merge(&mut base, json!({"a": {"y": 3, "z": 4}, "b": [9], "d": true}));
+        assert_eq!(base["a"]["x"], 1);
+        assert_eq!(base["a"]["y"], 3);
+        assert_eq!(base["a"]["z"], 4);
+        assert_eq!(base["b"], json!([9])); // arrays replace wholesale
+        assert_eq!(base["c"], "old");       // untouched keys survive
+        assert_eq!(base["d"], true);
+    }
+
+    #[test]
+    fn settings_overlay_merges_and_validates() {
+        let dir = std::env::temp_dir().join(format!("bgflow-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = dir.join("settings.json");
+        std::fs::write(
+            &sp,
+            r#"{"analytics":{"local_asns":[64512]},"storage":{"max_bytes":1073741824}}"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.storage.data_dir = dir.clone();
+        // Simulate the overlay step directly (load() resolves the path
+        // from data_dir, which we just set).
+        let p = cfg.storage.data_dir.join("settings.json");
+        let ov: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let mut base = serde_json::to_value(cfg.clone()).unwrap();
+        deep_merge(&mut base, ov);
+        let merged: Config = serde_json::from_value(base).unwrap();
+        assert_eq!(merged.analytics.local_asns, vec![64512]);
+        assert_eq!(merged.storage.max_bytes, 1073741824);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn settings_overlay_rejects_invalid() {
+        let dir = std::env::temp_dir().join(format!("bgflow-cfg-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"storage":{"max_bytes":"junk"}}"#).unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.data_dir = dir.clone();
+        let ov: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        let mut base = serde_json::to_value(cfg.clone()).unwrap();
+        deep_merge(&mut base, ov);
+        assert!(serde_json::from_value::<Config>(base).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
