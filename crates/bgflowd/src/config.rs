@@ -25,6 +25,10 @@ pub struct Config {
     /// [interface_names] "2" = "ae0"
     #[serde(default)]
     pub interface_names: std::collections::BTreeMap<String, String>,
+    /// VLAN names, keyed by VLAN id:
+    /// [vlan_names] "10" = "Devoli"
+    #[serde(default)]
+    pub vlan_names: std::collections::BTreeMap<String, String>,
     /// Multi-user accounts for the UI/API.
     /// [[users]] name = "admin" password_hash = "pbkdf2-sha256$..." role = "admin"
     /// Generate hashes with `bgflowd hash-password`. Roles: admin | viewer.
@@ -350,6 +354,7 @@ impl Default for Config {
             alerts: AlertsConfig::default(),
             exporter_names: Default::default(),
             interface_names: Default::default(),
+            vlan_names: Default::default(),
             users: vec![],
             exporters: ExportersConfig::default(),
         }

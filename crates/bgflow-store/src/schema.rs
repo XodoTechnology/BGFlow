@@ -239,7 +239,7 @@ pub mod raw_idx {
 }
 
 /// Schema id 3: rollup records (19 columns). id 1 was the v1 layout.
-pub const ROLLUP_SCHEMA: Schema = Schema {
+pub const ROLLUP_SCHEMA_V1: Schema = Schema {
     id: 3,
     name: "rollup",
     columns: &[
@@ -265,6 +265,65 @@ pub const ROLLUP_SCHEMA: Schema = Schema {
     ],
 };
 
+/// Schema id 5: rollup records + `vlan`.
+pub const ROLLUP_SCHEMA_V2: Schema = Schema {
+    id: 5,
+    name: "rollup",
+    columns: &[
+        col!("bucket_ms", U64, Delta, ts),
+        col!("exporter", U128, Dict),
+        col!("protocol", U8, Dict),
+        col!("src_asn", U32, Dict),
+        col!("dst_asn", U32, Dict),
+        col!("src_ip", U128, Plain),
+        col!("dst_ip", U128, Plain),
+        col!("src_port", U16, Plain),
+        col!("dst_port", U16, Plain),
+        col!("src_country", U16, Dict),
+        col!("dst_country", U16, Dict),
+        col!("bytes", U64, Plain),
+        col!("packets", U64, Plain),
+        col!("flows", U64, Plain),
+        col!("min_ts_ms", U64, Plain),
+        col!("max_ts_ms", U64, Plain),
+        col!("src_org", U32, Dict),
+        col!("dst_org", U32, Dict),
+        col!("label_id", U32, Dict),
+        col!("vlan", U16, Dict),
+    ],
+};
+
+/// Schema id 6: rollup records + `vlan`, `ingress_if`, `egress_if`
+/// (appended — older segments decode them as 0 via the sparse row view).
+pub const ROLLUP_SCHEMA: Schema = Schema {
+    id: 6,
+    name: "rollup",
+    columns: &[
+        col!("bucket_ms", U64, Delta, ts),
+        col!("exporter", U128, Dict),
+        col!("protocol", U8, Dict),
+        col!("src_asn", U32, Dict),
+        col!("dst_asn", U32, Dict),
+        col!("src_ip", U128, Plain),
+        col!("dst_ip", U128, Plain),
+        col!("src_port", U16, Plain),
+        col!("dst_port", U16, Plain),
+        col!("src_country", U16, Dict),
+        col!("dst_country", U16, Dict),
+        col!("bytes", U64, Plain),
+        col!("packets", U64, Plain),
+        col!("flows", U64, Plain),
+        col!("min_ts_ms", U64, Plain),
+        col!("max_ts_ms", U64, Plain),
+        col!("src_org", U32, Dict),
+        col!("dst_org", U32, Dict),
+        col!("label_id", U32, Dict),
+        col!("vlan", U16, Dict),
+        col!("ingress_if", U32, Dict),
+        col!("egress_if", U32, Dict),
+    ],
+};
+
 /// Column indices into ROLLUP_SCHEMA.
 pub mod rollup_idx {
     pub const BUCKET_MS: usize = 0;
@@ -286,13 +345,20 @@ pub mod rollup_idx {
     pub const SRC_ORG: usize = 16;
     pub const DST_ORG: usize = 17;
     pub const LABEL_ID: usize = 18;
+    /// Only in schema id ≥5 — absent (reads 0) on id-3 segments.
+    pub const VLAN: usize = 19;
+    /// Only in schema id ≥6 — absent (reads 0) on older segments.
+    pub const INGRESS_IF: usize = 20;
+    pub const EGRESS_IF: usize = 21;
 }
 
 pub fn schema_by_id(id: u16) -> Option<&'static Schema> {
     match id {
         2 => Some(&RAW_SCHEMA_V1),
-        3 => Some(&ROLLUP_SCHEMA),
+        3 => Some(&ROLLUP_SCHEMA_V1),
         4 => Some(&RAW_SCHEMA),
+        5 => Some(&ROLLUP_SCHEMA_V2),
+        6 => Some(&ROLLUP_SCHEMA),
         _ => None,
     }
 }

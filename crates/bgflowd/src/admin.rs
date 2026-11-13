@@ -4,7 +4,7 @@
 use crate::auth::AuthState;
 use crate::config::{self, AlertsConfig};
 use crate::enrich::{HttpEnrichers, MmdbGeo};
-use crate::query::{ExporterNames, InterfaceNames};
+use crate::query::{ExporterNames, InterfaceNames, VlanNames};
 use crate::rules::Ruleset;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -18,6 +18,7 @@ pub struct AdminShared {
     pub enrich: Arc<HttpEnrichers>,
     pub exporter_names: Arc<RwLock<ExporterNames>>,
     pub interface_names: Arc<RwLock<InterfaceNames>>,
+    pub vlan_names: Arc<RwLock<VlanNames>>,
     pub auth: Arc<AuthState>,
     pub alerts: Arc<RwLock<AlertsConfig>>,
     /// MMDB geo readers — swapped on reload so geoip config/path changes
@@ -78,8 +79,19 @@ impl AdminShared {
 
         *self.exporter_names.write().unwrap() = ExporterNames::build(&cfg.exporter_names);
         rep.exporter_names = cfg.exporter_names.len();
+        // Re-apply UI-set names persisted in the exporter policy.
+        {
+            let mut names = self.exporter_names.write().unwrap();
+            for (ip, e) in self.exporter_policy.entries() {
+                if let Some(n) = e.name {
+                    names.set_name(bgflow_types::ip_to_u128(&ip), Some(n));
+                }
+            }
+        }
 
         *self.interface_names.write().unwrap() = InterfaceNames::build(&cfg.interface_names);
+
+        *self.vlan_names.write().unwrap() = VlanNames::build(&cfg.vlan_names);
 
         rep.users = self.auth.reload_users(&cfg.users);
 

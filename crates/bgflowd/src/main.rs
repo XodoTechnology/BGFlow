@@ -241,9 +241,23 @@ async fn main() -> Result<()> {
         Arc::new(RwLock::new(query::ExporterNames::build(
             &cfg.exporter_names,
         )));
+    // Overlay UI-set names persisted in the exporter policy — they win
+    // over [exporter_names] config until cleared.
+    {
+        let mut names = exporter_names.write().unwrap();
+        for (ip, e) in exporter_policy.entries() {
+            if let Some(n) = e.name {
+                names.set_name(bgflow_types::ip_to_u128(&ip), Some(n));
+            }
+        }
+    }
     let interface_names =
         Arc::new(RwLock::new(query::InterfaceNames::build(
             &cfg.interface_names,
+        )));
+    let vlan_names =
+        Arc::new(RwLock::new(query::VlanNames::build(
+            &cfg.vlan_names,
         )));
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
@@ -255,6 +269,7 @@ async fn main() -> Result<()> {
         enrich: http_enrich.clone(),
         exporter_names: exporter_names.clone(),
         interface_names: interface_names.clone(),
+        vlan_names: vlan_names.clone(),
         auth: auth.clone(),
         alerts: alerts_cfg.clone(),
         geo: geo.clone(),
@@ -280,6 +295,7 @@ async fn main() -> Result<()> {
             rules: rules.clone(),
             exporter_names: exporter_names.clone(),
             interface_names: interface_names.clone(),
+            vlan_names: vlan_names.clone(),
             ptr: ptr.clone(),
         },
         status: shared.status.clone(),

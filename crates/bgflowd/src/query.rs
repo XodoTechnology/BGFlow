@@ -38,6 +38,18 @@ impl ExporterNames {
         self.by_ip.get(&ip).map(|s| s.as_str())
     }
 
+    /// Runtime name override (UI-set exporter names persisted via the
+    /// exporter policy). `None` removes the override.
+    pub fn set_name(&mut self, ip: u128, name: Option<String>) {
+        if let Some(old) = self.by_ip.remove(&ip) {
+            self.by_name.remove(&old.to_lowercase());
+        }
+        if let Some(n) = name.filter(|s| !s.trim().is_empty()) {
+            self.by_name.insert(n.trim().to_lowercase(), ip);
+            self.by_ip.insert(ip, n);
+        }
+    }
+
     /// Resolve a filter token: IP literal, "name (ip)" display form, or
     /// configured name (case-insensitive).
     pub fn resolve(&self, token: &str) -> Option<u128> {
@@ -84,6 +96,33 @@ impl InterfaceNames {
     }
 }
 
+/// VLAN id → display name from `[vlan_names]` config, e.g. "10" = "Devoli".
+/// Swapped on reload like interface names.
+#[derive(Default)]
+pub struct VlanNames {
+    by_vlan: HashMap<u16, String>,
+}
+
+impl VlanNames {
+    pub fn build(map: &std::collections::BTreeMap<String, String>) -> Self {
+        let mut e = VlanNames::default();
+        for (k, v) in map {
+            if let Ok(i) = k.trim().parse::<u16>() {
+                e.by_vlan.insert(i, v.clone());
+            }
+        }
+        e
+    }
+
+    pub fn name_of(&self, vlan: u16) -> Option<&str> {
+        self.by_vlan.get(&vlan).map(|s| s.as_str())
+    }
+
+    pub fn all(&self) -> &HashMap<u16, String> {
+        &self.by_vlan
+    }
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub flow_index: SegmentIndex,
@@ -96,6 +135,7 @@ pub struct Ctx {
     pub rules: Arc<Ruleset>,
     pub exporter_names: Arc<RwLock<ExporterNames>>,
     pub interface_names: Arc<RwLock<InterfaceNames>>,
+    pub vlan_names: Arc<RwLock<VlanNames>>,
     /// Reverse-DNS cache — non-blocking lookups for flow rows.
     pub ptr: Arc<PtrCache>,
 }
@@ -164,6 +204,11 @@ pub struct FlowQuery {
     /// City-name string-table ids (0/None = any).
     pub src_city: Option<u32>,
     pub dst_city: Option<u32>,
+    /// VLAN id filter (None = any; 0 matches untagged flows).
+    pub vlan: Option<u16>,
+    /// Interface index filters (raw flows carry them on every schema).
+    pub ingress_if: Option<u32>,
+    pub egress_if: Option<u32>,
     pub limit: usize,
     /// Skip this many matching rows before collecting (pagination).
     pub offset: usize,
@@ -242,6 +287,21 @@ impl FlowQuery {
         }
         if let Some(v) = self.dst_city {
             if f.dst_city != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.vlan {
+            if f.vlan != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.ingress_if {
+            if f.ingress_if != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.egress_if {
+            if f.egress_if != v {
                 return false;
             }
         }
@@ -390,6 +450,18 @@ impl RollupRow<'_> {
         self.v(rollup_idx::DST_ORG) as u32
     }
     #[inline]
+    pub fn vlan(&self) -> u16 {
+        self.v(rollup_idx::VLAN) as u16
+    }
+    #[inline]
+    pub fn ingress_if(&self) -> u32 {
+        self.v(rollup_idx::INGRESS_IF) as u32
+    }
+    #[inline]
+    pub fn egress_if(&self) -> u32 {
+        self.v(rollup_idx::EGRESS_IF) as u32
+    }
+    #[inline]
     pub fn label_id(&self) -> u32 {
         self.v(rollup_idx::LABEL_ID) as u32
     }
@@ -417,6 +489,12 @@ pub struct RollupFilter {
     pub src_org: Option<u32>,
     pub dst_org: Option<u32>,
     pub label: Option<u32>,
+    /// VLAN id filter (0/None = any). Rollup schema ≥5 only — older
+    /// segments read vlan=0 so they match only vlan=0 filters.
+    pub vlan: Option<u16>,
+    /// Interface index filters (schema ≥6 rollups; raw flows always have them).
+    pub ingress_if: Option<u32>,
+    pub egress_if: Option<u32>,
 }
 
 impl RollupFilter {
@@ -494,6 +572,21 @@ impl RollupFilter {
                 return false;
             }
         }
+        if let Some(v) = self.vlan {
+            if r.vlan() != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.ingress_if {
+            if r.ingress_if() != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.egress_if {
+            if r.egress_if() != v {
+                return false;
+            }
+        }
         true
     }
 
@@ -540,6 +633,15 @@ impl RollupFilter {
         if self.label.is_some() {
             v.push(ix::LABEL_ID);
         }
+        if self.vlan.is_some() {
+            v.push(ix::VLAN);
+        }
+        if self.ingress_if.is_some() {
+            v.push(ix::INGRESS_IF);
+        }
+        if self.egress_if.is_some() {
+            v.push(ix::EGRESS_IF);
+        }
         v
     }
 }
@@ -562,6 +664,9 @@ pub fn dim_col(by: &str) -> Option<usize> {
         "src_org" => ix::SRC_ORG,
         "dst_org" => ix::DST_ORG,
         "label" | "label_id" => ix::LABEL_ID,
+        "vlan" => ix::VLAN,
+        "ingress_if" => ix::INGRESS_IF,
+        "egress_if" => ix::EGRESS_IF,
         _ => return None,
     })
 }
@@ -954,6 +1059,9 @@ pub fn dim_key(by: &str, r: &RollupRow) -> u128 {
         "src_org" => r.src_org() as u128,
         "dst_org" => r.dst_org() as u128,
         "label" | "label_id" => r.label_id() as u128,
+        "vlan" => r.vlan() as u128,
+        "ingress_if" => r.ingress_if() as u128,
+        "egress_if" => r.egress_if() as u128,
         "src_ipver" => {
             if is_v4_mapped(r.src_ip()) { 4 } else { 6 }
         }
@@ -969,7 +1077,7 @@ pub fn format_key(ctx: &Ctx, by: &str, key: u128) -> serde_json::Value {
     // Dimensions where 0 means "unset/unknown" display as "-".
     match by {
         "src_asn" | "dst_asn" | "src_country" | "dst_country" | "src_org"
-        | "dst_org" | "label" | "label_id" if key == 0 => {
+        | "dst_org" | "label" | "label_id" | "vlan" if key == 0 => {
             return serde_json::json!("-");
         }
         _ => {}
@@ -1015,6 +1123,8 @@ pub fn format_key(ctx: &Ctx, by: &str, key: u128) -> serde_json::Value {
         "src_ipver" | "dst_ipver" => {
             serde_json::json!(if key == 4 { "IPv4" } else { "IPv6" })
         }
+        "vlan" => serde_json::json!(key as u16),
+        "ingress_if" | "egress_if" => serde_json::json!(key as u32),
         _ => serde_json::json!(key),
     }
 }

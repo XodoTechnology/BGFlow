@@ -27,6 +27,9 @@ struct RollupKey {
     src_org: u32,
     dst_org: u32,
     label_id: u32,
+    vlan: u16,
+    ingress_if: u32,
+    egress_if: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -115,6 +118,9 @@ impl RollupAggregator {
             src_org: f.src_org,
             dst_org: f.dst_org,
             label_id: f.label_id,
+            vlan: f.vlan,
+            ingress_if: f.ingress_if,
+            egress_if: f.egress_if,
         };
         let e = self.map.entry(key).or_insert(RollupAccum {
             min_ts: f.ts_ms,
@@ -160,6 +166,9 @@ impl RollupAggregator {
             src_org: k.src_org,
             dst_org: k.dst_org,
             label_id: k.label_id,
+            vlan: k.vlan,
+            ingress_if: k.ingress_if,
+            egress_if: k.egress_if,
             bytes: v.bytes,
             packets: v.packets,
             flows: v.flows,

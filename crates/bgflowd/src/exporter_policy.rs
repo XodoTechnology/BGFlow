@@ -48,6 +48,9 @@ pub struct PolicyEntry {
     pub approved_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// UI-set display name (overrides [exporter_names] config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Datagrams/bytes dropped by this policy since process start
     /// (not persisted — informational only).
     #[serde(skip)]
@@ -216,6 +219,20 @@ impl ExporterPolicy {
         st
     }
 
+    /// Set/clear the display name (None clears). Creates the entry if the
+    /// IP has never been seen — naming alone doesn't admit traffic.
+    pub fn set_name(&self, ip: IpAddr, name: Option<String>, now_ms: u64) {
+        let mut g = self.inner.lock().unwrap();
+        let e = g.map.entry(ip).or_insert_with(|| PolicyEntry {
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+            ..Default::default()
+        });
+        e.name = name.filter(|n| !n.trim().is_empty());
+        drop(g);
+        self.save();
+    }
+
     /// Remove an entry entirely — next datagram re-registers it (as
     /// pending when approval is required, invisible otherwise).
     pub fn remove(&self, ip: IpAddr) -> bool {
@@ -248,7 +265,10 @@ impl ExporterPolicy {
             .map
             .iter()
             .filter(|(_, e)| {
-                e.state != ExporterState::Approved || e.note.is_some() || e.approved_at_ms > 0
+                e.state != ExporterState::Approved
+                    || e.note.is_some()
+                    || e.name.is_some()
+                    || e.approved_at_ms > 0
             })
             .map(|(k, v)| {
                 let mut c = v.clone();

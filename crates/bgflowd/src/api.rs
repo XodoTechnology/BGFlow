@@ -139,6 +139,15 @@ fn rollup_filter(
     if let Some(s) = q.get("label") {
         f.label = resolve_label(ctx, s);
     }
+    if let Some(s) = q.get("vlan") {
+        f.vlan = Some(s.parse().map_err(|_| err("bad vlan"))?);
+    }
+    if let Some(s) = q.get("ingress_if") {
+        f.ingress_if = Some(s.parse().map_err(|_| err("bad ingress_if"))?);
+    }
+    if let Some(s) = q.get("egress_if") {
+        f.egress_if = Some(s.parse().map_err(|_| err("bad egress_if"))?);
+    }
     Ok(f)
 }
 
@@ -333,6 +342,15 @@ async fn flows(
     }
     if let Some(s) = q.get("label") {
         fq.label = resolve_label(&st.ctx, s);
+    }
+    if let Some(s) = q.get("vlan") {
+        fq.vlan = Some(s.parse().map_err(|_| err("bad vlan"))?);
+    }
+    if let Some(s) = q.get("ingress_if") {
+        fq.ingress_if = Some(s.parse().map_err(|_| err("bad ingress_if"))?);
+    }
+    if let Some(s) = q.get("egress_if") {
+        fq.egress_if = Some(s.parse().map_err(|_| err("bad egress_if"))?);
     }
     // City filters accept a string-table id or an exact city name.
     for (param, slot) in [("src_city", &mut fq.src_city), ("dst_city", &mut fq.dst_city)] {
@@ -945,7 +963,8 @@ async fn timeseries(
 const TOP_DIMS: &[&str] = &[
     "src_ip", "dst_ip", "src_ipver", "dst_ipver", "src_asn", "dst_asn",
     "src_org", "dst_org", "src_port", "dst_port", "proto",
-    "exporter", "src_country", "dst_country", "label",
+    "exporter", "src_country", "dst_country", "label", "vlan",
+    "ingress_if", "egress_if",
 ];
 
 async fn top(
@@ -1136,6 +1155,39 @@ async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// POST /api/v1/exporters/{ip}/name — {"name": "edge-rtr"} sets a display
+/// name (persisted in exporters.json, overrides [exporter_names]);
+/// {"name": ""} clears the override. Admin only.
+async fn exporter_rename(
+    State(st): State<Arc<AppState>>,
+    Path(ip_s): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ip: IpAddr = ip_s
+        .parse()
+        .map_err(|_| err(format!("bad exporter ip: {}", ip_s)))?;
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    let now = crate::metrics::now_ms();
+    st.exporter_policy.set_name(ip, name.clone(), now);
+    // Mirror into the runtime name table so top dims / flow rows pick it
+    // up immediately. Clearing falls back to the [exporter_names] config.
+    let u = bgflow_types::ip_to_u128(&ip);
+    let effective = match &name {
+        Some(n) => Some(n.clone()),
+        None => st.config.exporter_names.get(&ip_s).cloned(),
+    };
+    st.ctx
+        .exporter_names
+        .write()
+        .unwrap()
+        .set_name(u, effective);
+    tracing::info!("exporter {} renamed to {:?}", ip, name);
+    Ok(Json(serde_json::json!({"ok": true, "ip": ip_s, "name": name})))
+}
+
 /// POST /api/v1/exporters/{ip}/{action} — approve|suspend|reject|remove.
 /// Admin role only (enforced by middleware path check).
 async fn exporter_action(
@@ -1171,6 +1223,15 @@ async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> 
     items.sort_by_key(|(k, _)| **k);
     Json(serde_json::json!({
         "items": items.iter().map(|(k, v)| serde_json::json!({"ifindex": k, "name": v})).collect::<Vec<_>>()
+    }))
+}
+
+async fn vlans(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let g = st.ctx.vlan_names.read().unwrap();
+    let mut items: Vec<_> = g.all().iter().collect();
+    items.sort_by_key(|(k, _)| **k);
+    Json(serde_json::json!({
+        "items": items.iter().map(|(k, v)| serde_json::json!({"vlan": k, "name": v})).collect::<Vec<_>>()
     }))
 }
 
@@ -1431,6 +1492,9 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "src_city", "in": "query", "description": "city name (exact)"},
                 {"name": "dst_city", "in": "query", "description": "city name (exact)"},
                 {"name": "label", "in": "query", "description": "label name or id"},
+                {"name": "vlan", "in": "query", "description": "VLAN id (rollups need schema ≥5)"},
+                {"name": "ingress_if", "in": "query", "description": "ingress ifIndex (rollups need schema ≥6)"},
+                {"name": "egress_if", "in": "query", "description": "egress ifIndex (rollups need schema ≥6)"},
                 {"name": "limit", "in": "query"}, {"name": "offset", "in": "query"},
                 {"name": "order", "in": "query", "description": "asc|desc"},
                 {"name": "format", "in": "query", "description": "csv"},
@@ -1447,7 +1511,7 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "granularity", "in": "query", "description": "minute|hourly"},
             ]}},
             "/api/v1/top": {"get": {"summary": "Top-N by dimension", "parameters": [
-                {"name": "by", "in": "query", "description": "src_ip|dst_ip|src_ipver|dst_ipver|src_asn|dst_asn|src_org|dst_org|src_port|dst_port|proto|exporter|src_country|dst_country|label"},
+                {"name": "by", "in": "query", "description": "src_ip|dst_ip|src_ipver|dst_ipver|src_asn|dst_asn|src_org|dst_org|src_port|dst_port|proto|exporter|src_country|dst_country|label|vlan|ingress_if|egress_if"},
                 {"name": "granularity", "in": "query", "description": "minute|hourly"},
                 {"name": "limit", "in": "query"},
             ]}},
@@ -1462,6 +1526,7 @@ fn openapi_spec() -> serde_json::Value {
             ]}},
             "/api/v1/exporters/{ip}/{action}": {"post": {"summary": "Exporter admission action (admin): approve|suspend|reject|remove"}},
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
+            "/api/v1/vlans": {"get": {"summary": "Configured VLAN names ([vlan_names])"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
             "/api/v1/geo": {"get": {"summary": "Geo bubbles: lat/lon aggregates of recent raw flows (needs city MMDB + schema ≥4)", "parameters": [
                 {"name": "from", "in": "query"}, {"name": "to", "in": "query"},
@@ -1902,8 +1967,10 @@ pub fn router(st: Arc<AppState>) -> Router {
                 .layer(crate::qcache::SwrCacheLayer::new()),
         )
         .route("/api/v1/exporters", get(exporters))
+        .route("/api/v1/exporters/:ip/name", post(exporter_rename))
         .route("/api/v1/exporters/:ip/:action", post(exporter_action))
         .route("/api/v1/interfaces", get(interfaces))
+        .route("/api/v1/vlans", get(vlans))
         .route("/api/v1/labels", get(labels))
         .route("/api/v1/enrichers", get(enrichers))
         .route("/api/v1/asn", get(asn_lookup))

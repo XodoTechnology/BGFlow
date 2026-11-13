@@ -214,8 +214,10 @@ let ME=null; // {user,role,auth} or {open:true}
 function showLogin(){$('#login').style.display='flex';setTimeout(()=>$('#lu')?.focus(),50)}
 async function api(p,opt){
   const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),API_TIMEOUT);
+  const headers={};let body;
+  if(opt&&opt.body!=null){headers['Content-Type']='application/json';body=JSON.stringify(opt.body)}
   let r;
-  try{r=await fetch(p,{method:(opt&&opt.method)||'GET',signal:ctl.signal})}
+  try{r=await fetch(p,{method:(opt&&opt.method)||'GET',headers,body,signal:ctl.signal})}
   catch(e){clearTimeout(to);throw new Error(e.name==='AbortError'?'request timed out ('+API_TIMEOUT/1000+'s)':e.message)}
   clearTimeout(to);
   if(r.status===401&&ME&&!ME.open){showLogin();throw new Error('authentication required')}
@@ -226,8 +228,8 @@ async function probeAuth(){
   try{
     const r=await fetch('/api/v1/auth/me',{signal:AbortSignal.timeout(8000)});
     const d=await r.json();
-    if(d.auth){ME=d;showUser();loadExpNames();loadIfNames();startAuto();load()}
-    else if(d.open){ME={open:true};loadExpNames();loadIfNames();startAuto();load()}
+    if(d.auth){ME=d;showUser();loadExpNames();loadIfNames();loadVlanNames();startAuto();load()}
+    else if(d.open){ME={open:true};loadExpNames();loadIfNames();loadVlanNames();startAuto();load()}
     else showLogin();
   }catch(e){showLogin()}
 }
@@ -243,7 +245,7 @@ async function doLogin(){
   try{
     const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p}),signal:AbortSignal.timeout(15000)});
     if(!r.ok){const d=await r.json().catch(()=>({}));lerr.textContent=d.error||('login failed ('+r.status+')');return}
-    const d=await r.json();ME=d;$('#login').style.display='none';showUser();loadExpNames();loadIfNames();startAuto();load();
+    const d=await r.json();ME=d;$('#login').style.display='none';showUser();loadExpNames();loadIfNames();loadVlanNames();startAuto();load();
   }catch(e){lerr.textContent='request failed: '+e.message}
 }
 async function doLogout(){
@@ -285,6 +287,8 @@ function dimLabel(dim,key){
   if(dim.includes('ipver')){const v6=/6/.test(k);return `<span class="vbadge${v6?' v6':''}">${v6?'IPv6':'IPv4'}</span>`}
   if(dim.includes('asn'))return k==='-'?'-':`<span class="asn" data-asn="${esc(k)}"><span class="muted">AS</span>${esc(k)}</span>`;
   if(dim==='src_port'||dim==='dst_port')return portHtml(k);
+  if(dim==='vlan')return vlanLabel(k);
+  if(dim==='ingress_if'||dim==='egress_if')return ifLabel(Number(k));
   if((dim==='src_ip'||dim==='dst_ip'||dim==='exporter')&&looksIp(k))return `<span class="iplink" data-ip="${esc(k)}">${esc(k)}</span>`;
   return esc(k);
 }
@@ -405,7 +409,7 @@ async function load(silent){
     else if(state.view==='metrics')await vMetrics();
     state.updated=Date.now();state.lastErr=null;syncHash();
     if(silent)content.scrollTop=keepScroll;
-    enhanceAsns();
+    enhanceAsns();enhanceTopIps();
   }catch(e){
     if(silent){state.lastErr=e.message;toast('Refresh failed: '+e.message)}
     else content.innerHTML='<div class="err">Error: '+esc(e.message)+'</div>'
@@ -419,10 +423,33 @@ async function load(silent){
 function topTbl(items, dim){
   const fk=DIM2F[dim]||dim;
   return `<table><tr><th></th><th>Key</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${
-    (items||[]).map((t,i)=>`<tr><td class="num muted">${i+1}</td>
+    (items||[]).map((t,i)=>{
+      const k=String(t.key);
+      // IP-keyed rows show the endpoint's ASN in the rank column (rank is
+      // implicit in ordering anyway); resolved lazily by enhanceTopIps().
+      const rank=looksIp(k)?`<span class="muted" data-topip="${esc(k)}">·</span>`:`<span class="muted">${i+1}</span>`;
+      return `<tr><td class="num">${rank}</td>
       <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${dimLabel(dim,t.key)}</td>
-      <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`).join('')
+      <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`}).join('')
     ||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table>`;
+}
+// Fill [data-topip] rank cells with the IP's ASN (via /api/v1/lookup,
+// cached in _ipCache), then let enhanceAsns append registry names.
+const _topAsn={};
+async function enhanceTopIps(){
+  const cells=[...document.querySelectorAll('[data-topip]')].filter(e=>!e.dataset.done);
+  if(!cells.length)return;
+  const ips=[...new Set(cells.map(e=>e.dataset.topip))];
+  await Promise.all(ips.map(async ip=>{
+    if(_topAsn[ip]!==undefined)return;
+    let d=_ipCache[ip];
+    if(d===undefined){try{d=await api('/api/v1/lookup?ip='+encodeURIComponent(ip));_ipCache[ip]=d}catch(e){_ipCache[ip]={error:1}}}
+    const asn=((d.results||[]).map(r=>r.result||{}).find(m=>m.asn)||{}).asn;
+    _topAsn[ip]=asn||0;
+  }));
+  for(const e of cells){e.dataset.done='1';const a=_topAsn[e.dataset.topip];
+    e.innerHTML=a?`<span class="asn" data-asn="${a}"><span class="muted">AS</span>${a}</span>`:'<span class="muted">-</span>'}
+  enhanceAsns();
 }
 
 async function vOverview(){
@@ -552,16 +579,17 @@ function filterBar(extra=''){
     <input id="f_label" placeholder="label" value="${esc(F.label||'')}">
     <input id="f_scity" placeholder="src city" value="${esc(F.src_city||'')}" style="width:90px">
     <input id="f_dcity" placeholder="dst city" value="${esc(F.dst_city||'')}" style="width:90px">
+    <input id="f_vlan" placeholder="vlan" value="${esc(F.vlan||'')}" style="width:70px">
     <button class="btn" onclick="applyFilters()">Apply</button>
     <button class="btn ghost" onclick="clearFilters()">Clear</button>${extra}
   </div>`;
 }
-function readFilters(){F.src=$('#f_src')?.value||'';F.dst=$('#f_dst')?.value||'';F.proto=$('#f_proto')?.value||'';F.sport=$('#f_sport')?.value||'';F.dport=$('#f_dport')?.value||'';F.exporter=$('#f_exporter')?.value||'';const asn=$('#f_asn')?.value||'';F.src_asn=asn;F.dst_asn='';F.src_ipver=$('#f_sipv')?.value||'';F.dst_ipver=$('#f_dipv')?.value||'';F.label=$('#f_label')?.value||'';F.src_city=$('#f_scity')?.value||'';F.dst_city=$('#f_dcity')?.value||'';for(const k in F)if(!F[k])delete F[k]}
+function readFilters(){F.src=$('#f_src')?.value||'';F.dst=$('#f_dst')?.value||'';F.proto=$('#f_proto')?.value||'';F.sport=$('#f_sport')?.value||'';F.dport=$('#f_dport')?.value||'';F.exporter=$('#f_exporter')?.value||'';const asn=$('#f_asn')?.value||'';F.src_asn=asn;F.dst_asn='';F.src_ipver=$('#f_sipv')?.value||'';F.dst_ipver=$('#f_dipv')?.value||'';F.label=$('#f_label')?.value||'';F.src_city=$('#f_scity')?.value||'';F.dst_city=$('#f_dcity')?.value||'';F.vlan=$('#f_vlan')?.value||'';for(const k in F)if(!F[k])delete F[k]}
 function applyFilters(){readFilters();load()}
 function clearFilters(){for(const k in F)delete F[k];load()}
 
 // map a top-dim name to the filter param + value for click-to-filter
-const DIM2F={src_ip:'src',dst_ip:'dst',src_asn:'src_asn',dst_asn:'dst_asn',src_port:'sport',dst_port:'dport',proto:'proto',exporter:'exporter',src_country:'src_country',dst_country:'dst_country',label:'label',src_ipver:'src_ipver',dst_ipver:'dst_ipver',src_org:'src_org',dst_org:'dst_org'};
+const DIM2F={src_ip:'src',dst_ip:'dst',src_asn:'src_asn',dst_asn:'dst_asn',src_port:'sport',dst_port:'dport',proto:'proto',exporter:'exporter',src_country:'src_country',dst_country:'dst_country',label:'label',src_ipver:'src_ipver',dst_ipver:'dst_ipver',src_org:'src_org',dst_org:'dst_org',vlan:'vlan',ingress_if:'ingress_if',egress_if:'egress_if'};
 function clickDim(by,key){const f=DIM2F[by];if(!f)return;F[f]=key;load()}
 // raw key for filtering when formatted key is a display string
 function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
@@ -572,7 +600,7 @@ function clickDimRaw(by,keyRaw,fmtKey){const f=DIM2F[by];if(!f)return;
   else{F[f]=fmtKey}
   load()}
 
-const TOP_DIMS=['src_ip','dst_ip','src_ipver','dst_ipver','src_asn','dst_asn','src_org','dst_org','src_port','dst_port','proto','exporter','src_country','dst_country','label'];
+const TOP_DIMS=['src_ip','dst_ip','src_ipver','dst_ipver','src_asn','dst_asn','src_org','dst_org','src_port','dst_port','proto','exporter','src_country','dst_country','label','vlan','ingress_if','egress_if'];
 
 async function vFlows(){
   content.innerHTML=filterBar(`<select id="f_limit"><option>100</option><option selected>500</option><option>2000</option><option>10000</option></select>
@@ -591,8 +619,9 @@ async function vFlows(){
     <td>${ocCell(f.src_org||f.src_country)} → ${ocCell(f.dst_org||f.dst_country)}</td>
     <td>${f.label?`<span class="tag clickable" onclick="setFilter('label','${esc(f.label)}')">${esc(f.label)}</span>`:'<span class="muted">-</span>'}</td>
     <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td>
+    <td>${vlanLabel(f.vlan)}</td>
     <td title="ingress → egress">${ifLabel(f.ingress_if)}<span class="muted"> → </span>${ifLabel(f.egress_if)}</td></tr>`).join('');
-  $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th><th title="ingress → egress interface">Interfaces</th></tr>${rows||'<tr><td colspan=11 class=muted>No flows</td></tr>'}</table>
+  $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th><th>VID</th><th title="ingress → egress interface">Interfaces</th></tr>${rows||'<tr><td colspan=12 class=muted>No flows</td></tr>'}</table>
    <div class="hint">${data.count} flows · <a href="#" onclick="dlCsv();return false">download CSV</a></div>`;
 }
 async function dlCsv(){const r=await fetch('/api/v1/flows?'+q({limit:10000,format:'csv'}));const d=await r.json();const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([d.csv],{type:'text/csv'}));a.download='bgflow-flows.csv';a.click()}
@@ -683,6 +712,9 @@ async function loadExpNames(){try{const d=await api('/api/v1/exporters');expName
 function expLabel(ip){return expNames[ip]?`${expNames[ip]} (${ip})`:ip}
 let ifNames={};
 async function loadIfNames(){try{const d=await api('/api/v1/interfaces');ifNames={};(d.items||[]).forEach(e=>{if(e.name)ifNames[e.ifindex]=e.name})}catch(e){}}
+let vlanNames={};
+async function loadVlanNames(){try{const d=await api('/api/v1/vlans');vlanNames={};(d.items||[]).forEach(e=>{if(e.name)vlanNames[e.vlan]=e.name})}catch(e){}}
+function vlanLabel(v){v=Number(v);if(!v)return'<span class="muted">-</span>';const n=vlanNames[v];return`<span class="clickable" onclick="setFilter('vlan','${v}')" title="click to filter">VID ${v}${n?` <span class="muted">— ${esc(n)}</span>`:''}</span>`}
 function ifLabel(i){if(!i)return'—';const n=ifNames[i];return n?`${esc(n)} <span class="muted">#${i}</span>`:`<span class="muted">#${i}</span>`}
 
 async function vExporters(){
@@ -697,11 +729,12 @@ async function vExporters(){
     if(!isAdmin)return '';
     const ip=encodeURIComponent(e.ip);
     const btn=(a,l,dis)=>`<button class="btn" style="padding:2px 8px;font-size:11px" ${dis?'disabled':''} onclick="expAction('${ip}','${a}')">${l}</button>`;
-    if(e.state==='pending')return btn('approve','Approve')+' '+btn('reject','Reject');
-    if(e.state==='approved'||e.state==='active')return btn('suspend','Suspend')+' '+btn('reject','Reject');
-    if(e.state==='trusted')return btn('suspend','Suspend')+' '+btn('reject','Reject');
-    if(e.state==='suspended'||e.state==='rejected')return btn('approve','Approve')+' '+btn('remove','Remove');
-    return '';
+    const rn=`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="expRename('${ip}','${esc(e.ip)}')">Name</button>`;
+    if(e.state==='pending')return rn+' '+btn('approve','Approve')+' '+btn('reject','Reject');
+    if(e.state==='approved'||e.state==='active')return rn+' '+btn('suspend','Suspend')+' '+btn('reject','Reject');
+    if(e.state==='trusted')return rn+' '+btn('suspend','Suspend')+' '+btn('reject','Reject');
+    if(e.state==='suspended'||e.state==='rejected')return rn+' '+btn('approve','Approve')+' '+btn('remove','Remove');
+    return rn;
   };
   const rows=(ex.items||[]).map(e=>`<tr${e.state==='pending'?' style="background:rgba(251,191,36,.06)"':''}>
     <td><span class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${stateBadge(e.state)} ${e.name?`<b>${esc(e.name)}</b> <span class="muted">${esc(e.ip)}</span>`:esc(e.ip)}</span>${e.note?` <span class="muted">· ${esc(e.note)}</span>`:''}</td>
@@ -722,6 +755,12 @@ async function vExporters(){
 async function expAction(ip,action){
   try{await api(`/api/v1/exporters/${ip}/${action}`,{method:'POST'});toast(`${ip}: ${action} ok`);load(true)}
   catch(e){toast('action failed: '+e.message)}
+}
+async function expRename(ip,raw){
+  const n=prompt(`Name for exporter ${raw}:`,expNames[raw]||'');
+  if(n===null)return;
+  try{await api(`/api/v1/exporters/${ip}/name`,{method:'POST',body:{name:n}});loadExpNames();load(true)}
+  catch(e){toast('rename failed: '+e.message)}
 }
 
 async function vLabels(){
@@ -815,12 +854,12 @@ function flowDetail(i){
    ${kv('Org',`${f.src_org||f.src_country||'-'} → ${f.dst_org||f.dst_country||'-'}`)}
    ${kv('Bytes/Pkts',`${fmtB(f.bytes)} / ${fmtN(f.packets)}`)}
    ${kv('Duration',f.duration_ms?f.duration_ms+' ms':'-')}
-   ${kv('Ifaces',`${f.ingress_if||'-'} → ${f.egress_if||'-'} (ifIndex)`)}
+   ${kv('Ifaces',`${ifLabel(f.ingress_if)} → ${ifLabel(f.egress_if)}`)}
    ${kv('Next hop',f.next_hop!=='0.0.0.0'&&f.next_hop!=='::'?f.next_hop:'-')}
    ${kv('Exporter',f.exporter)}${kv('Engine',f.engine_id?`${f.engine_id}/${f.engine_type}`:'-')}
    ${kv('Sampler',f.sampler_interval>1?`1 in ${f.sampler_interval}`:'-')}
    ${kv('TCP state',f.tcp_state||'-')}${kv('TTL',f.ip_ttl||'-')}
-   ${kv('End reason',f.flow_end_reason??'-')}${kv('VLAN',f.vlan||'-')}
+   ${kv('End reason',f.flow_end_reason??'-')}${kv('VLAN',vlanLabel(f.vlan))}
    ${kv('Label',f.label||'-')}${kv('ICMP',f.icmp_type?`${f.icmp_type}/${f.icmp_code}`:'-')}
    ${f.post_nat_src||f.post_nat_dst?kv('Post-NAT',`${f.post_nat_src||'-'} → ${f.post_nat_dst||'-'}`):''}
   </table>`;

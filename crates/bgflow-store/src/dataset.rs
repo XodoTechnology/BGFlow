@@ -181,6 +181,9 @@ impl Record for RollupRecord {
         cols[ix::SRC_ORG].extend_from_slice(&self.src_org.to_le_bytes());
         cols[ix::DST_ORG].extend_from_slice(&self.dst_org.to_le_bytes());
         cols[ix::LABEL_ID].extend_from_slice(&self.label_id.to_le_bytes());
+        cols[ix::VLAN].extend_from_slice(&self.vlan.to_le_bytes());
+        cols[ix::INGRESS_IF].extend_from_slice(&self.ingress_if.to_le_bytes());
+        cols[ix::EGRESS_IF].extend_from_slice(&self.egress_if.to_le_bytes());
     }
 
     fn from_scan(scan: &ScanResult, i: usize) -> Self {
@@ -206,6 +209,11 @@ impl Record for RollupRecord {
             src_org: c[ix::SRC_ORG].value_at(i) as u32,
             dst_org: c[ix::DST_ORG].value_at(i) as u32,
             label_id: c[ix::LABEL_ID].value_at(i) as u32,
+            // vlan/ifindexes exist only in schema id ≥5/≥6 — older
+            // segments decode them as 0.
+            vlan: c.get(ix::VLAN).map(|col| col.value_at(i) as u16).unwrap_or(0),
+            ingress_if: c.get(ix::INGRESS_IF).map(|col| col.value_at(i) as u32).unwrap_or(0),
+            egress_if: c.get(ix::EGRESS_IF).map(|col| col.value_at(i) as u32).unwrap_or(0),
         }
     }
 }
@@ -308,9 +316,17 @@ impl<R: Record> Dataset<R> {
         std::fs::create_dir_all(&root)?;
         let schema = R::schema();
 
+        // Accept every schema version of this dataset family ("flows",
+        // "rollup") — readers resolve each segment's own layout and sparse
+        // rows read appended columns as 0. Filtering by name (not id)
+        // keeps schema-evolved history visible after upgrades.
         let mut segments = segment::scan_segments(&root)?
             .into_iter()
-            .filter(|s| s.header.schema_id == schema.id)
+            .filter(|s| {
+                crate::schema::schema_by_id(s.header.schema_id)
+                    .map(|sc| sc.name == schema.name)
+                    .unwrap_or(false)
+            })
             .collect::<Vec<_>>();
         segments.sort_by_key(|s| s.header.min_ts_ms);
 

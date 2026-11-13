@@ -103,6 +103,11 @@ country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
 # [interface_names]
 # "2" = "ae0"
 
+# Optional: VLAN names shown across the UI (flows, top-by-vlan, filters).
+# [vlan_names]
+# "10" = "Devoli"
+# "250" = "Cogent"
+
 # --- Flow inputs -------------------------------------------------------------
 # One [[inputs]] block per listen socket. protocol = auto detects
 # NetFlow v5/v9, IPFIX, and sFlow per datagram.

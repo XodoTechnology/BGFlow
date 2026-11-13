@@ -93,6 +93,11 @@ pub struct RollupRecord {
     pub dst_org: u32,
     /// Matched label id (0 = none) — enables per-label stats on rollups.
     pub label_id: u32,
+    /// VLAN id the flow was seen on (0 = untagged/unknown; schema ≥5 only).
+    pub vlan: u16,
+    /// Interface indexes (0 = unknown; schema ≥6 only).
+    pub ingress_if: u32,
+    pub egress_if: u32,
     pub bytes: u64,
     pub packets: u64,
     pub flows: u64,

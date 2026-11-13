@@ -253,7 +253,10 @@ impl SegmentReader {
         let mut out = Vec::with_capacity(cols.len());
         let mut buf = Vec::new();
         for &ci in cols {
-            let d = self.dir.get(ci).context("column index out of range")?;
+            // Segments written under an older schema lack appended columns
+            // (e.g. rollup vlan on id-3 files) — skip them; sparse row views
+            // read missing columns as 0.
+            let Some(d) = self.dir.get(ci) else { continue };
             let def = &self.schema.columns[ci];
             let encoding = Encoding::from_id(d.encoding)
                 .context("bad encoding id")?;
