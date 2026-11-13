@@ -72,11 +72,16 @@ pub async fn run(
         segment_rows: cfg.segment_rows,
         segment_interval: Duration::from_secs(cfg.segment_interval_secs),
     };
-    let mut flows = Dataset::<FlowRecord>::open(cfg.data_dir.join("flows"), opts.clone())?;
-    let mut rollups = Dataset::<RollupRecord>::open(cfg.data_dir.join("rollups"), opts.clone())?;
+    let mut flows =
+        Dataset::<FlowRecord>::open(cfg.dataset_dir("flows", &cfg.flows_dir), opts.clone())?;
+    let mut rollups = Dataset::<RollupRecord>::open(
+        cfg.dataset_dir("rollups", &cfg.rollups_dir),
+        opts.clone(),
+    )?;
     // Coarse dataset: hourly buckets with /24·/48-masked IPs — the
     // long-retention, low-cardinality stats layer.
-    let mut hourly = Dataset::<RollupRecord>::open(cfg.data_dir.join("hourly"), opts)?;
+    let mut hourly =
+        Dataset::<RollupRecord>::open(cfg.dataset_dir("hourly", &cfg.hourly_dir), opts)?;
     let mut agg = RollupAggregator::new().with_sampling(cfg.sample_weighting);
     let mut coarse_agg = RollupAggregator::coarse().with_sampling(cfg.sample_weighting);
     let coarse_on = cfg.coarse_rollup;
@@ -285,7 +290,70 @@ fn retention(
             tracing::info!("retention: freed {} bytes of hourly rollups", freed);
         }
     }
+    if cfg.max_bytes > 0 {
+        let freed = disk_cap(flows, rollups, hourly, cfg.max_bytes)?;
+        metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        if freed > 0 {
+            tracing::info!("disk cap: evicted oldest segments, freed {} bytes", freed);
+        }
+    }
     Ok(())
+}
+
+/// Enforce `max_bytes` across all datasets: evict globally oldest
+/// segments (by data end time) until usage drops under 90% of the cap,
+/// leaving headroom so we don't evict on every sweep. Time-based
+/// retention runs first, so this only kicks in when the cap is tighter
+/// than the retention windows.
+fn disk_cap(
+    flows: &mut Dataset<FlowRecord>,
+    rollups: &mut Dataset<RollupRecord>,
+    hourly: &mut Dataset<RollupRecord>,
+    cap: u64,
+) -> anyhow::Result<u64> {
+    let total = flows.total_bytes() + rollups.total_bytes() + hourly.total_bytes();
+    if total <= cap {
+        return Ok(0);
+    }
+    let need = total.saturating_sub(cap.saturating_mul(9) / 10);
+
+    // Rank every indexed segment oldest-first, take victims until the
+    // planned free space covers `need`.
+    let mut all: Vec<(u64, u8, usize, u64)> = Vec::new();
+    for (tag, snap) in [
+        (0u8, flows.segment_snapshot()),
+        (1u8, rollups.segment_snapshot()),
+        (2u8, hourly.segment_snapshot()),
+    ] {
+        for (i, s) in snap.iter().enumerate() {
+            all.push((s.header.max_ts_ms, tag, i, s.file_size));
+        }
+    }
+    all.sort_by_key(|e| e.0);
+    let mut plan: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut planned = 0u64;
+    for &(_, tag, i, size) in &all {
+        if planned >= need {
+            break;
+        }
+        plan[tag as usize].push(i);
+        planned += size;
+    }
+
+    // Drop per dataset, indices descending so earlier removals don't
+    // shift the positions of later victims.
+    let mut freed = 0u64;
+    for (tag, idxs) in plan.iter().enumerate() {
+        let mut idxs = idxs.clone();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        let ds_freed = match tag {
+            0 => idxs.iter().map(|&i| flows.drop_segment(i)).sum::<u64>(),
+            1 => idxs.iter().map(|&i| rollups.drop_segment(i)).sum::<u64>(),
+            _ => idxs.iter().map(|&i| hourly.drop_segment(i)).sum::<u64>(),
+        };
+        freed += ds_freed;
+    }
+    Ok(freed)
 }
 
 fn publish(

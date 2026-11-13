@@ -7,7 +7,7 @@
 //! dropped. State persists to `<data_dir>/exporters.json`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -51,6 +51,13 @@ pub struct PolicyEntry {
     /// UI-set display name (overrides [exporter_names] config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Per-exporter VLAN names (VID → label). Device-local meaning, so
+    /// these live per exporter rather than in global [vlan_names].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vlans: BTreeMap<u16, String>,
+    /// Per-exporter interface names (ifIndex → label).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub interfaces: BTreeMap<u32, String>,
     /// Datagrams/bytes dropped by this policy since process start
     /// (not persisted — informational only).
     #[serde(skip)]
@@ -233,6 +240,57 @@ impl ExporterPolicy {
         self.save();
     }
 
+    /// Replace the VLAN name map for an exporter (empty clears). Creates
+    /// the entry if absent — labels alone don't admit traffic.
+    pub fn set_vlans(&self, ip: IpAddr, vlans: BTreeMap<u16, String>, now_ms: u64) {
+        let mut g = self.inner.lock().unwrap();
+        let e = g.map.entry(ip).or_insert_with(|| PolicyEntry {
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+            ..Default::default()
+        });
+        e.vlans = vlans;
+        drop(g);
+        self.save();
+    }
+
+    /// Replace the interface name map for an exporter (empty clears).
+    pub fn set_interfaces(&self, ip: IpAddr, ifs: BTreeMap<u32, String>, now_ms: u64) {
+        let mut g = self.inner.lock().unwrap();
+        let e = g.map.entry(ip).or_insert_with(|| PolicyEntry {
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+            ..Default::default()
+        });
+        e.interfaces = ifs;
+        drop(g);
+        self.save();
+    }
+
+    /// All per-exporter VLAN names (ip → vid → name), for name merging.
+    pub fn vlan_labels(&self) -> HashMap<IpAddr, BTreeMap<u16, String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .iter()
+            .filter(|(_, e)| !e.vlans.is_empty())
+            .map(|(ip, e)| (*ip, e.vlans.clone()))
+            .collect()
+    }
+
+    /// All per-exporter interface names (ip → ifindex → name).
+    pub fn interface_labels(&self) -> HashMap<IpAddr, BTreeMap<u32, String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .iter()
+            .filter(|(_, e)| !e.interfaces.is_empty())
+            .map(|(ip, e)| (*ip, e.interfaces.clone()))
+            .collect()
+    }
+
     /// Remove an entry entirely — next datagram re-registers it (as
     /// pending when approval is required, invisible otherwise).
     pub fn remove(&self, ip: IpAddr) -> bool {
@@ -268,6 +326,8 @@ impl ExporterPolicy {
                 e.state != ExporterState::Approved
                     || e.note.is_some()
                     || e.name.is_some()
+                    || !e.vlans.is_empty()
+                    || !e.interfaces.is_empty()
                     || e.approved_at_ms > 0
             })
             .map(|(k, v)| {

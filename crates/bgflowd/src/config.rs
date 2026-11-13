@@ -37,6 +37,28 @@ pub struct Config {
     /// Exporter admission policy ([exporters] section).
     #[serde(default)]
     pub exporters: ExportersConfig,
+    /// Optional SNMP polling of exporters for interface/VLAN names and
+    /// device info ([snmp] section). Disabled unless enabled = true.
+    #[serde(default)]
+    pub snmp: SnmpConfig,
+    /// Analytics/direction settings ([analytics] section).
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
+}
+
+/// [analytics] — traffic analytics settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AnalyticsConfig {
+    /// "Our" ASNs for direction analytics: a flow whose dst_asn is local is
+    /// inbound, src_asn local is outbound, neither is transit/other.
+    pub local_asns: Vec<u32>,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self { local_asns: vec![] }
+    }
 }
 
 /// Exporter admission control. New senders can be required to wait for
@@ -157,6 +179,94 @@ pub struct StorageConfig {
     /// exporters report raw sampled counts — exporters that pre-scale
     /// would be double-counted. Default off.
     pub sample_weighting: bool,
+    /// Hard cap on total segment bytes across flows/rollups/hourly
+    /// (0 = unlimited). When exceeded, the oldest segments are evicted
+    /// first until usage drops under 90% of the cap. Accepts plain
+    /// bytes or strings like "50GiB", "51200M". Checked on the
+    /// retention sweep interval.
+    #[serde(default, deserialize_with = "de_size")]
+    pub max_bytes: u64,
+    /// Optional per-dataset directory overrides — e.g. point bulk raw
+    /// flows at one mount and rollup stats at another. Each defaults
+    /// to <data_dir>/{flows,rollups,hourly}.
+    pub flows_dir: Option<PathBuf>,
+    pub rollups_dir: Option<PathBuf>,
+    pub hourly_dir: Option<PathBuf>,
+}
+
+impl StorageConfig {
+    /// Resolve a dataset directory: explicit override or <data_dir>/<name>.
+    pub fn dataset_dir(&self, name: &str, override_dir: &Option<PathBuf>) -> PathBuf {
+        override_dir.clone().unwrap_or_else(|| self.data_dir.join(name))
+    }
+}
+
+/// Deserialize a byte size: integer bytes, or a string with an optional
+/// K/M/G/T suffix (binary, 'i'/'B' tolerated): "50GiB", "51200M", "1.5g".
+fn de_size<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        N(u64),
+        S(String),
+    }
+    match Repr::deserialize(d)? {
+        Repr::N(n) => Ok(n),
+        Repr::S(s) => parse_size(&s)
+            .ok_or_else(|| D::Error::custom(format!("bad byte size '{}'", s))),
+    }
+}
+
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().to_ascii_lowercase().replace(['_', ' '], "");
+    let pos = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, suf) = s.split_at(pos);
+    let v: f64 = num.parse().ok()?;
+    let suf = suf.trim_end_matches('b');
+    let mult = match suf {
+        "" => 1.0,
+        "k" | "ki" => 1024f64,
+        "m" | "mi" => 1024f64.powi(2),
+        "g" | "gi" => 1024f64.powi(3),
+        "t" | "ti" => 1024f64.powi(4),
+        _ => return None,
+    };
+    Some((v * mult) as u64)
+}
+
+/// `[snmp]` — optional polling of exporters (SNMPv2c) for interface
+/// names, VLAN names and device info. Learned names only fill gaps;
+/// config/UI-set names always win.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SnmpConfig {
+    pub enabled: bool,
+    /// v2c community string (required when enabled).
+    pub community: String,
+    pub port: u16,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    /// GETBULK/GET retries per request.
+    pub retries: u32,
+}
+
+impl Default for SnmpConfig {
+    fn default() -> Self {
+        SnmpConfig {
+            enabled: false,
+            community: String::new(),
+            port: 161,
+            interval_secs: 300,
+            timeout_secs: 2,
+            retries: 1,
+        }
+    }
 }
 
 /// One MMDB path or several (e.g. separate IPv4/IPv6 databases — lookups
@@ -293,12 +403,15 @@ impl Default for EnricherConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuleConfig {
     /// Label name applied when the rule matches.
     pub name: String,
     /// IP protocol number (6=TCP, 17=UDP, ...).
     pub proto: Option<u8>,
+    /// Matches when EITHER src_port or dst_port equals this (service
+    /// labels like dns/https that must catch both directions).
+    pub port: Option<u16>,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     /// CIDR prefixes, e.g. "10.0.0.0/8" or "2001:db8::/32".
@@ -320,6 +433,7 @@ impl Default for RuleConfig {
         RuleConfig {
             name: String::new(),
             proto: None,
+            port: None,
             src_port: None,
             dst_port: None,
             src_ip: None,
@@ -357,6 +471,8 @@ impl Default for Config {
             vlan_names: Default::default(),
             users: vec![],
             exporters: ExportersConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            snmp: SnmpConfig::default(),
         }
     }
 }
@@ -391,6 +507,10 @@ impl Default for StorageConfig {
             coarse_rollup: true,
             coarse_retention_days: 365,
             sample_weighting: false,
+            max_bytes: 0,
+            flows_dir: None,
+            rollups_dir: None,
+            hourly_dir: None,
         }
     }
 }

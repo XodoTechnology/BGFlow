@@ -15,6 +15,7 @@ mod metrics;
 mod qcache;
 mod query;
 mod rules;
+mod snmp;
 mod sys;
 mod writer;
 
@@ -259,8 +260,10 @@ async fn main() -> Result<()> {
         Arc::new(RwLock::new(query::VlanNames::build(
             &cfg.vlan_names,
         )));
+    let local_asns = Arc::new(RwLock::new(cfg.analytics.local_asns.clone()));
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
+    let snmp_store = snmp::new_store();
 
     // Admin operations shared by SIGHUP and POST /api/v1/admin/reload.
     let admin = Arc::new(admin::AdminShared {
@@ -270,6 +273,7 @@ async fn main() -> Result<()> {
         exporter_names: exporter_names.clone(),
         interface_names: interface_names.clone(),
         vlan_names: vlan_names.clone(),
+        local_asns: local_asns.clone(),
         auth: auth.clone(),
         alerts: alerts_cfg.clone(),
         geo: geo.clone(),
@@ -296,6 +300,7 @@ async fn main() -> Result<()> {
             exporter_names: exporter_names.clone(),
             interface_names: interface_names.clone(),
             vlan_names: vlan_names.clone(),
+            local_asns: local_asns.clone(),
             ptr: ptr.clone(),
         },
         status: shared.status.clone(),
@@ -306,8 +311,26 @@ async fn main() -> Result<()> {
         auth: auth.clone(),
         admin: admin.clone(),
         exporter_policy: exporter_policy.clone(),
+        snmp: snmp_store.clone(),
         asn_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
+
+    // SNMP enrichment loop (optional — [snmp] enabled = true).
+    if cfg.snmp.enabled {
+        if cfg.snmp.community.is_empty() {
+            tracing::warn!("[snmp] enabled but community is empty — SNMP disabled");
+        } else {
+            tracing::info!(
+                "snmp: polling approved/pending exporters every {}s (community auth, port {})",
+                cfg.snmp.interval_secs, cfg.snmp.port
+            );
+            tokio::spawn(snmp::run(
+                snmp_store,
+                exporter_policy.clone(),
+                cfg.snmp.clone(),
+            ));
+        }
+    }
 
     // Alert evaluation loop (reloadable; no-op scan when no rules configured).
     {

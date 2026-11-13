@@ -509,6 +509,31 @@ impl<R: Record> Dataset<R> {
         Ok(freed)
     }
 
+    /// Remove the indexed segment at `idx` — used by oldest-first
+    /// disk-cap eviction. Only flushed segments are indexed, so the
+    /// active write buffer is never touched. Returns bytes freed
+    /// (0 if the index is stale or the file can't be removed).
+    pub fn drop_segment(&mut self, idx: usize) -> u64 {
+        if idx >= self.segments.len() {
+            return 0;
+        }
+        let s = self.segments.remove(idx);
+        match std::fs::remove_file(&s.path) {
+            Ok(()) => {
+                if let Some(parent) = s.path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                s.file_size
+            }
+            Err(e) => {
+                tracing::warn!("drop_segment: cannot remove {:?}: {}", s.path, e);
+                // Keep the index honest — the file still exists.
+                self.segments.insert(idx, s);
+                0
+            }
+        }
+    }
+
     /// Total on-disk bytes across indexed segments.
     pub fn total_bytes(&self) -> u64 {
         self.segments.iter().map(|s| s.file_size).sum()

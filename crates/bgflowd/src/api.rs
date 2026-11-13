@@ -33,6 +33,8 @@ pub struct AppState {
     pub auth: Arc<AuthState>,
     pub admin: Arc<AdminShared>,
     pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
+    /// SNMP-learned interface/VLAN names + device info per exporter.
+    pub snmp: crate::snmp::SnmpStore,
     /// AS registry lookups (BGPView), asn → (fetched_at, payload).
     pub asn_cache: Mutex<HashMap<u32, (Instant, serde_json::Value)>>,
 }
@@ -230,6 +232,10 @@ fn status_payload(st: &AppState) -> serde_json::Value {
         "git": git_describe(&st.config),
         "system": system,
         "status": s,
+        "storage": {
+            "bytes": s.flow_bytes + s.rollup_bytes + s.hourly_bytes,
+            "cap_bytes": st.config.storage.max_bytes,
+        },
         "orgs": st.ctx.orgs.len(),
         "rules": st.ctx.rules.len(),
         "inputs": st.config.inputs.iter().map(|i| i.listen.to_string()).collect::<Vec<_>>(),
@@ -616,6 +622,16 @@ where
     }
 }
 
+/// Per-bucket traffic split by direction relative to `local_asns`:
+/// dst local → in, src local → out, neither/both → transit.
+#[derive(Default)]
+struct SeriesPt {
+    total: Agg,
+    inn: Agg,
+    out: Agg,
+    tr: Agg,
+}
+
 /// Overview endpoint bounded accumulator — totals + protocol +
 /// timeseries. The top-dim maps are NOT here: they go through the
 /// key-sharded maps so per-worker memory stays flat regardless of IP
@@ -624,14 +640,20 @@ where
 struct OvAcc {
     total: Agg,
     by_proto: HashMap<u8, Agg>,
-    series: HashMap<u64, Agg>,
+    series: HashMap<u64, SeriesPt>,
 }
 
 impl OvAcc {
     fn merge(&mut self, o: Self) {
         agg_add(&mut self.total, &o.total);
         merge_agg_map(&mut self.by_proto, o.by_proto);
-        merge_agg_map(&mut self.series, o.series);
+        for (k, p) in o.series {
+            let e = self.series.entry(k).or_default();
+            agg_add(&mut e.total, &p.total);
+            agg_add(&mut e.inn, &p.inn);
+            agg_add(&mut e.out, &p.out);
+            agg_add(&mut e.tr, &p.tr);
+        }
     }
 }
 
@@ -698,7 +720,12 @@ async fn overview(
     let (from, to) = range(&q);
     let set = rollup_set(&q);
     let f = rollup_filter(&q, &st.ctx)?;
-    let size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
+    let mut size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
+    // Hourly rollup rows are hour-granular — finer buckets would only
+    // scatter each row into its hour's first sub-slot.
+    if set == RollupSet::Hourly && size < 3_600_000 {
+        size = 3_600_000;
+    }
     let limit: usize = q
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -706,6 +733,7 @@ async fn overview(
         .min(100);
     const TOP_DIMS_OV: [&str; 5] = ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"];
     let needed = query::rollup_needed(&f, &["proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]);
+    let local_asns = Arc::new(st.ctx.local_asns.read().unwrap().clone());
 
     // One sharded scan: bounded state (totals/proto/series) accumulates
     // per worker; each top dim emits (dim_idx, key) pairs routed into
@@ -734,19 +762,33 @@ async fn overview(
         },
         |a: &mut Agg, b: Agg| agg_add(a, &b),
         || OvAcc::default(),
-        |acc: &mut OvAcc, r: &query::RollupRow| {
-            acc.total.bytes += r.bytes();
-            acc.total.packets += r.packets();
-            acc.total.flows += r.flows();
-            let p = acc.by_proto.entry(r.protocol()).or_default();
-            p.bytes += r.bytes();
-            p.packets += r.packets();
-            p.flows += r.flows();
-            let b = (r.bucket_ms() / size) * size;
-            let s = acc.series.entry(b).or_default();
-            s.bytes += r.bytes();
-            s.packets += r.packets();
-            s.flows += r.flows();
+        {
+            let local = local_asns.clone();
+            move |acc: &mut OvAcc, r: &query::RollupRow| {
+                acc.total.bytes += r.bytes();
+                acc.total.packets += r.packets();
+                acc.total.flows += r.flows();
+                let p = acc.by_proto.entry(r.protocol()).or_default();
+                p.bytes += r.bytes();
+                p.packets += r.packets();
+                p.flows += r.flows();
+                let b = (r.bucket_ms() / size) * size;
+                let s = acc.series.entry(b).or_default();
+                let a = Agg {
+                    bytes: r.bytes(),
+                    packets: r.packets(),
+                    flows: r.flows(),
+                };
+                agg_add(&mut s.total, &a);
+                let sa = local.contains(&r.src_asn());
+                let da = local.contains(&r.dst_asn());
+                let d = match (sa, da) {
+                    (true, false) => &mut s.out,
+                    (false, true) => &mut s.inn,
+                    _ => &mut s.tr,
+                };
+                agg_add(d, &a);
+            }
         },
         |a: &mut OvAcc, b: OvAcc| a.merge(b),
     )
@@ -769,16 +811,46 @@ async fn overview(
         .collect();
     protos.sort_by_key(|v| std::cmp::Reverse(v["bytes"].as_u64().unwrap_or(0)));
 
-    let mut ts_rows: Vec<_> = series
-        .into_iter()
-        .map(|(t, a)| {
-            serde_json::json!({
-                "t": t / 1000, "bucket_ms": t,
-                "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
-            })
+    // Zero-fill the selected window so the chart's time axis spans the
+    // whole range instead of compressing to buckets that have data.
+    // Capped so wide range + tiny bucket combos can't emit unbounded
+    // points; beyond the cap we emit populated buckets only.
+    let emit = |t: u64, p: &SeriesPt| {
+        serde_json::json!({
+            "t": t / 1000, "bucket_ms": t,
+            "bytes": p.total.bytes, "packets": p.total.packets, "flows": p.total.flows,
+            "in_bytes": p.inn.bytes, "in_packets": p.inn.packets, "in_flows": p.inn.flows,
+            "out_bytes": p.out.bytes, "out_packets": p.out.packets, "out_flows": p.out.flows,
+            "tr_bytes": p.tr.bytes, "tr_packets": p.tr.packets, "tr_flows": p.tr.flows,
         })
-        .collect();
-    ts_rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
+    };
+    let start = (from / size) * size;
+    let end = (to / size) * size;
+    let n_pts = if end >= start { (end - start) / size + 1 } else { 0 };
+    let mut ts_rows: Vec<serde_json::Value> = Vec::new();
+    if n_pts <= 8192 {
+        let mut keys: Vec<u64> = series.keys().copied().collect();
+        keys.sort_unstable();
+        let mut ki = 0;
+        while ki < keys.len() && keys[ki] < start {
+            ki += 1;
+        }
+        let zero = SeriesPt::default();
+        let mut t = start;
+        while t <= end {
+            if ki < keys.len() && keys[ki] == t {
+                ts_rows.push(emit(t, &series[&t]));
+                ki += 1;
+            } else {
+                ts_rows.push(emit(t, &zero));
+            }
+            t += size;
+        }
+    } else {
+        let mut kv: Vec<_> = series.iter().collect();
+        kv.sort_by_key(|(t, _)| *t);
+        ts_rows = kv.into_iter().map(|(t, p)| emit(*t, p)).collect();
+    }
 
     // Partition shard entries by dimension index, then exact top-N per
     // dim via select_nth (no full sort of the IP-sized key spaces).
@@ -956,7 +1028,10 @@ async fn timeseries(
     let (from, to) = range(&q);
     let set = rollup_set(&q);
     let f = rollup_filter(&q, &st.ctx)?;
-    let size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
+    let mut size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
+    if set == RollupSet::Hourly && size < 3_600_000 {
+        size = 3_600_000;
+    }
     let needed = query::rollup_needed(&f, &[]);
     let buckets: HashMap<u64, Agg> = query::rollup_scan_par::<HashMap<u64, Agg>>(
         &st.ctx,
@@ -1129,6 +1204,7 @@ async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let map = st.metrics.exporters.lock().unwrap();
     let names = st.ctx.exporter_names.read().unwrap();
     let policy = st.exporter_policy.entries();
+    let snmp_map = st.snmp.read().unwrap();
     let require = st.exporter_policy.require_approval();
     // Union of observed senders (metrics) and policy-known IPs — pending
     // exporters appear here even though their traffic is dropped.
@@ -1163,8 +1239,11 @@ async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
                 "first_seen_ms": p.map(|x| x.first_seen_ms).unwrap_or(0),
                 "approved_at_ms": p.map(|x| x.approved_at_ms).unwrap_or(0),
                 "note": p.and_then(|x| x.note.clone()),
+                "vlans": p.map(|x| x.vlans.clone()).unwrap_or_default(),
+                "interfaces": p.map(|x| x.interfaces.clone()).unwrap_or_default(),
                 "dropped_datagrams": p.map(|x| x.dropped_datagrams).unwrap_or(0),
                 "dropped_bytes": p.map(|x| x.dropped_bytes).unwrap_or(0),
+                "snmp": snmp_map.get(&ip),
             })
         })
         .collect();
@@ -1220,6 +1299,66 @@ async fn exporter_rename(
     Ok(Json(serde_json::json!({"ok": true, "ip": ip_s, "name": name})))
 }
 
+/// POST /api/v1/exporters/{ip}/vlans — {"vlans": {"250": "Cogent"}}
+/// replaces the exporter's VLAN name map ({"vlans": {}} clears). Admin only.
+async fn exporter_vlans(
+    State(st): State<Arc<AppState>>,
+    Path(ip_s): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ip: IpAddr = ip_s
+        .parse()
+        .map_err(|_| err(format!("bad exporter ip: {}", ip_s)))?;
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(obj) = body.get("vlans").and_then(|v| v.as_object()) {
+        for (k, v) in obj.iter().take(1024) {
+            let vid: u16 = k
+                .parse()
+                .map_err(|_| err(format!("bad vlan id: {}", k)))?;
+            if let Some(name) = v.as_str() {
+                let name = name.trim();
+                if !name.is_empty() && name.len() <= 64 {
+                    map.insert(vid, name.to_string());
+                }
+            }
+        }
+    }
+    let now = crate::metrics::now_ms();
+    st.exporter_policy.set_vlans(ip, map.clone(), now);
+    Ok(Json(serde_json::json!({"ok": true, "ip": ip_s, "vlans": map})))
+}
+
+/// POST /api/v1/exporters/{ip}/interfaces — {"interfaces": {"1": "xe-0/0/0"}}
+/// replaces the exporter's interface name map. Admin only.
+async fn exporter_interfaces(
+    State(st): State<Arc<AppState>>,
+    Path(ip_s): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ip: IpAddr = ip_s
+        .parse()
+        .map_err(|_| err(format!("bad exporter ip: {}", ip_s)))?;
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(obj) = body.get("interfaces").and_then(|v| v.as_object()) {
+        for (k, v) in obj.iter().take(1024) {
+            let idx: u32 = k
+                .parse()
+                .map_err(|_| err(format!("bad ifindex: {}", k)))?;
+            if let Some(name) = v.as_str() {
+                let name = name.trim();
+                if !name.is_empty() && name.len() <= 64 {
+                    map.insert(idx, name.to_string());
+                }
+            }
+        }
+    }
+    let now = crate::metrics::now_ms();
+    st.exporter_policy.set_interfaces(ip, map.clone(), now);
+    Ok(Json(
+        serde_json::json!({"ok": true, "ip": ip_s, "interfaces": map}),
+    ))
+}
+
 /// POST /api/v1/exporters/{ip}/{action} — approve|suspend|reject|remove.
 /// Admin role only (enforced by middleware path check).
 async fn exporter_action(
@@ -1249,9 +1388,58 @@ async fn exporter_action(
     })))
 }
 
+/// Merge per-exporter labels into a global name map: a key named
+/// identically on every exporter that defines it is unambiguous and can
+/// be shown in aggregated views (top dims, filters). Conflicting names
+/// stay per-exporter only.
+fn merge_unanimous<V: Ord + Clone>(
+    global: &std::collections::BTreeMap<V, String>,
+    per_exporter: Vec<&std::collections::BTreeMap<V, String>>,
+) -> std::collections::BTreeMap<V, String> {
+    let mut map = global.clone();
+    let mut votes: std::collections::BTreeMap<V, std::collections::BTreeMap<String, usize>> =
+        Default::default();
+    for m in per_exporter {
+        for (k, n) in m {
+            *votes.entry(k.clone()).or_default().entry(n.clone()).or_default() += 1;
+        }
+    }
+    for (k, names) in votes {
+        if names.len() == 1 {
+            if let Some(n) = names.keys().next() {
+                map.insert(k, n.clone());
+            }
+        }
+    }
+    map
+}
+
 async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let g = st.ctx.interface_names.read().unwrap();
-    let mut items: Vec<_> = g.all().iter().collect();
+    let global: std::collections::BTreeMap<u32, String> =
+        g.all().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let labels = st.exporter_policy.interface_labels();
+    // UI-set labels + SNMP-learned names vote; only unanimous names
+    // surface in the global map (device-local names differ per box).
+    let mut owned: Vec<std::collections::BTreeMap<u32, String>> =
+        labels.values().cloned().collect();
+    {
+        let snmp = st.snmp.read().unwrap();
+        for e in snmp.values() {
+            let m: std::collections::BTreeMap<u32, String> = e
+                .interfaces
+                .iter()
+                .filter(|(_, f)| !f.name.is_empty())
+                .map(|(i, f)| (*i, f.name.clone()))
+                .collect();
+            if !m.is_empty() {
+                owned.push(m);
+            }
+        }
+    }
+    let per: Vec<_> = owned.iter().collect();
+    let merged = merge_unanimous(&global, per);
+    let mut items: Vec<_> = merged.iter().collect();
     items.sort_by_key(|(k, _)| **k);
     Json(serde_json::json!({
         "items": items.iter().map(|(k, v)| serde_json::json!({"ifindex": k, "name": v})).collect::<Vec<_>>()
@@ -1260,7 +1448,22 @@ async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> 
 
 async fn vlans(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let g = st.ctx.vlan_names.read().unwrap();
-    let mut items: Vec<_> = g.all().iter().collect();
+    let global: std::collections::BTreeMap<u16, String> =
+        g.all().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let labels = st.exporter_policy.vlan_labels();
+    let mut owned: Vec<std::collections::BTreeMap<u16, String>> =
+        labels.values().cloned().collect();
+    {
+        let snmp = st.snmp.read().unwrap();
+        for e in snmp.values() {
+            if !e.vlans.is_empty() {
+                owned.push(e.vlans.clone());
+            }
+        }
+    }
+    let per: Vec<_> = owned.iter().collect();
+    let merged = merge_unanimous(&global, per);
+    let mut items: Vec<_> = merged.iter().collect();
     items.sort_by_key(|(k, _)| **k);
     Json(serde_json::json!({
         "items": items.iter().map(|(k, v)| serde_json::json!({"vlan": k, "name": v})).collect::<Vec<_>>()
@@ -1557,6 +1760,9 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "require_approval", "in": "query", "description": "returned in payload"},
             ]}},
             "/api/v1/exporters/{ip}/{action}": {"post": {"summary": "Exporter admission action (admin): approve|suspend|reject|remove"}},
+            "/api/v1/exporters/{ip}/name": {"post": {"summary": "Set exporter display name (admin)"}},
+            "/api/v1/exporters/{ip}/vlans": {"post": {"summary": "Replace exporter VLAN name map (admin): {\"vlans\":{\"250\":\"Cogent\"}}"}},
+            "/api/v1/exporters/{ip}/interfaces": {"post": {"summary": "Replace exporter interface name map (admin): {\"interfaces\":{\"1\":\"xe-0/0/0\"}}"}},
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
             "/api/v1/vlans": {"get": {"summary": "Configured VLAN names ([vlan_names])"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
@@ -2000,6 +2206,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         )
         .route("/api/v1/exporters", get(exporters))
         .route("/api/v1/exporters/:ip/name", post(exporter_rename))
+        .route("/api/v1/exporters/:ip/vlans", post(exporter_vlans))
+        .route("/api/v1/exporters/:ip/interfaces", post(exporter_interfaces))
         .route("/api/v1/exporters/:ip/:action", post(exporter_action))
         .route("/api/v1/interfaces", get(interfaces))
         .route("/api/v1/vlans", get(vlans))

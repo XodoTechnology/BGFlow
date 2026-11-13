@@ -136,6 +136,8 @@ pub struct Ctx {
     pub exporter_names: Arc<RwLock<ExporterNames>>,
     pub interface_names: Arc<RwLock<InterfaceNames>>,
     pub vlan_names: Arc<RwLock<VlanNames>>,
+    /// "Our" ASNs for in/out direction classification ([local_asns]).
+    pub local_asns: Arc<RwLock<Vec<u32>>>,
     /// Reverse-DNS cache — non-blocking lookups for flow rows.
     pub ptr: Arc<PtrCache>,
 }
@@ -145,7 +147,7 @@ pub struct Ctx {
 // ---------------------------------------------------------------------------
 
 /// Parse a time param: epoch seconds, epoch millis, or relative "-<n><unit>"
-/// where unit is s/m/h/d. Returns milliseconds.
+/// where unit is s/m/h/d (m=minute) or M=month (30d). Returns milliseconds.
 pub fn parse_time(s: Option<&str>, default_ms: u64) -> u64 {
     let Some(s) = s else { return default_ms };
     let s = s.trim();
@@ -160,6 +162,7 @@ pub fn parse_time(s: Option<&str>, default_ms: u64) -> u64 {
             "m" => 60_000,
             "h" => 3_600_000,
             "d" => 86_400_000,
+            "M" => 2_592_000_000, // 30 days
             _ => return default_ms,
         };
         return crate::metrics::now_ms().saturating_sub(n.saturating_mul(mult));

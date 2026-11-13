@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0e14">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 26 26'%3E%3Crect x='1' y='1' width='24' height='24' rx='7' fill='%230e1420' stroke='%23232b3a'/%3E%3Ccircle cx='6.5' cy='8.5' r='2.2' fill='%2322d3ee'/%3E%3Ccircle cx='6.5' cy='17.5' r='2.2' fill='%2322d3ee'/%3E%3Ccircle cx='19.5' cy='13' r='2.8' fill='%233b82f6'/%3E%3Cpath d='M8.7 8.5 C13 8.5 13.5 13 16.7 13' stroke='%2322d3ee' stroke-width='1.5' fill='none'/%3E%3Cpath d='M8.7 17.5 C13 17.5 13.5 13 16.7 13' stroke='%233b82f6' stroke-width='1.5' fill='none'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 26 26'%3E%3Crect x='1' y='1' width='24' height='24' rx='7' fill='%230e1420'/%3E%3Ccircle cx='6.5' cy='8.5' r='2.2' fill='%2322d3ee'/%3E%3Ccircle cx='6.5' cy='17.5' r='2.2' fill='%2322d3ee'/%3E%3Ccircle cx='19.5' cy='13' r='2.8' fill='%233b82f6'/%3E%3Cpath d='M8.7 8.5 C13 8.5 13.5 13 16.7 13' stroke='%2322d3ee' stroke-width='1.5' fill='none'/%3E%3Cpath d='M8.7 17.5 C13 17.5 13.5 13 16.7 13' stroke='%233b82f6' stroke-width='1.5' fill='none'/%3E%3C/svg%3E">
 <title>BGFlow</title>
 <style>
 :root{
@@ -38,7 +41,7 @@ a{color:var(--accent);text-decoration:none}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:16px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
 .card .lbl{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
-.card .val{font-size:24px;font-weight:650;font-family:var(--mono);margin-top:4px}
+.card .val{font-size:24px;font-weight:650;font-family:var(--mono);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .card .sub{color:var(--muted);font-size:11.5px;margin-top:2px}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
 .filters input,.filters select{background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:12.5px;font-family:var(--mono);min-width:100px}
@@ -60,6 +63,7 @@ th.num{text-align:right}
 .vbadge.v6{background:color-mix(in srgb,#e879f9 16%,var(--panel2));color:var(--pink)}
 .flg{font-family:'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif;font-size:15px;letter-spacing:0}
 .asn{display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+.asnpre{display:inline-block;margin-right:10px;min-width:2ch;opacity:.85}
 .clickable{color:var(--accent2);cursor:pointer}
 .clickable:hover{text-decoration:underline}
 canvas{width:100%;height:260px;display:block}
@@ -117,6 +121,8 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <span class="chip" data-r="-6h">6h</span>
     <span class="chip on" data-r="-24h">24h</span>
     <span class="chip" data-r="-7d">7d</span>
+    <span class="chip" data-r="-1M">1M</span>
+    <span class="chip" data-r="-5M">5M</span>
     <span class="chip" data-r="custom">custom</span>
     <input id="fromin" placeholder="from (e.g. -1h)" style="display:none;min-width:130px">
     <input id="toin" placeholder="to" style="display:none;min-width:130px">
@@ -187,6 +193,7 @@ function loadHash(){
     state.view=v;
     document.querySelectorAll('#nav a').forEach(x=>{x.classList.toggle('on',x.dataset.v===v)});
     const t=document.querySelector('#nav a[data-v="'+v+'"]');if(t)$('#viewtitle').textContent=t.textContent.trim();
+    document.title=$('#viewtitle').textContent+' — BGFlow';
   }
   const r=p.get('r');
   if(r){state.range=r;
@@ -271,7 +278,19 @@ function toast(msg,ms=9000){
   t.textContent=msg;t.classList.add('show');
   clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),ms);
 }
-function q(extra={}){const p=new URLSearchParams();const [f,t]=trange();if(f)p.set('from',f);if(t)p.set('to',t);p.set('granularity',state.granularity);for(const[k,v]of Object.entries(F))if(v)p.set(k,v);for(const[k,v]of Object.entries(extra))if(v!=null)p.set(k,v);return p.toString()}
+// Approximate preset spans (ms) + bucket sizes for auto-tuning on long
+// ranges: past ~month scale we read the coarse hourly dataset and grow
+// the chart bucket so point counts stay bounded.
+const RANGE_MS={'-15m':900e3,'-1h':36e5,'-6h':216e5,'-24h':864e5,'-7d':6048e5,'-1M':2592e7,'-5M':12960e7};
+const BUCKET_MS={'1m':60e3,'5m':300e3,'15m':900e3,'1h':36e5,'6h':216e5,'1d':864e5};
+const BUCKET_ORDER=['1m','5m','15m','1h','6h','1d'];
+function effGranularity(){return (RANGE_MS[state.range]||0)>25*864e5&&state.granularity==='minute'?'hourly':state.granularity}
+function effBucket(){const span=RANGE_MS[state.range]||864e5;let b=state.bucket;
+  while(span/(BUCKET_MS[b]||300e3)>4000){const i=BUCKET_ORDER.indexOf(b);if(i<0||i===BUCKET_ORDER.length-1)break;b=BUCKET_ORDER[i+1]}
+  // Hourly rollup rows are hour-granular — never bucket finer than 1h.
+  if(effGranularity()==='hourly'&&BUCKET_ORDER.indexOf(b)<BUCKET_ORDER.indexOf('1h'))b='1h';
+  return b}
+function q(extra={}){const p=new URLSearchParams();const [f,t]=trange();if(f)p.set('from',f);if(t)p.set('to',t);p.set('granularity',effGranularity());for(const[k,v]of Object.entries(F))if(v)p.set(k,v);for(const[k,v]of Object.entries(extra))if(v!=null)p.set(k,v);return p.toString()}
 function trange(){if(state.range==='custom'){return[$('#fromin').value||'-24h',$('#toin').value||'now']}return[state.range,null]}
 function protoName(p){return({1:'ICMP',6:'TCP',17:'UDP',41:'IPv6',47:'GRE',50:'ESP',58:'ICMPv6'}[p])||('IP'+p)}
 // country flag emoji from ISO code (plain text — canvas-safe); '' for non-codes
@@ -368,7 +387,10 @@ async function enhanceAsns(){
         const extra=[d.name&&d.name!==label?d.name:'',d.source].filter(Boolean).join(' · ');
         e.title=extra?`${full} — ${extra}`:full}
       continue}
-    if(label){e.innerHTML=`<span class="muted">AS${esc(e.dataset.asn)}</span> ${esc(label)}`;
+    if(label){
+      // Hard cap: registry descriptions can be absurdly long (lyrics, spam).
+      const short=label.length>30?label.slice(0,29).trimEnd()+'…':label;
+      e.innerHTML=`<span class="muted">AS${esc(e.dataset.asn)}</span> ${esc(short)}`;
       const full=`AS${e.dataset.asn} ${label}`;
       const extra=[d.name&&d.name!==label?d.name:'',d.source].filter(Boolean).join(' · ');
       e.title=extra?`${full} — ${extra}`:full}}
@@ -391,7 +413,7 @@ function savePreset(){const n=prompt('Preset name:');if(!n)return;const p=preset
 function delPreset(){const n=$('#preset_sel')?.value;if(!n||!presets()[n])return;const p=presets();delete p[n];savePresets(p);load()}
 
 // ---------- nav / topbar ----------
-document.querySelectorAll('#nav a').forEach(a=>a.onclick=()=>{document.querySelectorAll('#nav a').forEach(x=>x.classList.remove('on'));a.classList.add('on');state.view=a.dataset.v;$('#viewtitle').textContent=a.textContent.trim();load()});
+document.querySelectorAll('#nav a').forEach(a=>a.onclick=()=>{document.querySelectorAll('#nav a').forEach(x=>x.classList.remove('on'));a.classList.add('on');state.view=a.dataset.v;$('#viewtitle').textContent=a.textContent.trim();document.title=a.textContent.trim()+' — BGFlow';load()});
 document.querySelectorAll('.chip[data-r]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-r]').forEach(x=>x.classList.remove('on'));c.classList.add('on');state.range=c.dataset.r;const cust=state.range==='custom';$('#fromin').style.display=cust?'':'none';$('#toin').style.display=cust?'':'none';load()});
 $('#refsel').onchange=e=>{state.refreshMs=+e.target.value;startAuto()};
 function startAuto(){clearInterval(timer);if(state.refreshMs>0)timer=setInterval(()=>{if(state.view!=='metrics')load(true)},state.refreshMs)}
@@ -436,30 +458,32 @@ async function load(silent){
   }
 }
 
+// Friendly dimension names for table headers.
+const DIM_TITLE={src_ip:'Source IP',dst_ip:'Destination IP',src_asn:'Source ASN',dst_asn:'Destination ASN',src_port:'Source port',dst_port:'Destination port',proto:'Protocol',exporter:'Exporter',src_country:'Source country',dst_country:'Destination country',label:'Label',src_ipver:'Src IP version',dst_ipver:'Dst IP version',src_org:'Source org',dst_org:'Dest org',vlan:'VLAN',ingress_if:'Ingress if',egress_if:'Egress if'};
 // click-safe filter: value rides in data-k (esc handles HTML), JS reads it back
 function topTbl(items, dim){
   const fk=DIM2F[dim]||dim;
-  return `<table><tr><th></th><th>Key</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${
-    (items||[]).map((t,i)=>{
+  const isIp=dim==='src_ip'||dim==='dst_ip';
+  return `<table><tr><th>${esc(DIM_TITLE[dim]||'Key')}</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${
+    (items||[]).map((t)=>{
       const k=String(t.key);
-      // IP-keyed rows show the endpoint's ASN in the rank column (rank is
-      // implicit in ordering anyway); resolved lazily by enhanceTopIps().
-      const rank=looksIp(k)?`<span class="muted" data-topip="${esc(k)}">·</span>`:`<span class="muted">${i+1}</span>`;
-      // Front page stays compact: ASN dims show the number only, no registry
-      // name (names live on the dedicated Top/Flows views).
-      const lbl=dim.includes('asn')?`<span class="asn"><span class="muted">AS</span>${esc(k)}</span>`:dimLabel(dim,t.key);
-      return `<tr><td class="num">${rank}</td>
-      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${lbl}</td>
+      // IP rows get their ASN resolved into a far-left prefix inside the
+      // key cell (enhanceTopIps fills [data-topasn] lazily).
+      const asn=isIp&&looksIp(k)?`<span class="asnpre" data-topasn="${esc(k)}">…</span>`:'';
+      const lbl=dimLabel(dim,t.key);
+      return `<tr>
+      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${asn}${lbl}</td>
       <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`}).join('')
-    ||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table>`;
+    ||'<tr><td colspan=3 class=muted>No data</td></tr>'}</table>`;
 }
-// Fill [data-topip] rank cells with the IP's ASN (via /api/v1/lookup,
-// cached in _ipCache), then let enhanceAsns append registry names.
+// Fill [data-topasn] prefixes with the IP's ASN (via /api/v1/lookup,
+// cached in _ipCache), then re-run enhanceAsns so the fresh data-asn
+// spans pick up registry-name tooltips.
 const _topAsn={};
 async function enhanceTopIps(){
-  const cells=[...document.querySelectorAll('[data-topip]')].filter(e=>!e.dataset.done);
+  const cells=[...document.querySelectorAll('[data-topasn]')].filter(e=>!e.dataset.done);
   if(!cells.length)return;
-  const ips=[...new Set(cells.map(e=>e.dataset.topip))];
+  const ips=[...new Set(cells.map(e=>e.dataset.topasn))];
   await Promise.all(ips.map(async ip=>{
     if(_topAsn[ip]!==undefined)return;
     let d=_ipCache[ip];
@@ -467,14 +491,16 @@ async function enhanceTopIps(){
     const asn=((d.results||[]).map(r=>r.result||{}).find(m=>m.asn)||{}).asn;
     _topAsn[ip]=asn||0;
   }));
-  for(const e of cells){e.dataset.done='1';const a=_topAsn[e.dataset.topip];
-    e.innerHTML=a?`<span class="asn"><span class="muted">AS</span>${a}</span>`:'<span class="muted">-</span>'}
+  for(const e of cells){e.dataset.done='1';const a=_topAsn[e.dataset.topasn];
+    e.innerHTML=a?`<span class="asn" data-asn="${a}" data-asn-compact><span class="muted">AS</span>${a}</span>`:''}
+  enhanceAsns();
 }
 
 async function vOverview(){
   // One combined scan server-side instead of 6 separate top/summary calls.
+  const eb=effBucket();
   const [ov,st]=await Promise.all([
-    api('/api/v1/overview?'+q({bucket:state.bucket,limit:8,compare:1})),api('/api/v1/status')]);
+    api('/api/v1/overview?'+q({bucket:eb,limit:8,compare:1})),api('/api/v1/status')]);
   const sum=ov,ts=ov,s={items:ov.top.src_ip},d={items:ov.top.dst_ip},
         sa={items:ov.top.src_asn},da={items:ov.top.dst_asn},dp={items:ov.top.dst_port};
   const pv=ov.prev||null;
@@ -482,21 +508,25 @@ async function vOverview(){
     const col=pct>=0?'var(--green)':'var(--red)';const ar=pct>=0?'▲':'▼';
     return` <span style="color:${col}">${ar}${Math.abs(pct)>=1000?'999+':Math.abs(pct).toFixed(1)}%</span>`};
   const cards=`<div class="cards">
-    <div class="card"><div class="lbl">Flows</div><div class="val">${fmtN(sum.flows)}</div><div class="sub">${esc(trangeLabel())}${dlt(sum.flows,pv.flows)}</div></div>
+    <div class="card"><div class="lbl">Flows</div><div class="val" title="${fmtN(sum.flows)}">${fmtN(sum.flows)}</div><div class="sub">${esc(trangeLabel())}${dlt(sum.flows,pv.flows)}</div></div>
     <div class="card"><div class="lbl">Bytes</div><div class="val">${fmtB(sum.bytes)}</div><div class="sub">${fmtN(sum.packets)} packets${dlt(sum.bytes,pv.bytes)}</div></div>
-    <div class="card"><div class="lbl">Packets</div><div class="val">${fmtN(sum.packets)}</div><div class="sub">avg ${(sum.packets/Math.max(1,sum.flows)).toFixed(1)}/flow${dlt(sum.packets,pv.packets)}</div></div>
+    <div class="card"><div class="lbl">Packets</div><div class="val" title="${fmtN(sum.packets)}">${fmtN(sum.packets)}</div><div class="sub">avg ${(sum.packets/Math.max(1,sum.flows)).toFixed(1)}/flow${dlt(sum.packets,pv.packets)}</div></div>
     <div class="card"><div class="lbl">Stored</div><div class="val">${fmtB(st.status.flow_bytes+st.status.rollup_bytes+st.status.hourly_bytes)}</div><div class="sub">${fmtN(st.status.flow_rows+st.status.rollup_rows+st.status.hourly_rows)} rows · ${st.status.uptime_secs}s up</div></div>
   </div>`;
   const protos=(sum.by_protocol||[]).slice(0,6).map(p=>`<tr><td>${protoBadge(p.name)}</td><td class="num">${fmtN(p.flows)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.packets)}</td></tr>`).join('');
-  // live rate from the most recent bucket
-  const last=ts.series&&ts.series[ts.series.length-1];
-  if(last&&ts.bucket_ms){const secs=ts.bucket_ms/1000;state.rate={bps:last.bytes/secs,pps:last.packets/secs}}
+  // live rate from the most recent bucket that actually has data (the
+  // trailing bucket is the still-open minute — rollups emit on close)
+  const sers=ts.series||[];
+  const last=[...sers].reverse().find(s=>s.bytes>0);
+  state.rate=last&&ts.bucket_ms?{bps:last.bytes/(ts.bucket_ms/1000),pps:last.packets/(ts.bucket_ms/1000)}:null;
   content.innerHTML=filterBar()+cards+
-   `<div class="panel"><h3>Traffic — ${esc(state.bucket)}
+   `<div class="panel"><h3>Traffic — ${esc(eb)} buckets
+     <span id="dirleg" style="display:none;font-weight:400;font-size:10px">
+       <span style="color:#22c55e">■</span> in <span style="color:#3b82f6">■</span> out <span style="color:#64748b">■</span> transit</span>
      <span style="float:right">
        ${['bytes','packets','flows'].map(m=>`<span class="chip ${state.metric===m?'on':''}" data-m="${m}" style="font-size:11px;padding:2px 9px">${m}</span>`).join('')}
-       <select id="b_bucket" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:2px 6px;border-radius:5px;font-size:11px">
-         ${['1m','5m','15m','1h','6h','1d'].map(b=>`<option value="${b}" ${state.bucket===b?'selected':''}>${b}</option>`).join('')}
+       <select id="b_bucket" title="aggregation bucket size — the visible window comes from the range chips" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:2px 6px;border-radius:5px;font-size:11px">
+         ${['1m','5m','15m','1h','6h','1d'].map(b=>`<option value="${b}" ${eb===b?'selected':''}>${b}</option>`).join('')}
        </select></span></h3><canvas id="chart" style="height:280px"></canvas></div>
     <div class="grid2">
       <div class="panel"><h3>Top Sources <span class="muted" style="text-transform:none">(click to filter)</span></h3>${topTbl(s.items,'src_ip')}</div>
@@ -524,10 +554,16 @@ function drawChart(series){
   c.width=W*dpr;c.height=H*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);
   const vals=series.map(s=>s[metric]||0);
   const max=Math.max(...vals,1);
-  const n=series.length,padL=10,padR=14,padT=16,padB=24,iw=W-padL-padR,ih=H-padT-padB;
+  const n=series.length,padR=14,padT=16,padB=24;
   const fmt=metric==='bytes'?fmtB:fmtN;
+  // Size the y gutter to the widest label — large packet counts would
+  // otherwise collide with the plot area.
+  x.font='10px ui-monospace,monospace';
+  const padL=Math.max(30,Math.ceil(Math.max(...[0,.25,.5,.75,1].map(f=>x.measureText(fmt(max*f)).width)))+8);
+  c.dataset.padL=padL;
+  const iw=W-padL-padR,ih=H-padT-padB;
   // grid + y labels
-  x.strokeStyle='#1d2534';x.fillStyle='#8b949e';x.font='10px ui-monospace,monospace';x.lineWidth=1;
+  x.strokeStyle='#1d2534';x.fillStyle='#8b949e';x.lineWidth=1;
   for(let i=0;i<=4;i++){const v=max*i/4,y=padT+ih*(1-i/4);
     x.beginPath();x.moveTo(padL,y);x.lineTo(W-padR,y);x.stroke();
     x.fillText(fmt(v),3,y+3);}
@@ -537,25 +573,47 @@ function drawChart(series){
     x.fillText(d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),padL+i*iw/Math.max(1,n-1)-16,H-8)});
   // points + catmull-rom → bezier smoothing
   const px=i=>padL+i*iw/Math.max(1,n-1), py=v=>padT+ih-(v/max)*ih;
-  const pts=vals.map((v,i)=>[px(i),py(v)]);
-  const path=()=>{x.beginPath();
-    if(pts.length<3){pts.forEach((p,i)=>i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]));return}
-    x.moveTo(pts[0][0],pts[0][1]);
-    for(let i=0;i<pts.length-1;i++){
-      const p0=pts[Math.max(0,i-1)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(pts.length-1,i+2)];
+  const hasDir=series.some(s=>s.in_bytes!==undefined)&&series.some(s=>(s.in_bytes||0)+(s.out_bytes||0)>0);
+  const dl=$('#dirleg');if(dl)dl.style.display=hasDir?'inline':'none';
+  const mkpts=v=>v.map((val,i)=>[px(i),py(val)]);
+  const trace=(p,cont)=>{
+    if(p.length<3){for(let i=0;i<p.length;i++){if(i===0&&!cont)x.moveTo(p[i][0],p[i][1]);else x.lineTo(p[i][0],p[i][1])}return}
+    if(!cont)x.moveTo(p[0][0],p[0][1]);
+    for(let i=0;i<p.length-1;i++){
+      const p0=p[Math.max(0,i-1)],p1=p[i],p2=p[i+1],p3=p[Math.min(p.length-1,i+2)];
       x.bezierCurveTo(p1[0]+(p2[0]-p0[0])/6,p1[1]+(p2[1]-p0[1])/6,p2[0]-(p3[0]-p1[0])/6,p2[1]-(p3[1]-p1[1])/6,p2[0],p2[1]);
     }};
-  // gradient area fill
-  const g=x.createLinearGradient(0,padT,0,H-padB);
-  g.addColorStop(0,'rgba(59,130,246,.38)');g.addColorStop(.7,'rgba(59,130,246,.08)');g.addColorStop(1,'rgba(59,130,246,0)');
-  path();x.lineTo(px(n-1),padT+ih);x.lineTo(px(0),padT+ih);x.closePath();x.fillStyle=g;x.fill();
-  // gradient stroke line
-  const lg=x.createLinearGradient(padL,0,W-padR,0);lg.addColorStop(0,'#3b82f6');lg.addColorStop(1,'#22d3ee');
-  path();x.strokeStyle=lg;x.lineWidth=2;x.lineJoin='round';x.stroke();
-  // peak marker
+  if(hasDir){
+    // stacked areas bottom→top: transit, outbound, inbound
+    const li=series.map(s=>s['in_'+metric]||0),lo=series.map(s=>s['out_'+metric]||0),lt=series.map(s=>s['tr_'+metric]||0);
+    const cum=a=>{const o=[];let t=0;for(const v of a){t+=v;o.push(t)}return o};
+    const b1=cum(lt),b2=cum(lt.map((v,i)=>v+lo[i])),b3=cum(lt.map((v,i)=>v+lo[i]+li[i]));
+    const z=series.map(()=>0);
+    const layer=(up,dn,col)=>{const U=mkpts(up),D=mkpts(dn).reverse();
+      x.beginPath();trace(U,false);x.lineTo(D[0][0],D[0][1]);trace(D,true);x.closePath();
+      x.fillStyle=col;x.fill()};
+    layer(b1,z,'rgba(100,116,139,.5)');
+    layer(b2,b1,'rgba(59,130,246,.5)');
+    layer(b3,b2,'rgba(34,197,94,.55)');
+    const tp=mkpts(b3);x.beginPath();trace(tp,false);
+    x.strokeStyle='rgba(230,237,243,.45)';x.lineWidth=1;x.stroke();
+  }else{
+    const pts=mkpts(vals);
+    const path=()=>{x.beginPath();trace(pts,false)};
+    // gradient area fill
+    const g=x.createLinearGradient(0,padT,0,H-padB);
+    g.addColorStop(0,'rgba(59,130,246,.38)');g.addColorStop(.7,'rgba(59,130,246,.08)');g.addColorStop(1,'rgba(59,130,246,0)');
+    path();x.lineTo(px(n-1),padT+ih);x.lineTo(px(0),padT+ih);x.closePath();x.fillStyle=g;x.fill();
+    // gradient stroke line
+    const lg=x.createLinearGradient(padL,0,W-padR,0);lg.addColorStop(0,'#3b82f6');lg.addColorStop(1,'#22d3ee');
+    path();x.strokeStyle=lg;x.lineWidth=2;x.lineJoin='round';x.stroke();
+  }
+  // peak marker (clamped inside the canvas)
   const mi=vals.indexOf(max);
-  x.fillStyle='#e6edf3';x.font='600 11px ui-monospace,monospace';
-  x.fillText(fmt(max),px(mi)-14,padT+ih-8);
+  const pk=fmt(max);x.font='600 11px ui-monospace,monospace';
+  const pw=x.measureText(pk).width;
+  x.fillStyle='#e6edf3';
+  x.fillText(pk,Math.min(Math.max(px(mi)-pw/2,padL),Math.max(padL,W-padR-pw)),padT+ih-8);
   // hover crosshair + tooltip
   const hi=state.hoverI;
   if(hi>=0&&hi<n){
@@ -564,20 +622,22 @@ function drawChart(series){
     x.beginPath();x.moveTo(hx,padT);x.lineTo(hx,padT+ih);x.stroke();x.setLineDash([]);
     x.beginPath();x.arc(hx,hy,3.5,0,7);x.fillStyle='#22d3ee';x.fill();
     x.strokeStyle='#0b0e14';x.lineWidth=1.5;x.stroke();
-    const lbl=`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`;
+    const rows=hasDir?[`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`,`in ${fmt(s['in_'+metric]||0)} · out ${fmt(s['out_'+metric]||0)} · transit ${fmt(s['tr_'+metric]||0)}`]
+      :[`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`];
     x.font='11px ui-monospace,monospace';
-    const tw=x.measureText(lbl).width+12;
+    const tw=Math.max(...rows.map(r=>x.measureText(r).width))+12,th=rows.length*15+6;
     let bx=Math.min(Math.max(hx-tw/2,padL),W-padR-tw),by=padT+4;
     x.fillStyle='rgba(18,22,31,.95)';x.strokeStyle='#232b3a';
-    if(x.roundRect){x.beginPath();x.roundRect(bx,by,tw,18,5);x.fill();x.stroke()}
-    else{x.fillRect(bx,by,tw,18);x.strokeRect(bx,by,tw,18)}
-    x.fillStyle='#e6edf3';x.fillText(lbl,bx+6,by+13);
+    if(x.roundRect){x.beginPath();x.roundRect(bx,by,tw,th);x.fill();x.stroke()}
+    else{x.fillRect(bx,by,tw,th);x.strokeRect(bx,by,tw,th)}
+    x.fillStyle='#e6edf3';
+    rows.forEach((r,i)=>x.fillText(r,bx+6,by+13+i*15));
   }
 }
 function bindChartHover(){
   const c=$('#chart');if(!c)return;
   c.onmousemove=e=>{const s=state.chartSeries;if(!s||!s.length)return;
-    const r=c.getBoundingClientRect(),padL=10,padR=14,iw=r.width-padL-padR;
+    const r=c.getBoundingClientRect(),padL=+(c.dataset.padL||34),padR=14,iw=r.width-padL-padR;
     const i=Math.round((e.clientX-r.left-padL)/iw*(s.length-1));
     i===state.hoverI||(state.hoverI=Math.max(0,Math.min(s.length-1,i)),drawChart(s));};
   c.onmouseleave=()=>{state.hoverI=-1;if(state.chartSeries)drawChart(state.chartSeries)};
@@ -638,8 +698,8 @@ async function vFlows(){
     <td>${ocPair(f.src_org,f.src_country)} → ${ocPair(f.dst_org,f.dst_country)}</td>
     <td>${f.label?`<span class="tag clickable" onclick="setFilter('label','${esc(f.label)}')">${esc(f.label)}</span>`:'<span class="muted">-</span>'}</td>
     <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td>
-    <td>${vlanLabel(f.vlan)}</td>
-    <td title="ingress → egress">${ifLabel(f.ingress_if)}<span class="muted"> → </span>${ifLabel(f.egress_if)}</td></tr>`).join('');
+    <td>${vlanLabel(f.vlan,f.exporter)}</td>
+    <td title="ingress → egress">${ifLabel(f.ingress_if,f.exporter)}<span class="muted"> → </span>${ifLabel(f.egress_if,f.exporter)}</td></tr>`).join('');
   $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Source</th><th>Dest</th><th>Proto</th><th class="num">Bytes</th><th class="num">Pkts</th><th>ASN</th><th>Org/Country</th><th>Label</th><th>Exporter</th><th>VID</th><th title="ingress → egress interface">Interfaces</th></tr>${rows||'<tr><td colspan=12 class=muted>No flows</td></tr>'}</table>
    <div class="hint">${data.count} flows · <a href="#" onclick="dlCsv();return false">download CSV</a></div>`;
 }
@@ -666,11 +726,14 @@ async function loadTopData(){
   const data=await api('/api/v1/top?'+q({by:state.topby,limit:state.topn}));
   if(!$('#t_lbl'))return; // navigated away mid-fetch
   const max=data.items?.[0]?.bytes||1;
-  const rows=(data.items||[]).map((t,i)=>`<tr><td class="num muted">${i+1}</td>
-    <td class="clickable" onclick='clickDimRaw(${JSON.stringify(state.topby)},${t.key_raw},${JSON.stringify(typeof t.key==='object'?JSON.stringify(t.key):String(t.key))})'>${dimLabel(state.topby,typeof t.key==='object'?JSON.stringify(t.key):t.key)}</td>
+  const isIp=state.topby==='src_ip'||state.topby==='dst_ip';
+  const rows=(data.items||[]).map((t)=>{const ks=typeof t.key==='object'?JSON.stringify(t.key):String(t.key);
+    const asn=isIp&&looksIp(ks)?`<span class="asnpre" data-topasn="${esc(ks)}">…</span>`:'';
+    return `<tr>
+    <td class="clickable" onclick='clickDimRaw(${JSON.stringify(state.topby)},${t.key_raw},${JSON.stringify(ks)})'>${asn}${dimLabel(state.topby,ks)}</td>
     <td style="width:30%"><span class="bar" style="width:${Math.max(2,t.bytes/max*100)}%"></span></td>
-    <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.packets)}</td><td class="num">${fmtN(t.flows)}</td></tr>`).join('');
-  $('#tbl').innerHTML=`<table><tr><th></th><th>Key</th><th></th><th class="num">Bytes</th><th class="num">Packets</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=6 class=muted>No data</td></tr>'}</table>
+    <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.packets)}</td><td class="num">${fmtN(t.flows)}</td></tr>`}).join('');
+  $('#tbl').innerHTML=`<table><tr><th>${esc(DIM_TITLE[state.topby]||'Key')}</th><th></th><th class="num">Bytes</th><th class="num">Packets</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=5 class=muted>No data</td></tr>'}</table>
    <div class="hint">dataset: ${esc(data.set||'minute')}</div>`;
 }
 
@@ -726,15 +789,40 @@ async function vAnomalies(){
   $('#tbl').innerHTML=`<table><tr><th>Time</th><th>Key</th><th></th><th class="num">Z</th><th class="num">Bytes</th></tr>${rows||'<tr><td colspan=5 class=muted>No anomalies — widen the range or lower sigma</td></tr>'}</table>`;
 }
 
-let expNames={};
-async function loadExpNames(){try{const d=await api('/api/v1/exporters');expNames={};(d.items||[]).forEach(e=>{if(e.name)expNames[e.ip]=e.name})}catch(e){}}
+let expNames={},expVlans={},expIfs={},expSnmpVlans={},expSnmpIfs={},snmpMeta={};
+async function loadExpNames(){
+  try{
+    const d=await api('/api/v1/exporters');expNames={};expVlans={};expIfs={};expSnmpVlans={};expSnmpIfs={};snmpMeta={};
+    (d.items||[]).forEach(e=>{
+      if(e.name)expNames[e.ip]=e.name;
+      if(e.vlans&&Object.keys(e.vlans).length)expVlans[e.ip]=e.vlans;
+      if(e.interfaces&&Object.keys(e.interfaces).length)expIfs[e.ip]=e.interfaces;
+      if(e.snmp){
+        snmpMeta[e.ip]=e.snmp;
+        const si={},sv={};
+        if(e.snmp.interfaces)for(const k in e.snmp.interfaces){const n=e.snmp.interfaces[k]&&e.snmp.interfaces[k].name;if(n)si[k]=n}
+        if(e.snmp.vlans)for(const k in e.snmp.vlans){if(e.snmp.vlans[k])sv[k]=e.snmp.vlans[k]}
+        if(Object.keys(si).length)expSnmpIfs[e.ip]=si;
+        if(Object.keys(sv).length)expSnmpVlans[e.ip]=sv;
+      }
+    })
+  }catch(e){}
+}
 function expLabel(ip){return expNames[ip]?`${expNames[ip]} (${ip})`:ip}
 let ifNames={};
 async function loadIfNames(){try{const d=await api('/api/v1/interfaces');ifNames={};(d.items||[]).forEach(e=>{if(e.name)ifNames[e.ifindex]=e.name})}catch(e){}}
 let vlanNames={};
 async function loadVlanNames(){try{const d=await api('/api/v1/vlans');vlanNames={};(d.items||[]).forEach(e=>{if(e.name)vlanNames[e.vlan]=e.name})}catch(e){}}
-function vlanLabel(v){v=Number(v);if(!v)return'<span class="muted">-</span>';const n=vlanNames[v];return`<span class="clickable" onclick="setFilter('vlan','${v}')" title="click to filter">VID ${v}${n?` <span class="muted">— ${esc(n)}</span>`:''}</span>`}
-function ifLabel(i){if(!i)return'—';const n=ifNames[i];return n?`${esc(n)} <span class="muted">#${i}</span>`:`<span class="muted">#${i}</span>`}
+function vlanLabel(v,exp){
+  v=Number(v);if(!v)return'<span class="muted">-</span>';
+  // Per-exporter manual label wins, then merged global map, then
+  // SNMP-learned name for this exporter.
+  const n=(exp&&expVlans[exp]&&expVlans[exp][v])||vlanNames[v]||(exp&&expSnmpVlans[exp]&&expSnmpVlans[exp][v]);
+  return`<span class="clickable" onclick="setFilter('vlan','${v}')" title="click to filter">VID ${v}${n?` <span class="muted">— ${esc(n)}</span>`:''}</span>`}
+function ifLabel(i,exp){
+  if(i===null||i===undefined)return'—';
+  const n=(exp&&expIfs[exp]&&expIfs[exp][i])||ifNames[i]||(exp&&expSnmpIfs[exp]&&expSnmpIfs[exp][i]);
+  return n?`${esc(n)} <span class="muted">#${i}</span>`:`<span class="muted">#${i}</span>`}
 
 async function vExporters(){
   const [ex,st]=await Promise.all([api('/api/v1/exporters'),api('/api/v1/status')]);
@@ -745,22 +833,25 @@ async function vExporters(){
     return m[s]||`<span class="tag">${esc(s)}</span>`;
   };
   const acts=e=>{
-    if(!isAdmin)return '';
     const ip=encodeURIComponent(e.ip);
+    const lbl=isAdmin?`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="expToggle('${e.ip}')">Labels</button> `:'';
+    if(!isAdmin)return '';
     const btn=(a,l,dis)=>`<button class="btn" style="padding:2px 8px;font-size:11px" ${dis?'disabled':''} onclick="expAction('${ip}','${a}')">${l}</button>`;
     const rn=`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="expRename('${ip}','${esc(e.ip)}')">Name</button>`;
-    if(e.state==='pending')return rn+' '+btn('approve','Approve')+' '+btn('reject','Reject');
-    if(e.state==='approved'||e.state==='active')return rn+' '+btn('suspend','Suspend')+' '+btn('reject','Reject');
-    if(e.state==='trusted')return rn+' '+btn('suspend','Suspend')+' '+btn('reject','Reject');
-    if(e.state==='suspended'||e.state==='rejected')return rn+' '+btn('approve','Approve')+' '+btn('remove','Remove');
-    return rn;
+    if(e.state==='pending')return lbl+rn+' '+btn('approve','Approve')+' '+btn('reject','Reject');
+    if(e.state==='approved'||e.state==='active')return lbl+rn+' '+btn('suspend','Suspend')+' '+btn('reject','Reject');
+    if(e.state==='trusted')return lbl+rn+' '+btn('suspend','Suspend')+' '+btn('reject','Reject');
+    if(e.state==='suspended'||e.state==='rejected')return lbl+rn+' '+btn('approve','Approve')+' '+btn('remove','Remove');
+    return lbl+rn;
   };
+  window._exItems=ex.items||[];
   const rows=(ex.items||[]).map(e=>`<tr${e.state==='pending'?' style="background:rgba(251,191,36,.06)"':''}>
     <td><span class="clickable" onclick="setFilter('exporter','${esc(e.ip)}')">${stateBadge(e.state)} ${e.name?`<b>${esc(e.name)}</b> <span class="muted">${esc(e.ip)}</span>`:esc(e.ip)}</span>${e.note?` <span class="muted">· ${esc(e.note)}</span>`:''}</td>
     <td class="num">${fmtN(e.datagrams)}</td><td class="num">${fmtN(e.records)}</td><td class="num">${fmtB(e.bytes_in)}</td>
     ${e.dropped_datagrams?`<td class="num" style="color:var(--red)" title="${fmtB(e.dropped_bytes)} dropped">${fmtN(e.dropped_datagrams)} dropped</td>`:'<td class="num muted">-</td>'}
     <td class="muted">${ago(e.last_seen_ms)}</td>
-    <td>${acts(e)}</td></tr>`).join('');
+    <td>${acts(e)}</td></tr>
+    <tr id="exdet-${esc(e.ip)}" style="display:none"><td colspan="7" style="padding:10px 14px;background:rgba(255,255,255,.02)">…</td></tr>`).join('');
   content.innerHTML=filterBar()+`<div class="cards">
     <div class="card"><div class="lbl">Exporters</div><div class="val">${(ex.items||[]).length}</div></div>
     <div class="card"><div class="lbl">Pending approval</div><div class="val" style="${(ex.items||[]).some(e=>e.state==='pending')?'color:#fbbf24':''}">${(ex.items||[]).filter(e=>e.state==='pending').length}</div></div>
@@ -780,6 +871,66 @@ async function expRename(ip,raw){
   if(n===null)return;
   try{await api(`/api/v1/exporters/${ip}/name`,{method:'POST',body:{name:n}});loadExpNames();load(true)}
   catch(e){toast('rename failed: '+e.message)}
+}
+
+// ---------- per-exporter VLAN/interface labels ----------
+const expEdit={}; // ip -> {vlans:{},interfaces:{}}
+function expPaint(ip){
+  const row=document.getElementById('exdet-'+ip),td=row&&row.querySelector('td');
+  if(td)td.innerHTML=expEditHtml(ip);
+}
+function expToggle(ip){
+  const row=document.getElementById('exdet-'+ip);if(!row)return;
+  const show=row.style.display==='none';
+  row.style.display=show?'':'none';
+  if(show&&!row.dataset.loaded){
+    row.dataset.loaded='1';
+    const e=(_exItems||[]).find(x=>x.ip===ip)||{};
+    expEdit[ip]={vlans:{...(e.vlans||{})},interfaces:{...(e.interfaces||{})}};
+    expPaint(ip);
+  }
+}
+function expEditHtml(ip){
+  const m=expEdit[ip]||{vlans:{},interfaces:{}};
+  const rows=(kind,map,addPh)=>Object.entries(map).map(([k,n])=>
+    `<tr><td class="muted" style="width:70px">${esc(k)}</td>
+     <td><input value="${esc(n)}" style="width:100%" oninput="expSet('${ip}','${kind}','${k}',this.value)"></td>
+     <td style="width:30px"><button class="btn ghost" style="padding:1px 6px;font-size:11px" onclick="expDel('${ip}','${kind}','${k}')">✕</button></td></tr>`).join('');
+  const addRow=(kind,ph)=>`<tr><td><input id="exak-${ip}-${kind}" placeholder="${ph}" style="width:60px"></td>
+    <td><input id="exan-${ip}-${kind}" placeholder="name" style="width:100%"></td>
+    <td><button class="btn ghost" style="padding:1px 6px;font-size:11px" onclick="expAdd('${ip}','${kind}')">+</button></td></tr>`;
+  const tbl=(kind,title,addPh,map)=>`<div><h4 class="muted" style="font-size:11px;margin:2px 0 6px">${title}</h4>
+    <table style="width:100%">${rows(kind,map,addPh)}${addRow(kind,addPh)}</table></div>`;
+  const sn=snmpMeta[ip];
+  const snmpHtml=sn?`<div class="hint" style="margin-bottom:10px">
+    ${sn.error?`<span style="color:var(--red)">SNMP: ${esc(sn.error)}</span> · `:''}
+    ${sn.sys_descr?`<b>${esc(sn.sys_descr)}</b> · `:''}
+    ${Object.keys(sn.interfaces||{}).length} interfaces · ${Object.keys(sn.vlans||{}).length} VLANs learned${sn.polled_ms?` · polled ${ago(sn.polled_ms)}`:''}
+    <div class="muted" style="font-size:10.5px;margin-top:3px">SNMP-learned names fill gaps automatically — labels set here always win</div></div>`:'';
+  return snmpHtml+`<div class="grid2" style="gap:18px">
+    ${tbl('vlans','VLAN names <span class="muted">(VID → label)</span>','VID',m.vlans)}
+    ${tbl('interfaces','Interface names <span class="muted">(ifIndex → label)</span>','#',m.interfaces)}
+   </div>
+   <div style="margin-top:10px"><button class="btn" style="padding:3px 14px;font-size:11px" onclick="expSaveLabels('${ip}')">Save labels</button>
+   <span class="muted" style="font-size:11px"> — per-exporter names win on flow rows; a name identical on every exporter merges into top dims</span></div>`;
+}
+function expSet(ip,kind,k,v){const m=expEdit[ip];if(!m)return;const t=v.trim();if(t)m[kind][k]=t;else delete m[kind][k]}
+function expDel(ip,kind,k){const m=expEdit[ip];if(m)delete m[kind][k];expPaint(ip)}
+function expAdd(ip,kind){
+  const ki=document.getElementById(`exak-${ip}-${kind}`),ni=document.getElementById(`exan-${ip}-${kind}`);
+  const k=(ki?.value||'').trim(),n=(ni?.value||'').trim();
+  if(!/^\d+$/.test(k)){toast('key must be a number (VID / ifIndex)');return}
+  if(!n){toast('need a name');return}
+  expEdit[ip][kind][k]=n;
+  expPaint(ip);
+}
+async function expSaveLabels(ip){
+  const m=expEdit[ip]||{vlans:{},interfaces:{}};
+  try{
+    await api(`/api/v1/exporters/${encodeURIComponent(ip)}/vlans`,{method:'POST',body:{vlans:m.vlans}});
+    await api(`/api/v1/exporters/${encodeURIComponent(ip)}/interfaces`,{method:'POST',body:{interfaces:m.interfaces}});
+    toast(`${ip}: labels saved`);loadExpNames();load(true);
+  }catch(e){toast('save failed: '+e.message)}
 }
 
 async function vLabels(){
@@ -896,12 +1047,12 @@ function flowDetail(i){
    ${kv('Org',`${ocPair(f.src_org,f.src_country)} → ${ocPair(f.dst_org,f.dst_country)}`)}
    ${kv('Bytes/Pkts',`${fmtB(f.bytes)} / ${fmtN(f.packets)}`)}
    ${kv('Duration',f.duration_ms?f.duration_ms+' ms':'-')}
-   ${kv('Ifaces',`${ifLabel(f.ingress_if)} → ${ifLabel(f.egress_if)}`)}
+   ${kv('Ifaces',`${ifLabel(f.ingress_if,f.exporter)} → ${ifLabel(f.egress_if,f.exporter)}`)}
    ${kv('Next hop',f.next_hop!=='0.0.0.0'&&f.next_hop!=='::'?f.next_hop:'-')}
    ${kv('Exporter',f.exporter)}${kv('Engine',f.engine_id?`${f.engine_id}/${f.engine_type}`:'-')}
    ${kv('Sampler',f.sampler_interval>1?`1 in ${f.sampler_interval}`:'-')}
    ${kv('TCP state',f.tcp_state||'-')}${kv('TTL',f.ip_ttl||'-')}
-   ${kv('End reason',f.flow_end_reason??'-')}${kv('VLAN',vlanLabel(f.vlan))}
+   ${kv('End reason',f.flow_end_reason??'-')}${kv('VLAN',vlanLabel(f.vlan,f.exporter))}
    ${kv('Label',f.label||'-')}${kv('ICMP',f.icmp_type?`${f.icmp_type}/${f.icmp_code}`:'-')}
    ${f.post_nat_src||f.post_nat_dst?kv('Post-NAT',`${f.post_nat_src||'-'} → ${f.post_nat_dst||'-'}`):''}
   </table>`;

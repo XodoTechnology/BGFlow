@@ -71,6 +71,16 @@ coarse_retention_days = 365
 # sampler_interval (1-in-N). Enable ONLY if your exporters report raw
 # sampled counts (most do); exporters that pre-scale would double-count.
 sample_weighting = false
+# Hard disk cap for all segment data (raw + rollups + hourly). When
+# exceeded, the oldest segments are evicted first until usage drops
+# under 90% of the cap. 0 = unlimited. Accepts "50GiB", "51200M", or bytes.
+# max_bytes = "50GiB"
+# Optional: put datasets on separate mounts — e.g. bulk raw flows on a
+# big disk, rollup stats on a smaller fast one. Each defaults to
+# <data_dir>/{flows,rollups,hourly}.
+# flows_dir = "/bulk/bgflow/flows"
+# rollups_dir = "/stats/bgflow/rollups"
+# hourly_dir = "/stats/bgflow/hourly"
 
 [geoip]
 # GeoIP MMDB databases (optional) — fills in ASN/org/country for flows
@@ -107,6 +117,22 @@ country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
 # [vlan_names]
 # "10" = "Devoli"
 # "250" = "Cogent"
+
+# Optional: your own ASNs — drives the inbound/outbound split on the
+# dashboard traffic graph (dst_asn local = in, src_asn local = out).
+# [analytics]
+# local_asns = [64512, 65000]
+
+# Optional: SNMP-poll approved/pending exporters for interface names
+# (IF-MIB), VLAN names (Q-BRIDGE-MIB) and device info. Learned names
+# only fill gaps — [interface_names]/[vlan_names] and UI-set per-exporter
+# labels always win. SNMPv2c community auth.
+# [snmp]
+# enabled = true
+# community = "public"
+# port = 161
+# interval_secs = 300
+# timeout_secs = 2
 
 # --- Flow inputs -------------------------------------------------------------
 # One [[inputs]] block per listen socket. protocol = auto detects
@@ -189,8 +215,10 @@ country = "$.country"
 # First matching rule wins; label_id is stored on the flow and shown in the UI.
 # All specified fields must match (AND). Omit a field to wildcard it.
 #
-# Match fields: proto, src_port, dst_port, src_ip, dst_ip (CIDR),
+# Match fields: proto, port (either side), src_port, dst_port, src_ip, dst_ip (CIDR),
 # src_asn, dst_asn, src_country, dst_country (alpha-2), exporter, org (substring).
+# Unknown keys are rejected — a typo'd field fails config load rather than
+# silently matching everything.
 
 [[rules]]
 name = "google"
@@ -203,7 +231,7 @@ dst_asn = 13335
 
 [[rules]]
 name = "dns"
-dst_port = 53
+port = 53
 
 # [[rules]]
 # name = "internal"

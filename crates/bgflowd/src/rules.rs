@@ -10,6 +10,8 @@ use std::net::IpAddr;
 pub struct Rule {
     pub name: String,
     proto: Option<u8>,
+    /// Either-side port match (src_port == p || dst_port == p).
+    port: Option<u16>,
     src_port: Option<u16>,
     dst_port: Option<u16>,
     /// (masked base, mask) — see crate::query::parse_ip_filter for why the
@@ -56,6 +58,7 @@ fn build_rules(items: &[RuleConfig]) -> Vec<Rule> {
                 Some(Rule {
                     name: r.name.clone(),
                     proto: r.proto,
+                    port: r.port,
                     src_port: r.src_port,
                     dst_port: r.dst_port,
                     src_net,
@@ -139,6 +142,11 @@ impl Rule {
     fn matches(&self, f: &FlowRecord, org_name: &impl Fn(u32) -> Option<String>) -> bool {
         if let Some(p) = self.proto {
             if f.protocol != p {
+                return false;
+            }
+        }
+        if let Some(p) = self.port {
+            if f.src_port != p && f.dst_port != p {
                 return false;
             }
         }
