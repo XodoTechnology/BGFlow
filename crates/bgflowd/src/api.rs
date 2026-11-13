@@ -8,7 +8,7 @@ use crate::metrics::Metrics;
 use crate::query::{self, Ctx, FlowQuery, RollupFilter, RollupSet};
 use crate::writer::StatusSnapshot;
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Path, Query, RawQuery, State},
     http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{sse::Sse, Html, IntoResponse, Response},
@@ -39,6 +39,14 @@ pub struct AppState {
     pub snmp: crate::snmp::SnmpStore,
     /// AS registry lookups (BGPView), asn → (fetched_at, payload).
     pub asn_cache: Mutex<HashMap<u32, (Instant, serde_json::Value)>>,
+    /// Single-slot TTL cache for /overview — the dashboard polls every
+    /// ~15s while a long-range scan can take longer; without coalescing,
+    /// polls overlap into back-to-back full scans. Keyed by the raw
+    /// query string; entries older than OV_CACHE_TTL recompute.
+    pub ov_cache: Mutex<Option<(String, Instant, serde_json::Value)>>,
+    /// Incremental per-bucket aggregates — serves unfiltered in-window
+    /// dashboard queries without touching segment files.
+    pub hot: Arc<RwLock<crate::hot::HotStats>>,
 }
 
 type Q = HashMap<String, String>;
@@ -65,6 +73,84 @@ fn rollup_set(q: &Q) -> RollupSet {
         Some("hourly") | Some("hour") | Some("coarse") | Some("1h") => RollupSet::Hourly,
         _ => RollupSet::Minute,
     }
+}
+
+/// Dataset choice for aggregate-only endpoints (overview/timeseries/
+/// summary): past ~2h, minute rollups mean decoding tens of millions of
+/// rows and building huge top-dim maps, so promote to the hourly
+/// dataset whose IPs are already /24·/48-masked. Dimension-detail
+/// endpoints (/top, /conversations, /countries, /matrix) keep honoring
+/// the caller's explicit granularity.
+fn auto_rollup_set(q: &Q, from: u64, to: u64) -> RollupSet {
+    let set = rollup_set(q);
+    if set == RollupSet::Minute && to.saturating_sub(from) > 7_200_000 {
+        RollupSet::Hourly
+    } else {
+        set
+    }
+}
+
+/// Hot-tier fast path: serves unfiltered in-window queries from the
+/// incremental per-bucket aggregates instead of scanning segments.
+/// `set` is the rollup dataset the caller's scan path would read —
+/// the hot tier must mirror its bucket granularity or range-edge
+/// semantics diverge (whole-bucket overlap differs ~2x between minute
+/// and hour buckets on unaligned windows).
+/// Returns the merged view plus the effective series bucket width
+/// (hour-tier responses floor at 1h like the hourly dataset does).
+/// `None` → caller falls back to the segment scan.
+fn hot_view(
+    st: &AppState,
+    f: &RollupFilter,
+    q: &Q,
+    set: RollupSet,
+    from: u64,
+    to: u64,
+    size: u64,
+    strict: bool,
+) -> Option<(crate::hot::HotView, u64)> {
+    // ?hot=0|off|false forces the segment-scan path — escape hatch for
+    // debugging and correctness comparisons.
+    if matches!(q.get("hot").map(|s| s.as_str()), Some("0") | Some("off") | Some("false")) {
+        return None;
+    }
+    if !f.is_empty() {
+        return None;
+    }
+    let g = st.hot.read().unwrap();
+    // Direction splits are stamped with the local_asns they were built
+    // against — a changed set with a pending rebuild means stale
+    // in/out/transit, so don't serve.
+    let cur = crate::hot::asns_stamp(&st.ctx.local_asns.read().unwrap());
+    if g.asns_stamp != cur {
+        return None;
+    }
+    // Serve the tier matching the scan's granularity. `strict` callers
+    // (aggregate endpoints whose set already mirrors the span) get no
+    // cross-tier fallback — a wider-bucket tier would shift range-edge
+    // semantics vs their scan. Non-strict callers (dimension endpoints
+    // defaulting to the minute set even for long ranges) may fall back
+    // to the hour tier: bounded edge approximation in exchange for
+    // skipping a multi-10s scan.
+    let prefer_min = set == RollupSet::Minute;
+    let (use_min, mask_ips) = if prefer_min {
+        if g.covers(from, true) {
+            (true, false)
+        } else if !strict && g.covers(from, false) {
+            (false, false)
+        } else {
+            return None;
+        }
+    } else if g.covers(from, false) {
+        (false, true)
+    } else {
+        return None;
+    };
+    let mut size = size.max(60_000);
+    if !use_min {
+        size = size.max(3_600_000);
+    }
+    Some((g.view(from, to, size, use_min, mask_ips), size))
 }
 
 fn parse_ipver(s: &str) -> Result<u8, (StatusCode, Json<serde_json::Value>)> {
@@ -558,11 +644,11 @@ fn csv_response(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) -> Result<J
     Ok(Json(serde_json::json!({"count": recs.len(), "csv": s})))
 }
 
-#[derive(Default)]
-struct Agg {
-    bytes: u64,
-    packets: u64,
-    flows: u64,
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Agg {
+    pub(crate) bytes: u64,
+    pub(crate) packets: u64,
+    pub(crate) flows: u64,
 }
 
 fn agg_add(a: &mut Agg, b: &Agg) {
@@ -633,12 +719,12 @@ where
 
 /// Per-bucket traffic split by direction relative to `local_asns`:
 /// dst local → in, src local → out, neither/both → transit.
-#[derive(Default)]
-struct SeriesPt {
-    total: Agg,
-    inn: Agg,
-    out: Agg,
-    tr: Agg,
+#[derive(Default, Clone, Copy)]
+pub(crate) struct SeriesPt {
+    pub(crate) total: Agg,
+    pub(crate) inn: Agg,
+    pub(crate) out: Agg,
+    pub(crate) tr: Agg,
 }
 
 /// Overview endpoint bounded accumulator — totals + protocol +
@@ -671,8 +757,27 @@ async fn summary(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
+    if let Some((v, _)) = hot_view(&st, &f, &q, set, from, to, 3_600_000, true) {
+        let mut protos: Vec<_> = v
+            .by_proto
+            .into_iter()
+            .map(|(p, a)| {
+                serde_json::json!({
+                    "protocol": p,
+                    "name": bgflow_types::protocol_name(p),
+                    "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+                })
+            })
+            .collect();
+        protos.sort_by_key(|v| std::cmp::Reverse(v["bytes"].as_u64().unwrap_or(0)));
+        return Ok(Json(serde_json::json!({
+            "from": from, "to": to,
+            "bytes": v.total.bytes, "packets": v.total.packets, "flows": v.total.flows,
+            "by_protocol": protos,
+        })));
+    }
     let needed = query::rollup_needed(&f, &["proto"]);
     let (total, by_proto) = query::rollup_scan_par(
         &st.ctx,
@@ -722,12 +827,27 @@ async fn summary(
 /// Combined dashboard payload: totals + protocol breakdown + timeseries +
 /// top-N for the overview dims — all from ONE rollup scan (vs ~7 separate
 /// scans when the UI calls each endpoint individually).
+/// /overview responses younger than this are served from cache — the
+/// UI refreshes every ~15s, so anything under ~one refresh interval is
+/// effectively live while halving scan load on slow ranges.
+const OV_CACHE_TTL: Duration = Duration::from_secs(12);
+
 async fn overview(
     State(st): State<Arc<AppState>>,
+    raw: RawQuery,
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let key = raw.0.unwrap_or_default();
+    {
+        let g = st.ov_cache.lock().unwrap();
+        if let Some((k, at, v)) = g.as_ref() {
+            if *k == key && at.elapsed() < OV_CACHE_TTL {
+                return Ok(Json(v.clone()));
+            }
+        }
+    }
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
     let mut size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
     // Hourly rollup rows are hour-granular — finer buckets would only
@@ -741,6 +861,9 @@ async fn overview(
         .unwrap_or(8)
         .min(100);
     const TOP_DIMS_OV: [&str; 5] = ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"];
+    if let Some(resp) = hot_overview(&st, &f, &q, set, from, to, size, limit) {
+        return Ok(resp);
+    }
     let needed = query::rollup_needed(&f, &["proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]);
     let local_asns = Arc::new(st.ctx.local_asns.read().unwrap().clone());
 
@@ -929,7 +1052,7 @@ async fn overview(
         None
     };
 
-    Ok(Json(serde_json::json!({
+    let out = serde_json::json!({
         "from": from, "to": to,
         "bytes": total.bytes, "packets": total.packets, "flows": total.flows,
         "prev": prev,
@@ -938,6 +1061,118 @@ async fn overview(
         "series": ts_rows,
         "top": top_out,
         "set": match set { RollupSet::Minute => "minute", RollupSet::Hourly => "hourly" },
+    });
+    *st.ov_cache.lock().unwrap() = Some((key, Instant::now(), out.clone()));
+    Ok(Json(out))
+}
+
+/// Serve /overview entirely from the hot tier when eligible — produces
+/// the identical JSON shape as the scan path with `"set":"hot"`.
+/// `compare` is honored only when the preceding window is covered too;
+/// otherwise returns None so the caller scans.
+fn hot_overview(
+    st: &AppState,
+    f: &RollupFilter,
+    q: &Q,
+    set: RollupSet,
+    from: u64,
+    to: u64,
+    size: u64,
+    limit: usize,
+) -> Option<Json<serde_json::Value>> {
+    let (mut v, esize) = hot_view(st, f, q, set, from, to, size, true)?;
+    let prev = if q.contains_key("compare") {
+        let span = to.saturating_sub(from);
+        let pfrom = from.saturating_sub(span);
+        let (pv, _) = hot_view(st, f, q, set, pfrom, from, esize, true)?;
+        Some(serde_json::json!({
+            "from": pfrom, "to": from,
+            "bytes": pv.total.bytes, "packets": pv.total.packets, "flows": pv.total.flows,
+        }))
+    } else {
+        None
+    };
+
+    let mut protos: Vec<_> = v
+        .by_proto
+        .drain()
+        .map(|(p, a)| {
+            serde_json::json!({
+                "protocol": p,
+                "name": bgflow_types::protocol_name(p),
+                "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+            })
+        })
+        .collect();
+    protos.sort_by_key(|v| std::cmp::Reverse(v["bytes"].as_u64().unwrap_or(0)));
+
+    // Zero-fill the window exactly like the scan path so the chart axis
+    // spans the full range.
+    let emit = |t: u64, p: &SeriesPt| {
+        serde_json::json!({
+            "t": t / 1000, "bucket_ms": t,
+            "bytes": p.total.bytes, "packets": p.total.packets, "flows": p.total.flows,
+            "in_bytes": p.inn.bytes, "in_packets": p.inn.packets, "in_flows": p.inn.flows,
+            "out_bytes": p.out.bytes, "out_packets": p.out.packets, "out_flows": p.out.flows,
+            "tr_bytes": p.tr.bytes, "tr_packets": p.tr.packets, "tr_flows": p.tr.flows,
+        })
+    };
+    let start = (from / esize) * esize;
+    let end = (to / esize) * esize;
+    let n_pts = if end >= start { (end - start) / esize + 1 } else { 0 };
+    let mut ts_rows: Vec<serde_json::Value> = Vec::new();
+    if n_pts <= 8192 {
+        let zero = SeriesPt::default();
+        let mut t = start;
+        while t <= end {
+            match v.series.get(&t) {
+                Some(p) => ts_rows.push(emit(t, p)),
+                None => ts_rows.push(emit(t, &zero)),
+            }
+            t += esize;
+        }
+    } else {
+        ts_rows = v.series.iter().map(|(t, p)| emit(*t, p)).collect();
+    }
+
+    // TOP_DIMS_OV order matches HOT_DIMS[0..5] — index directly.
+    let cmp = |a: &(u128, Agg), b: &(u128, Agg)| {
+        b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
+    };
+    let mut top_out = serde_json::Map::new();
+    for (i, d) in ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"].iter().enumerate() {
+        let mut rows: Vec<(u128, Agg)> = std::mem::take(&mut v.tops[i]).into_iter().collect();
+        if limit > 0 {
+            if rows.len() > limit {
+                rows.select_nth_unstable_by(limit - 1, cmp);
+            }
+            rows.truncate(limit);
+            rows.sort_by(cmp);
+        } else {
+            rows.clear();
+        }
+        top_out.insert(
+            d.to_string(),
+            serde_json::json!(rows
+                .into_iter()
+                .map(|(k, a)| serde_json::json!({
+                    "key": query::format_key(&st.ctx, d, k),
+                    "key_raw": k.to_string(),
+                    "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+                }))
+                .collect::<Vec<_>>()),
+        );
+    }
+
+    Some(Json(serde_json::json!({
+        "from": from, "to": to,
+        "bytes": v.total.bytes, "packets": v.total.packets, "flows": v.total.flows,
+        "prev": prev,
+        "by_protocol": protos,
+        "bucket_ms": esize,
+        "series": ts_rows,
+        "top": top_out,
+        "set": "hot",
     })))
 }
 
@@ -1035,11 +1270,25 @@ async fn timeseries(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
     let mut size = bucket_ms(q.get("bucket").map(|s| s.as_str()));
     if set == RollupSet::Hourly && size < 3_600_000 {
         size = 3_600_000;
+    }
+    if let Some((v, hsize)) = hot_view(&st, &f, &q, set, from, to, size, true) {
+        let mut rows: Vec<_> = v
+            .series
+            .into_iter()
+            .map(|(t, p)| {
+                serde_json::json!({
+                    "t": t / 1000, "bucket_ms": t,
+                    "bytes": p.total.bytes, "packets": p.total.packets, "flows": p.total.flows,
+                })
+            })
+            .collect();
+        rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
+        return Ok(Json(serde_json::json!({"bucket_ms": hsize, "series": rows})));
     }
     let needed = query::rollup_needed(&f, &[]);
     let buckets: HashMap<u64, Agg> = query::rollup_scan_par::<HashMap<u64, Agg>>(
@@ -1095,6 +1344,36 @@ async fn top(
     let set = rollup_set(&q);
     let f = rollup_filter(&q, &st.ctx)?;
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(1000);
+
+    // Hot tier serves the dims it tracks; everything else scans.
+    if let Some(di) = crate::hot::hot_dim_idx(by) {
+        if let Some((v, _)) = hot_view(&st, &f, &q, set, from, to, 3_600_000, false) {
+            let mut rows: Vec<(u128, Agg)> = v
+                .tops
+                .into_iter()
+                .nth(di)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            rows.sort_by(|a, b| {
+                b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
+            });
+            rows.truncate(limit);
+            let out: Vec<_> = rows
+                .into_iter()
+                .map(|(k, a)| {
+                    serde_json::json!({
+                        "key": query::format_key(&st.ctx, by, k),
+                        "key_raw": k.to_string(),
+                        "bytes": a.bytes, "packets": a.packets, "flows": a.flows,
+                    })
+                })
+                .collect();
+            return Ok(Json(
+                serde_json::json!({"by": by, "set": "hot", "items": out}),
+            ));
+        }
+    }
 
     // Full-cardinality dim map (ports/IPs can be huge) — key-sharded
     // parallel aggregation: memory stays at one map's size.
@@ -2092,10 +2371,46 @@ async fn auth_me(
     }
 }
 
+/// Reload live config, then rebuild the hot tier when anything it
+/// bakes in changed (local_asns → direction splits, window sizes).
+/// Shared by POST /admin/reload and the settings PUT path.
+fn reload_and_rebuild_hot(st: &AppState) -> crate::admin::ReloadReport {
+    let sig = |c: &Config| {
+        (
+            crate::hot::asns_stamp(&c.analytics.local_asns),
+            c.analytics.hot_window_hours,
+            c.analytics.hot_detail_minutes,
+        )
+    };
+    let before = sig(&st.config.read().unwrap());
+    let rep = st.admin.reload();
+    if rep.ok {
+        let after = sig(&st.config.read().unwrap());
+        if before != after {
+            {
+                let mut h = st.hot.write().unwrap();
+                h.set_windows(
+                    after.1.saturating_mul(3_600_000),
+                    after.2.saturating_mul(60_000),
+                );
+            }
+            let ctx = st.ctx.clone();
+            let h = st.hot.clone();
+            let la = st.ctx.local_asns.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::hot::rebuild(&ctx, &h, &la) {
+                    tracing::warn!("hot tier rebuild after reload failed: {}", e);
+                }
+            });
+        }
+    }
+    rep
+}
+
 /// POST /api/v1/admin/reload — hot-reload rules/enrichers/users/alerts.
 /// Admin role only (enforced by middleware path check).
 async fn admin_reload(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let rep = st.admin.reload();
+    let rep = reload_and_rebuild_hot(&st);
     Json(serde_json::to_value(&rep).unwrap_or(serde_json::json!({})))
 }
 
@@ -2291,7 +2606,7 @@ async fn admin_settings_put(
         .map_err(|e| err(format!("cannot install {}: {}", path.display(), e)))?;
     // Same path as SIGHUP — reload() re-reads config::load which now
     // includes the overlay, so everything hot-appliable applies live.
-    let rep = st.admin.reload();
+    let rep = reload_and_rebuild_hot(&st);
     Ok(Json(serde_json::json!({
         "ok": rep.ok,
         "settings_path": path,

@@ -13,6 +13,10 @@ RestartSec=5
 # SIGHUP reloads rules/enrichers/users/alerts without dropping ingest.
 ExecReload=/bin/kill -HUP $MAINPID
 LimitNOFILE=1048576
+# Cap glibc malloc arenas: parallel scan threads each get an arena, and
+# freed query memory otherwise stays retained per-arena. Fewer arenas =
+# less RSS retention (malloc_trim in bgflowd returns the rest).
+Environment=MALLOC_ARENA_MAX=4
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/bgflow

@@ -242,6 +242,23 @@ impl ColumnBuf {
         self.rows = 0;
     }
 
+    /// Drop the oldest `k` rows (used to bound the buffer when segment
+    /// writes keep failing — better a bounded loss than unbounded RAM).
+    fn drop_front(&mut self, schema: &Schema, k: usize) {
+        if k == 0 {
+            return;
+        }
+        if k >= self.rows {
+            self.clear();
+            return;
+        }
+        for (ci, col) in self.cols.iter_mut().enumerate() {
+            let w = schema.columns[ci].ty.width();
+            col.drain(..k * w);
+        }
+        self.rows -= k;
+    }
+
     /// Sort all columns by the timestamp column (stable, by ts only).
     fn sort_by_ts(&mut self, schema: &Schema) {
         let n = self.rows;
@@ -376,7 +393,22 @@ impl<R: Record> Dataset<R> {
         if self.buf.rows >= self.opts.segment_rows
             || self.buf_started.elapsed() >= self.opts.segment_interval
         {
-            self.flush()?;
+            if let Err(e) = self.flush() {
+                // A failing flush leaves rows buffered; without a bound
+                // the columnar buffer grows forever and OOMs the daemon.
+                // Cap it: past 8x segment_rows, drop the oldest half of
+                // the excess — the error is still reported to the caller.
+                let cap = self.opts.segment_rows.saturating_mul(8);
+                if self.buf.rows > cap {
+                    let drop = self.buf.rows - self.opts.segment_rows.saturating_mul(4);
+                    self.buf.drop_front(self.schema, drop);
+                    tracing::warn!(
+                        "dataset: dropped {} buffered rows after repeated flush failures",
+                        drop
+                    );
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -388,11 +420,36 @@ impl<R: Record> Dataset<R> {
         }
         self.buf.sort_by_ts(self.schema);
 
-        let ts_idx = self.schema.ts_column();
-        let ts_col = &self.buf.cols[ts_idx];
         let n = self.buf.rows;
-        let first_ts = u64::from_le_bytes(ts_col[0..8].try_into().unwrap());
-        let last_ts = u64::from_le_bytes(ts_col[(n - 1) * 8..n * 8].try_into().unwrap());
+        // Segment time bounds drive query-time pruning (`overlaps`).
+        // For rollup records the ts column is `bucket_ms` — all rows in
+        // an hourly segment share one bucket, collapsing bounds to a
+        // point and making mid-range queries skip the whole segment.
+        // Prefer the real flow-time columns when the schema has them.
+        let (first_ts, last_ts) = match (
+            self.schema.col_index("min_ts_ms"),
+            self.schema.col_index("max_ts_ms"),
+        ) {
+            (Some(mi), Some(ma)) => {
+                let lo_col = &self.buf.cols[mi];
+                let hi_col = &self.buf.cols[ma];
+                let mut lo = u64::MAX;
+                let mut hi = 0u64;
+                for i in 0..n {
+                    lo = lo.min(u64::from_le_bytes(lo_col[i * 8..i * 8 + 8].try_into().unwrap()));
+                    hi = hi.max(u64::from_le_bytes(hi_col[i * 8..i * 8 + 8].try_into().unwrap()));
+                }
+                (lo, hi)
+            }
+            _ => {
+                let ts_idx = self.schema.ts_column();
+                let ts_col = &self.buf.cols[ts_idx];
+                (
+                    u64::from_le_bytes(ts_col[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(ts_col[(n - 1) * 8..n * 8].try_into().unwrap()),
+                )
+            }
+        };
 
         // Encode every column.
         let mut chunks = Vec::with_capacity(self.schema.columns.len());

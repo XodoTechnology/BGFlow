@@ -13,6 +13,7 @@ mod demo;
 mod enrich;
 mod exporter_policy;
 mod geoip;
+mod hot;
 mod ingest;
 mod metrics;
 mod qcache;
@@ -202,6 +203,14 @@ async fn main() -> Result<()> {
         cfg.storage.channel_capacity,
     );
     let shared = WriterShared::new();
+    // "Our" ASNs for direction analytics + the hot aggregate tier the
+    // writer feeds as rollup buckets drain (created early — the writer
+    // needs them).
+    let local_asns = Arc::new(RwLock::new(cfg.analytics.local_asns.clone()));
+    let hot = Arc::new(RwLock::new(hot::HotStats::new(
+        cfg.analytics.hot_window_hours.saturating_mul(3_600_000),
+        cfg.analytics.hot_detail_minutes.saturating_mul(60_000),
+    )));
     // Shared storage config — the writer re-reads retention/disk-cap
     // knobs each sweep so admin settings apply without a restart.
     let storage_cfg = Arc::new(RwLock::new(cfg.storage.clone()));
@@ -209,8 +218,10 @@ async fn main() -> Result<()> {
         let cfg_s = storage_cfg.clone();
         let sh = shared.clone();
         let m = metrics.clone();
+        let h = hot.clone();
+        let la = local_asns.clone();
         tokio::spawn(async move {
-            if let Err(e) = writer::run(cfg_s, sh, m, rx).await {
+            if let Err(e) = writer::run(cfg_s, sh, m, rx, h, la).await {
                 tracing::error!("writer failed: {}", e);
             }
         });
@@ -266,7 +277,6 @@ async fn main() -> Result<()> {
         Arc::new(RwLock::new(query::VlanNames::build(
             &cfg.vlan_names,
         )));
-    let local_asns = Arc::new(RwLock::new(cfg.analytics.local_asns.clone()));
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
     let snmp_store = snmp::new_store();
@@ -324,7 +334,23 @@ async fn main() -> Result<()> {
         exporter_policy: exporter_policy.clone(),
         snmp: snmp_store.clone(),
         asn_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        ov_cache: std::sync::Mutex::new(None),
+        hot: hot.clone(),
     });
+
+    // Populate the hot tier from existing rollup segments so dashboard
+    // queries are served from memory shortly after startup. Runs in the
+    // background — segment scans still answer until the swap lands.
+    {
+        let ctx = app_state.ctx.clone();
+        let h = hot.clone();
+        let la = local_asns.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = hot::rebuild(&ctx, &h, &la) {
+                tracing::warn!("hot tier startup rebuild failed: {}", e);
+            }
+        });
+    }
 
     // SNMP enrichment loop (optional — [snmp] enabled = true).
     if cfg.snmp.enabled {
@@ -393,6 +419,17 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     );
+
+    // Return freed heap to the OS periodically: parallel query scans
+    // allocate hundreds of MB transiently and glibc otherwise retains
+    // it in per-thread arenas, inflating RSS long after queries end.
+    #[cfg(target_os = "linux")]
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            unsafe { libc::malloc_trim(0) };
+        }
+    });
 
     // Demo traffic: --demo flag wins, else [demo] config section.
     let demo_target = args.demo.or_else(|| {

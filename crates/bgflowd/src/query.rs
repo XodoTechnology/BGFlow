@@ -501,6 +501,29 @@ pub struct RollupFilter {
 }
 
 impl RollupFilter {
+    /// True when no filter fields are set — the hot tier only serves
+    /// unfiltered queries (filtered aggregation still scans segments).
+    pub fn is_empty(&self) -> bool {
+        self.exporters.is_empty()
+            && self.proto.is_none()
+            && self.src_asn.is_none()
+            && self.dst_asn.is_none()
+            && self.src_ip.is_none()
+            && self.dst_ip.is_none()
+            && self.src_ipver.is_none()
+            && self.dst_ipver.is_none()
+            && self.src_port.is_none()
+            && self.dst_port.is_none()
+            && self.src_country.is_none()
+            && self.dst_country.is_none()
+            && self.src_org.is_none()
+            && self.dst_org.is_none()
+            && self.label.is_none()
+            && self.vlan.is_none()
+            && self.ingress_if.is_none()
+            && self.egress_if.is_none()
+    }
+
     pub fn matches(&self, r: &RollupRow) -> bool {
         if !self.exporters.is_empty() && !self.exporters.contains(&r.exporter()) {
             return false;

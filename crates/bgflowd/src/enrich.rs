@@ -211,7 +211,10 @@ impl CountryRecord {
 /// cross-family queries: the crate happily walks the wrong tree and
 /// returns *plausible-looking garbage* instead of an error.
 struct GeoReader {
-    r: maxminddb::Reader<Vec<u8>>,
+    // mmap-backed: DB pages live in the kernel page cache and are
+    // reclaimable under memory pressure, instead of ~57MB of anonymous
+    // heap per open database (which also doubled during hot-swaps).
+    r: maxminddb::Reader<maxminddb::Mmap>,
     /// `metadata.ip_version` — 4 or 6. IPv6 databases also contain the
     /// IPv4 space, so they answer both families.
     ip_version: u16,
@@ -274,7 +277,7 @@ fn build_readers(cfg: &GeoIpConfig) -> (GeoReaders, HashMap<PathBuf, FileStamp>)
             .into_iter()
             .map(str::trim)
             .filter(|p| !p.is_empty())
-            .filter_map(|p| match maxminddb::Reader::open_readfile(p) {
+            .filter_map(|p| match maxminddb::Reader::open_mmap(p) {
                 Ok(r) => {
                     let ip_version = r.metadata.ip_version;
                     Some(GeoReader { r, ip_version })

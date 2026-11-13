@@ -55,7 +55,7 @@ pub struct RollupAggregator {
 
 /// Mask an IP for coarse aggregation: v4 -> /24, v6 -> /48.
 /// Done via IpAddr so the v4-mapped storage form (and display) is preserved.
-fn coarse_mask(ip: u128) -> u128 {
+pub fn coarse_mask(ip: u128) -> u128 {
     match u128_to_ip(ip) {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -190,6 +190,30 @@ impl RollupAggregator {
                 true
             }
         });
+        out
+    }
+
+    /// Emergency cardinality bound: when the live map grows past `cap`
+    /// (e.g. a spoofed-source flood exploding distinct tuples), drain an
+    /// arbitrary subset down to ~75% of cap. Correctness is preserved —
+    /// readers sum rollup rows, so a tuple that keeps arriving simply
+    /// produces additional records for the same bucket — at the cost of
+    /// somewhat more, smaller segments.
+    pub fn drain_over(&mut self, cap: usize) -> Vec<RollupRecord> {
+        if self.map.len() <= cap {
+            return Vec::new();
+        }
+        let target = cap.saturating_mul(3) / 4;
+        let n = self.map.len() - target;
+        // HashMap iteration order is hash-dependent → effectively an
+        // unbiased subset, so no tuple class is preferentially flushed.
+        let keys: Vec<RollupKey> = self.map.keys().take(n).copied().collect();
+        let mut out = Vec::with_capacity(n);
+        for k in keys {
+            if let Some(v) = self.map.remove(&k) {
+                out.push(Self::to_record(&k, &v));
+            }
+        }
         out
     }
 

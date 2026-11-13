@@ -6,9 +6,11 @@
 //! directly from segment files.
 
 use crate::config::StorageConfig;
+use crate::hot::{HotRec, HotStats};
 use crate::metrics::{now_ms, Metrics};
 use bgflow_store::{Dataset, DatasetOpts, RollupAggregator, SegmentInfo};
 use bgflow_types::{FlowRecord, RollupRecord};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -61,12 +63,52 @@ impl WriterShared {
 }
 
 const BATCH: usize = 8192;
+/// Live-tuple caps for the rollup aggregators (~200B/entry incl.
+/// hashmap overhead → ≈60MB / ≈120MB worst case). A cardinality
+/// explosion — e.g. a DDoS with spoofed sources — would otherwise grow
+/// the maps without bound until the daemon OOMs. Normal operation sits
+/// far below these (tens of thousands of live keys).
+const AGG_MAP_CAP: usize = 300_000;
+/// Coarse buckets hold a whole hour of tuples in memory — a tight cap
+/// makes `drain_over` flush partials throughout the hour, bounding both
+/// memory and crash-loss (an unflushed map is gone on SIGKILL).
+const COARSE_AGG_MAP_CAP: usize = 200_000;
+
+/// Fold drained minute-rollup records into the hot tier — this is what
+/// lets dashboard queries skip segment scans entirely.
+fn feed_hot(hot: &RwLock<HotStats>, local: &RwLock<Vec<u32>>, recs: &[RollupRecord]) {
+    if recs.is_empty() {
+        return;
+    }
+    let local_set: HashSet<u32> = local.read().unwrap().iter().copied().collect();
+    let now = now_ms();
+    let hot_recs: Vec<HotRec> = recs
+        .iter()
+        .map(|r| HotRec {
+            bucket_ms: r.bucket_ms,
+            protocol: r.protocol,
+            src_asn: r.src_asn,
+            dst_asn: r.dst_asn,
+            src_ip: r.src_ip,
+            dst_ip: r.dst_ip,
+            dst_port: r.dst_port,
+            src_country: r.src_country,
+            dst_country: r.dst_country,
+            bytes: r.bytes,
+            packets: r.packets,
+            flows: r.flows,
+        })
+        .collect();
+    hot.write().unwrap().add_batch(&hot_recs, &local_set, now);
+}
 
 pub async fn run(
     cfg: Arc<RwLock<StorageConfig>>,
     shared: WriterShared,
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<FlowRecord>,
+    hot: Arc<RwLock<HotStats>>,
+    local_asns: Arc<RwLock<Vec<u32>>>,
 ) -> anyhow::Result<()> {
     // Open-time settings snapshot — dataset dirs/segment sizing are
     // fixed for the process lifetime. Retention knobs are re-read from
@@ -118,7 +160,9 @@ pub async fn run(
                         ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics);
                         // drain_all: keep the still-open buckets too — their
                         // raw flows exist, so rollups shouldn't lose them.
-                        push_all(&mut rollups, agg.drain_all().into_iter(), &metrics, "rollups");
+                        let recs = agg.drain_all();
+                        feed_hot(&hot, &local_asns, &recs);
+                        push_all(&mut rollups, recs.into_iter(), &metrics, "rollups");
                         push_all(&mut hourly, coarse_agg.drain_all().into_iter(), &metrics, "hourly");
                         flows.flush()?;
                         rollups.flush()?;
@@ -130,11 +174,33 @@ pub async fn run(
             }
             _ = tick.tick() => {
                 ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics);
+                // Cardinality circuit-breaker: drain a subset of live
+                // tuples early when a map exceeds its cap. Records land
+                // in the still-open bucket; readers sum duplicate
+                // (bucket, tuple) rows so totals stay correct.
+                if agg.len() > AGG_MAP_CAP {
+                    tracing::warn!(
+                        "rollup map over cap ({} > {}), emergency drain",
+                        agg.len(), AGG_MAP_CAP
+                    );
+                    let recs = agg.drain_over(AGG_MAP_CAP);
+                    feed_hot(&hot, &local_asns, &recs);
+                    push_all(&mut rollups, recs.into_iter(), &metrics, "rollups");
+                }
+                if coarse_agg.len() > COARSE_AGG_MAP_CAP {
+                    tracing::warn!(
+                        "coarse rollup map over cap ({} > {}), emergency drain",
+                        coarse_agg.len(), COARSE_AGG_MAP_CAP
+                    );
+                    push_all(&mut hourly, coarse_agg.drain_over(COARSE_AGG_MAP_CAP).into_iter(), &metrics, "hourly");
+                }
                 let now = now_ms();
                 let cur_min = bgflow_store::timeutil::minute_floor(now);
                 if cur_min != last_drain_min {
                     last_drain_min = cur_min;
-                    push_all(&mut rollups, agg.drain_finished(now).into_iter(), &metrics, "rollups");
+                    let recs = agg.drain_finished(now);
+                    feed_hot(&hot, &local_asns, &recs);
+                    push_all(&mut rollups, recs.into_iter(), &metrics, "rollups");
                 }
                 let cur_hour = bgflow_store::timeutil::hour_floor(now);
                 if cur_hour != last_drain_hour {

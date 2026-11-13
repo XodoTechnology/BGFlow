@@ -53,11 +53,21 @@ pub struct AnalyticsConfig {
     /// "Our" ASNs for direction analytics: a flow whose dst_asn is local is
     /// inbound, src_asn local is outbound, neither is transit/other.
     pub local_asns: Vec<u32>,
+    /// Hot-tier window: how far back in-memory aggregates serve queries
+    /// without scanning segments (hours).
+    pub hot_window_hours: u64,
+    /// Hot-tier detail window: minute-granularity buckets are kept this
+    /// far back; older data inside the window uses hour buckets.
+    pub hot_detail_minutes: u64,
 }
 
 impl Default for AnalyticsConfig {
     fn default() -> Self {
-        Self { local_asns: vec![] }
+        Self {
+            local_asns: vec![],
+            hot_window_hours: 26,
+            hot_detail_minutes: 180,
+        }
     }
 }
 
