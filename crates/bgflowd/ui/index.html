@@ -69,6 +69,10 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 .err{color:var(--red)}
 #toast{position:fixed;right:18px;bottom:18px;background:#3a1520;border:1px solid var(--red);color:#fecaca;padding:10px 16px;border-radius:8px;font-size:12.5px;max-width:440px;z-index:99;opacity:0;transform:translateY(8px);transition:.25s;pointer-events:auto;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.5)}
 #toast.show{opacity:1;transform:none}
+#fdetail{position:fixed;right:0;top:0;bottom:0;width:340px;background:var(--panel,#16181d);border-left:1px solid var(--border,#2a2d34);padding:14px 16px;overflow-y:auto;z-index:98;font-size:12.5px;box-shadow:-6px 0 24px rgba(0,0,0,.4)}
+#fdetail .fd-head{display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:8px}
+#fdetail table{width:100%;border-collapse:collapse}
+#fdetail td{padding:3px 4px;border-bottom:1px solid var(--border,#22242a);vertical-align:top;word-break:break-all}
 #login{position:fixed;inset:0;background:radial-gradient(1200px 600px at 50% -10%,#16233c 0%,var(--bg) 60%);display:flex;align-items:center;justify-content:center;z-index:100}
 #login .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:34px 34px 26px;width:350px;box-shadow:0 18px 60px rgba(0,0,0,.55)}
 #login .logo{justify-content:center;margin-bottom:4px}
@@ -92,6 +96,7 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
     <a data-v="countries">🌍 Countries</a>
     <a data-v="conv">⬌ Conversations</a>
     <a data-v="flowmap">≋ Flow Map</a>
+    <a data-v="geo">◎ Geo</a>
     <a data-v="anomalies">⚠ Anomalies</a>
     <a data-v="exporters">⬒ Exporters</a>
     <a data-v="labels">⚑ Labels &amp; Enrichment</a>
@@ -322,6 +327,7 @@ async function load(silent){
     else if(state.view==='countries')await vCountries();
     else if(state.view==='conv')await vConv();
     else if(state.view==='flowmap'){if(silent)await drawMap();else await vFlowmap()}
+    else if(state.view==='geo')await vGeo();
     else if(state.view==='anomalies')await vAnomalies();
     else if(state.view==='exporters')await vExporters();
     else if(state.view==='labels')await vLabels();
@@ -471,11 +477,13 @@ function filterBar(extra=''){
     <select id="f_sipv"><option value="">src ipver</option>${['','4','6'].map(v=>`<option value="${v}" ${F.src_ipver===v?'selected':''}>${v?v==='4'?'IPv4':'IPv6':'any'}</option>`).join('')}</select>
     <select id="f_dipv"><option value="">dst ipver</option>${['','4','6'].map(v=>`<option value="${v}" ${F.dst_ipver===v?'selected':''}>${v?v==='4'?'IPv4':'IPv6':'any'}</option>`).join('')}</select>
     <input id="f_label" placeholder="label" value="${esc(F.label||'')}">
+    <input id="f_scity" placeholder="src city" value="${esc(F.src_city||'')}" style="width:90px">
+    <input id="f_dcity" placeholder="dst city" value="${esc(F.dst_city||'')}" style="width:90px">
     <button class="btn" onclick="applyFilters()">Apply</button>
     <button class="btn ghost" onclick="clearFilters()">Clear</button>${extra}
   </div>`;
 }
-function readFilters(){F.src=$('#f_src')?.value||'';F.dst=$('#f_dst')?.value||'';F.proto=$('#f_proto')?.value||'';F.sport=$('#f_sport')?.value||'';F.dport=$('#f_dport')?.value||'';F.exporter=$('#f_exporter')?.value||'';const asn=$('#f_asn')?.value||'';F.src_asn=asn;F.dst_asn='';F.src_ipver=$('#f_sipv')?.value||'';F.dst_ipver=$('#f_dipv')?.value||'';F.label=$('#f_label')?.value||'';for(const k in F)if(!F[k])delete F[k]}
+function readFilters(){F.src=$('#f_src')?.value||'';F.dst=$('#f_dst')?.value||'';F.proto=$('#f_proto')?.value||'';F.sport=$('#f_sport')?.value||'';F.dport=$('#f_dport')?.value||'';F.exporter=$('#f_exporter')?.value||'';const asn=$('#f_asn')?.value||'';F.src_asn=asn;F.dst_asn='';F.src_ipver=$('#f_sipv')?.value||'';F.dst_ipver=$('#f_dipv')?.value||'';F.label=$('#f_label')?.value||'';F.src_city=$('#f_scity')?.value||'';F.dst_city=$('#f_dcity')?.value||'';for(const k in F)if(!F[k])delete F[k]}
 function applyFilters(){readFilters();load()}
 function clearFilters(){for(const k in F)delete F[k];load()}
 
@@ -499,14 +507,15 @@ async function vFlows(){
    '<div class="panel"><h3>Raw Flows (newest first)</h3><div id="tbl"></div></div>';
   const lim=$('#f_limit')?.value||500;
   const data=await api('/api/v1/flows?'+q({limit:lim}));
+  _fl=data.flows||[];
   const tip=(f,side)=>{const p=side;const bits=[];
     const ptr=f[p+'_ptr'];if(ptr)bits.push(ptr);
     const city=f[p+'_city'];const region=f[p+'_region'];const lat=f[p+'_lat'];const lon=f[p+'_lon'];
     if(city||region)bits.push([city,region].filter(Boolean).join(', '));
     if(lat&&lon)bits.push(Number(lat).toFixed(3)+', '+Number(lon).toFixed(3));
     return bits.join(' · ');};
-  const rows=(data.flows||[]).map(f=>`<tr>
-    <td class="muted">${f.ts?new Date(f.ts*1000).toLocaleTimeString():'-'}</td>
+  const rows=_fl.map((f,i)=>`<tr>
+    <td class="muted clickable" title="click for detail" onclick="flowDetail(${i})">${f.ts?new Date(f.ts*1000).toLocaleTimeString():'-'}</td>
     <td><span class="clickable" title="${esc(tip(f,'src'))}" onclick="setFilter('src','${esc(f.src_ip)}')">${esc(f.src_ip)}</span><span class="muted">:${f.src_port}</span></td>
     <td><span class="clickable" title="${esc(tip(f,'dst'))}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted">:${f.dst_port}</span></td>
     <td>${protoBadge(f.protocol_name||protoName(f.protocol))}</td>
@@ -641,6 +650,73 @@ async function vLabels(){
 async function doLookup(){const ip=$('#lu_ip')?.value.trim();if(!ip)return;try{const d=await api('/api/v1/lookup?ip='+encodeURIComponent(ip));const el=$('#lu_out');if(el)el.textContent=JSON.stringify(d,null,2)}catch(e){const el=$('#lu_out');if(el)el.textContent='Error: '+e.message}}
 
 // ---------- flow map (sankey) ----------
+// ---------- geo bubble map ----------
+async function vGeo(){
+  content.innerHTML=`<div class="filters">${presetBar()}<span class="muted">bubbles sized by bytes · geo data needs a *-city-*.mmdb and schema ≥4 flows</span></div>
+   <div class="panel"><canvas id="geomap" style="height:480px;cursor:crosshair"></canvas>
+   <div id="geohint" class="hint">hover a bubble</div></div>
+   <div class="panel"><h3>Top Locations</h3><div id="getbl"></div></div>`;
+  const d=await api('/api/v1/geo?'+q({limit:400}));
+  const pts=d.points||[];
+  const cv=$('#geomap');if(!cv)return;
+  const ctx2=cv.getContext('2d');
+  const draw=()=>{
+    const W=cv.clientWidth,H=cv.clientHeight;cv.width=W*devicePixelRatio;cv.height=H*devicePixelRatio;
+    ctx2.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+    ctx2.clearRect(0,0,W,H);
+    // equirectangular graticule
+    ctx2.strokeStyle='var(--border,#333)';ctx2.lineWidth=1;
+    for(let lo=-180;lo<=180;lo+=30){const x=(lo+180)/360*W;ctx2.beginPath();ctx2.moveTo(x,0);ctx2.lineTo(x,H);ctx2.stroke()}
+    for(let la=-60;la<=60;la+=30){const y=(90-la)/180*H;ctx2.beginPath();ctx2.moveTo(0,y);ctx2.lineTo(W,y);ctx2.stroke()}
+    const maxB=Math.max(1,...pts.map(p=>p.bytes||0));
+    cv._pts=pts.map(p=>({...p,x:(p.lon+180)/360*W,y:(90-p.lat)/180*H,r:3+Math.sqrt((p.bytes||0)/maxB)*22}));
+    for(const p of cv._pts){
+      ctx2.beginPath();ctx2.arc(p.x,p.y,p.r,0,7);
+      ctx2.fillStyle='rgba(79,140,255,.35)';ctx2.fill();
+      ctx2.strokeStyle='rgba(79,140,255,.8)';ctx2.stroke();
+    }
+  };
+  draw();window.addEventListener('resize',draw);
+  cv.onmousemove=e=>{
+    const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    let best=null,bd=18;
+    for(const p of cv._pts||[]){const dd=Math.hypot(p.x-mx,p.y-my);if(dd<bd+p.r&&dd<bd+14){best=p;bd=dd}}
+    const el=$('#geohint');
+    if(best&&el)el.innerHTML=`<b>${esc(best.city||'unknown')}</b> ${best.lat.toFixed(2)},${best.lon.toFixed(2)} — ${fmtB(best.bytes)} · ${fmtN(best.flows)} flows`;
+    else if(el)el.textContent='hover a bubble';
+  };
+  const rows=pts.slice(0,15).map(p=>`<tr><td>${p.city?esc(p.city):'<span class="muted">-</span>'}</td><td class="num">${p.lat.toFixed(2)}, ${p.lon.toFixed(2)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.flows)}</td></tr>`).join('');
+  $('#getbl').innerHTML=`<table><tr><th>City</th><th>Coords</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=4 class=muted>No geo data in range (need city MMDB + recent flows)</td></tr>'}</table>`;
+}
+
+// ---------- flow detail drawer ----------
+let _fl=[];
+function flowDetail(i){
+  const f=_fl[i];if(!f)return;
+  let d=document.getElementById('fdetail');if(!d){d=document.createElement('div');d.id='fdetail';document.body.appendChild(d)}
+  const kv=(k,v)=>`<tr><td class="muted">${k}</td><td>${v??'<span class="muted">-</span>'}</td></tr>`;
+  const ip=(x,p,c,l,la,lo)=>`${x}:${p}${c?` <span class="muted">· ${esc(c)}${l?` @ ${Number(la).toFixed(2)},${Number(lo).toFixed(2)}`:''}</span>`:''}`;
+  d.innerHTML=`<div class="fd-head"><b>Flow detail</b><span class="clickable" onclick="document.getElementById('fdetail').remove()">✕</span></div><table>
+   ${kv('Time',f.ts?new Date(f.ts*1000).toLocaleString():'-')}
+   ${kv('Source',ip(f.src_ip,f.src_port,f.src_city,f.src_ptr,f.src_lat,f.src_lon))}
+   ${kv('Dest',ip(f.dst_ip,f.dst_port,f.dst_city,f.dst_ptr,f.dst_lat,f.dst_lon))}
+   ${kv('Region',`${f.src_region||'-'} → ${f.dst_region||'-'}`)}
+   ${kv('Proto',`${f.protocol_name||f.protocol} flags=0x${(f.tcp_flags||0).toString(16)}`)}
+   ${kv('ASN',`AS${f.src_asn||'-'} → AS${f.dst_asn||'-'}`)}
+   ${kv('Org',`${f.src_org||f.src_country||'-'} → ${f.dst_org||f.dst_country||'-'}`)}
+   ${kv('Bytes/Pkts',`${fmtB(f.bytes)} / ${fmtN(f.packets)}`)}
+   ${kv('Duration',f.duration_ms?f.duration_ms+' ms':'-')}
+   ${kv('Ifaces',`${f.ingress_if||'-'} → ${f.egress_if||'-'} (ifIndex)`)}
+   ${kv('Next hop',f.next_hop!=='0.0.0.0'&&f.next_hop!=='::'?f.next_hop:'-')}
+   ${kv('Exporter',f.exporter)}${kv('Engine',f.engine_id?`${f.engine_id}/${f.engine_type}`:'-')}
+   ${kv('Sampler',f.sampler_interval>1?`1 in ${f.sampler_interval}`:'-')}
+   ${kv('TCP state',f.tcp_state||'-')}${kv('TTL',f.ip_ttl||'-')}
+   ${kv('End reason',f.flow_end_reason??'-')}${kv('VLAN',f.vlan||'-')}
+   ${kv('Label',f.label||'-')}${kv('ICMP',f.icmp_type?`${f.icmp_type}/${f.icmp_code}`:'-')}
+   ${f.post_nat_src||f.post_nat_dst?kv('Post-NAT',`${f.post_nat_src||'-'} → ${f.post_nat_dst||'-'}`):''}
+  </table>`;
+}
+
 const MATRIX_DIMS=['src_ipver','dst_ipver','src_asn','dst_asn','src_org','dst_org','src_country','dst_country','proto','label','src_port','dst_port'];
 
 async function vFlowmap(){

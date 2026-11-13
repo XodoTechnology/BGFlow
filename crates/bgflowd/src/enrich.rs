@@ -84,6 +84,12 @@ impl StringTable {
         id
     }
 
+    /// Look up a name's id (exact match). Used to resolve API filter
+    /// params like `src_city=Frankfurt`.
+    pub fn id_of(&self, name: &str) -> Option<u32> {
+        self.inner.lock().unwrap().ids.get(name).copied()
+    }
+
     pub fn name(&self, id: u32) -> Option<String> {
         if id == 0 {
             return None;

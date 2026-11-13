@@ -77,8 +77,8 @@ pub async fn run(
     // Coarse dataset: hourly buckets with /24·/48-masked IPs — the
     // long-retention, low-cardinality stats layer.
     let mut hourly = Dataset::<RollupRecord>::open(cfg.data_dir.join("hourly"), opts)?;
-    let mut agg = RollupAggregator::new();
-    let mut coarse_agg = RollupAggregator::coarse();
+    let mut agg = RollupAggregator::new().with_sampling(cfg.sample_weighting);
+    let mut coarse_agg = RollupAggregator::coarse().with_sampling(cfg.sample_weighting);
     let coarse_on = cfg.coarse_rollup;
 
     // Publish initial indexes (picks up segments from previous runs).
@@ -235,12 +235,10 @@ fn push_all<R: bgflow_store::Record>(
     metrics: &Metrics,
     what: &str,
 ) {
-    let mut stored = 0u64;
     let mut errs = 0u64;
     for rec in recs {
-        match ds.push(&rec) {
-            Ok(()) => stored += 1,
-            Err(_) => errs += 1,
+        if ds.push(&rec).is_err() {
+            errs += 1;
         }
     }
     if errs > 0 {

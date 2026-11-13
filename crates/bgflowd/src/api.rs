@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bgflow_store::Record;
 use bgflow_types::ip_to_u128;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -328,6 +329,17 @@ async fn flows(
     if let Some(s) = q.get("label") {
         fq.label = resolve_label(&st.ctx, s);
     }
+    // City filters accept a string-table id or an exact city name.
+    for (param, slot) in [("src_city", &mut fq.src_city), ("dst_city", &mut fq.dst_city)] {
+        if let Some(s) = q.get(param) {
+            let v = s
+                .parse::<u32>()
+                .ok()
+                .or_else(|| st.ctx.cities.id_of(s.trim()))
+                .ok_or_else(|| err(format!("unknown {} '{}'", param, s)))?;
+            *slot = Some(v);
+        }
+    }
 
     let mut recs = query::flows(&st.ctx, &fq).map_err(|e| err(e.to_string()))?;
     // Enrich-at-read: fills org/country/asn fields the ingest-time pipeline
@@ -344,6 +356,89 @@ async fn flows(
         "count": out.len(),
         "offset": fq.offset,
         "flows": out,
+    })))
+}
+
+/// GET /api/v1/geo — aggregate recent raw flows into lat/lon bubbles for
+/// the geo map view. Raw flows only carry geo on schema ≥4 segments and
+/// have short retention, so this is a "recent hotspots" view.
+async fn geo(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<Q>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (from, to) = range(&q);
+    let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(300).min(1000);
+    // ~1° grid buckets keyed by (lat_i32, lon_i32).
+    #[derive(Default)]
+    struct Cell {
+        bytes: u64,
+        packets: u64,
+        flows: u64,
+        lat_sum: f64,
+        lon_sum: f64,
+        city: u32,
+    }
+    let mut cells: std::collections::HashMap<(i32, i32), Cell> = std::collections::HashMap::new();
+    let infos = st.ctx.flow_index.read().unwrap().clone();
+    bgflow_store::for_each_segment_info::<bgflow_types::FlowRecord>(
+        &infos,
+        bgflow_types::FlowRecord::schema(),
+        from,
+        to,
+        false,
+        |scan| {
+            for i in 0..scan.rows {
+                let f = bgflow_types::FlowRecord::from_scan(scan, i);
+                if f.ts_ms < from || f.ts_ms > to {
+                    continue;
+                }
+                // Weight each endpoint's geo by its share — simpler: count
+                // dst geo for outbound-ish and src for the rest? Use dst
+                // when present else src (matches "where traffic goes").
+                let (lat, lon, city) = if f.dst_lat != 0 || f.dst_lon != 0 || f.dst_city != 0 {
+                    (f.dst_lat, f.dst_lon, f.dst_city)
+                } else {
+                    (f.src_lat, f.src_lon, f.src_city)
+                };
+                if lat == 0 && lon == 0 {
+                    continue;
+                }
+                let la = (lat as f64 / 100000.0 - 90.0).round() as i32;
+                let lo = (lon as f64 / 100000.0 - 180.0).round() as i32;
+                let c = cells.entry((la, lo)).or_default();
+                c.bytes += f.bytes;
+                c.packets += f.packets;
+                c.flows += 1;
+                c.lat_sum += lat as f64 / 100000.0 - 90.0;
+                c.lon_sum += lon as f64 / 100000.0 - 180.0;
+                if c.city == 0 {
+                    c.city = city;
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+    .map_err(|e| err(e.to_string()))?;
+
+    let mut pts: Vec<_> = cells
+        .into_iter()
+        .map(|((_, _), c)| {
+            serde_json::json!({
+                "lat": c.lat_sum / c.flows as f64,
+                "lon": c.lon_sum / c.flows as f64,
+                "bytes": c.bytes,
+                "packets": c.packets,
+                "flows": c.flows,
+                "city": st.ctx.cities.name(c.city),
+            })
+        })
+        .collect();
+    pts.sort_by(|a, b| b["bytes"].as_u64().cmp(&a["bytes"].as_u64()));
+    pts.truncate(limit);
+    Ok(Json(serde_json::json!({
+        "points": pts,
+        "from": from,
+        "to": to,
     })))
 }
 
@@ -1249,6 +1344,8 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "src_ipver", "in": "query", "description": "4|6"},
                 {"name": "dst_ipver", "in": "query", "description": "4|6"},
                 {"name": "src_org", "in": "query"}, {"name": "dst_org", "in": "query"},
+                {"name": "src_city", "in": "query", "description": "city name (exact)"},
+                {"name": "dst_city", "in": "query", "description": "city name (exact)"},
                 {"name": "label", "in": "query", "description": "label name or id"},
                 {"name": "limit", "in": "query"}, {"name": "offset", "in": "query"},
                 {"name": "order", "in": "query", "description": "asc|desc"},
@@ -1279,6 +1376,10 @@ fn openapi_spec() -> serde_json::Value {
             "/api/v1/exporters": {"get": {"summary": "Exporter ingest stats"}},
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
+            "/api/v1/geo": {"get": {"summary": "Geo bubbles: lat/lon aggregates of recent raw flows (needs city MMDB + schema ≥4)", "parameters": [
+                {"name": "from", "in": "query"}, {"name": "to", "in": "query"},
+                {"name": "limit", "in": "query", "description": "max bubbles (default 300)"},
+            ]}},
             "/api/v1/lookup": {"get": {"summary": "Manual enrichment lookup", "parameters": [
                 {"name": "ip", "in": "query"},
             ]}},
@@ -1562,6 +1663,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .merge(
             Router::new()
                 .route("/api/v1/flows", get(flows))
+                .route("/api/v1/geo", get(geo))
                 .route("/api/v1/summary", get(summary))
                 .route("/api/v1/overview", get(overview))
                 .route("/api/v1/matrix", get(matrix))

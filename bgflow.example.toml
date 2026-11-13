@@ -67,6 +67,10 @@ retention_interval_secs = 300
 # granularity=hourly on /api/v1/top|summary|timeseries.
 coarse_rollup = true
 coarse_retention_days = 365
+# Sampling correction: multiply rollup bytes/packets by each flow's
+# sampler_interval (1-in-N). Enable ONLY if your exporters report raw
+# sampled counts (most do); exporters that pre-scale would double-count.
+sample_weighting = false
 
 [geoip]
 # GeoIP MMDB databases (optional) — fills in ASN/org/country for flows

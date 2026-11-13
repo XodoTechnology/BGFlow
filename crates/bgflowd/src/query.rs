@@ -161,6 +161,9 @@ pub struct FlowQuery {
     pub dst_ipver: Option<u8>,
     pub src_org: Option<u32>,
     pub dst_org: Option<u32>,
+    /// City-name string-table ids (0/None = any).
+    pub src_city: Option<u32>,
+    pub dst_city: Option<u32>,
     pub limit: usize,
     /// Skip this many matching rows before collecting (pagination).
     pub offset: usize,
@@ -229,6 +232,16 @@ impl FlowQuery {
         }
         if let Some(v) = self.label {
             if f.label_id != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.src_city {
+            if f.src_city != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dst_city {
+            if f.dst_city != v {
                 return false;
             }
         }

@@ -118,6 +118,11 @@ pub struct StorageConfig {
     pub coarse_rollup: bool,
     /// Coarse rollup retention in days (0 = keep forever).
     pub coarse_retention_days: u32,
+    /// When true, rollup bytes/packets are multiplied by each flow's
+    /// sampler_interval (1-in-N sampling correction). Enable only if your
+    /// exporters report raw sampled counts — exporters that pre-scale
+    /// would be double-counted. Default off.
+    pub sample_weighting: bool,
 }
 
 /// One MMDB path or several (e.g. separate IPv4/IPv6 databases — lookups
@@ -349,6 +354,7 @@ impl Default for StorageConfig {
             retention_interval_secs: 300,
             coarse_rollup: true,
             coarse_retention_days: 365,
+            sample_weighting: false,
         }
     }
 }

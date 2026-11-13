@@ -44,6 +44,10 @@ pub struct RollupAggregator {
     /// Coarse mode: hour buckets + IPs masked to /24 (v4) or /48 (v6).
     /// Used for the long-retention "big picture" dataset.
     coarse: bool,
+    /// When true, bytes/packets are multiplied by `sampler_interval`
+    /// (1-in-N sampling) so rates reflect the unsampled traffic volume.
+    /// Enable only for exporters that report raw sampled counts.
+    weight_samples: bool,
 }
 
 /// Mask an IP for coarse aggregation: v4 -> /24, v6 -> /48.
@@ -65,13 +69,19 @@ fn coarse_mask(ip: u128) -> u128 {
 
 impl RollupAggregator {
     pub fn new() -> Self {
-        RollupAggregator { map: HashMap::new(), coarse: false }
+        RollupAggregator { map: HashMap::new(), coarse: false, weight_samples: false }
     }
 
     /// Hourly buckets with /24·/48-masked IPs — far fewer distinct keys,
     /// suited to year-plus retention.
     pub fn coarse() -> Self {
-        RollupAggregator { map: HashMap::new(), coarse: true }
+        RollupAggregator { map: HashMap::new(), coarse: true, weight_samples: false }
+    }
+
+    /// Enable sampler-interval weighting (see field docs).
+    pub fn with_sampling(mut self, on: bool) -> Self {
+        self.weight_samples = on;
+        self
     }
 
     /// Current number of in-memory aggregates (for metrics/health).
@@ -111,8 +121,16 @@ impl RollupAggregator {
             max_ts: f.ts_ms,
             ..Default::default()
         });
-        e.bytes += f.bytes;
-        e.packets += f.packets;
+        // Sampled flows (sFlow, sampled NetFlow/IPFIX) report 1-in-N
+        // counts — scale bytes/packets back up when enabled. `flows`
+        // stays the observed record count.
+        let w = if self.weight_samples && f.sampler_interval > 1 {
+            f.sampler_interval as u64
+        } else {
+            1
+        };
+        e.bytes += f.bytes.saturating_mul(w);
+        e.packets += f.packets.saturating_mul(w);
         e.flows += 1;
         if f.ts_ms < e.min_ts {
             e.min_ts = f.ts_ms;
