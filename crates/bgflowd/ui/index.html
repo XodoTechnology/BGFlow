@@ -116,13 +116,13 @@ pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;pa
 <div id="main">
   <div id="topbar">
     <div class="title" id="viewtitle">Overview</div>
+    <span class="chip" data-r="-1m">1m</span>
+    <span class="chip" data-r="-5m">5m</span>
     <span class="chip" data-r="-15m">15m</span>
     <span class="chip" data-r="-1h">1h</span>
     <span class="chip" data-r="-6h">6h</span>
     <span class="chip on" data-r="-24h">24h</span>
     <span class="chip" data-r="-7d">7d</span>
-    <span class="chip" data-r="-1M">1M</span>
-    <span class="chip" data-r="-5M">5M</span>
     <span class="chip" data-r="custom">custom</span>
     <input id="fromin" placeholder="from (e.g. -1h)" style="display:none;min-width:130px">
     <input id="toin" placeholder="to" style="display:none;min-width:130px">
@@ -281,12 +281,13 @@ function toast(msg,ms=9000){
 // Approximate preset spans (ms) + bucket sizes for auto-tuning on long
 // ranges: past ~month scale we read the coarse hourly dataset and grow
 // the chart bucket so point counts stay bounded.
-const RANGE_MS={'-15m':900e3,'-1h':36e5,'-6h':216e5,'-24h':864e5,'-7d':6048e5,'-1M':2592e7,'-5M':12960e7};
+const RANGE_MS={'-1m':60e3,'-5m':300e3,'-15m':900e3,'-1h':36e5,'-6h':216e5,'-24h':864e5,'-7d':6048e5,'-1M':2592e7,'-5M':12960e7};
 const BUCKET_MS={'1m':60e3,'5m':300e3,'15m':900e3,'1h':36e5,'6h':216e5,'1d':864e5};
 const BUCKET_ORDER=['1m','5m','15m','1h','6h','1d'];
 function effGranularity(){return (RANGE_MS[state.range]||0)>25*864e5&&state.granularity==='minute'?'hourly':state.granularity}
 function effBucket(){const span=RANGE_MS[state.range]||864e5;let b=state.bucket;
   while(span/(BUCKET_MS[b]||300e3)>4000){const i=BUCKET_ORDER.indexOf(b);if(i<0||i===BUCKET_ORDER.length-1)break;b=BUCKET_ORDER[i+1]}
+  while(span/(BUCKET_MS[b]||300e3)<2){const i=BUCKET_ORDER.indexOf(b);if(i<=0)break;b=BUCKET_ORDER[i-1]}
   // Hourly rollup rows are hour-granular — never bucket finer than 1h.
   if(effGranularity()==='hourly'&&BUCKET_ORDER.indexOf(b)<BUCKET_ORDER.indexOf('1h'))b='1h';
   return b}
@@ -522,7 +523,7 @@ async function vOverview(){
   content.innerHTML=filterBar()+cards+
    `<div class="panel"><h3>Traffic — ${esc(eb)} buckets
      <span id="dirleg" style="display:none;font-weight:400;font-size:10px">
-       <span style="color:#22c55e">■</span> in <span style="color:#3b82f6">■</span> out <span style="color:#64748b">■</span> transit</span>
+       <span style="color:#22c55e">■</span> in <span style="color:#3b82f6">■</span> out <span style="color:#64748b">■</span> transit/IXP</span>
      <span style="float:right">
        ${['bytes','packets','flows'].map(m=>`<span class="chip ${state.metric===m?'on':''}" data-m="${m}" style="font-size:11px;padding:2px 9px">${m}</span>`).join('')}
        <select id="b_bucket" title="aggregation bucket size — the visible window comes from the range chips" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:2px 6px;border-radius:5px;font-size:11px">
@@ -554,6 +555,9 @@ function drawChart(series){
   c.width=W*dpr;c.height=H*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);
   const vals=series.map(s=>s[metric]||0);
   const max=Math.max(...vals,1);
+  // ~10% headroom so the peak doesn't touch the top border and the
+  // smoothed curve has room to overshoot without clipping.
+  const top=max*1.1;
   const n=series.length,padR=14,padT=16,padB=24;
   const fmt=metric==='bytes'?fmtB:fmtN;
   // Size the y gutter to the widest label — large packet counts would
@@ -564,7 +568,7 @@ function drawChart(series){
   const iw=W-padL-padR,ih=H-padT-padB;
   // grid + y labels
   x.strokeStyle='#1d2534';x.fillStyle='#8b949e';x.lineWidth=1;
-  for(let i=0;i<=4;i++){const v=max*i/4,y=padT+ih*(1-i/4);
+  for(let i=0;i<=4;i++){const v=top*i/4,y=padT+ih*(1-i/4);
     x.beginPath();x.moveTo(padL,y);x.lineTo(W-padR,y);x.stroke();
     x.fillText(fmt(v),3,y+3);}
   // x labels
@@ -572,7 +576,7 @@ function drawChart(series){
   series.forEach((s,i)=>{if(i%step)return;const d=new Date(s.t*1000);
     x.fillText(d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),padL+i*iw/Math.max(1,n-1)-16,H-8)});
   // points + catmull-rom → bezier smoothing
-  const px=i=>padL+i*iw/Math.max(1,n-1), py=v=>padT+ih-(v/max)*ih;
+  const px=i=>padL+i*iw/Math.max(1,n-1), py=v=>padT+ih-(v/top)*ih;
   const hasDir=series.some(s=>s.in_bytes!==undefined)&&series.some(s=>(s.in_bytes||0)+(s.out_bytes||0)>0);
   const dl=$('#dirleg');if(dl)dl.style.display=hasDir?'inline':'none';
   const mkpts=v=>v.map((val,i)=>[px(i),py(val)]);
@@ -592,7 +596,7 @@ function drawChart(series){
     const layer=(up,dn,col)=>{const U=mkpts(up),D=mkpts(dn).reverse();
       x.beginPath();trace(U,false);x.lineTo(D[0][0],D[0][1]);trace(D,true);x.closePath();
       x.fillStyle=col;x.fill()};
-    layer(b1,z,'rgba(100,116,139,.5)');
+    layer(b1,z,'rgba(100,116,139,.38)');
     layer(b2,b1,'rgba(59,130,246,.5)');
     layer(b3,b2,'rgba(34,197,94,.55)');
     const tp=mkpts(b3);x.beginPath();trace(tp,false);
@@ -608,12 +612,12 @@ function drawChart(series){
     const lg=x.createLinearGradient(padL,0,W-padR,0);lg.addColorStop(0,'#3b82f6');lg.addColorStop(1,'#22d3ee');
     path();x.strokeStyle=lg;x.lineWidth=2;x.lineJoin='round';x.stroke();
   }
-  // peak marker (clamped inside the canvas)
+  // peak marker just above the peak point, clamped inside the canvas
   const mi=vals.indexOf(max);
   const pk=fmt(max);x.font='600 11px ui-monospace,monospace';
   const pw=x.measureText(pk).width;
   x.fillStyle='#e6edf3';
-  x.fillText(pk,Math.min(Math.max(px(mi)-pw/2,padL),Math.max(padL,W-padR-pw)),padT+ih-8);
+  x.fillText(pk,Math.min(Math.max(px(mi)-pw/2,padL),Math.max(padL,W-padR-pw)),Math.max(padT+10,py(vals[mi])-6));
   // hover crosshair + tooltip
   const hi=state.hoverI;
   if(hi>=0&&hi<n){
@@ -622,7 +626,7 @@ function drawChart(series){
     x.beginPath();x.moveTo(hx,padT);x.lineTo(hx,padT+ih);x.stroke();x.setLineDash([]);
     x.beginPath();x.arc(hx,hy,3.5,0,7);x.fillStyle='#22d3ee';x.fill();
     x.strokeStyle='#0b0e14';x.lineWidth=1.5;x.stroke();
-    const rows=hasDir?[`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`,`in ${fmt(s['in_'+metric]||0)} · out ${fmt(s['out_'+metric]||0)} · transit ${fmt(s['tr_'+metric]||0)}`]
+    const rows=hasDir?[`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`,`in ${fmt(s['in_'+metric]||0)} · out ${fmt(s['out_'+metric]||0)} · transit/IXP ${fmt(s['tr_'+metric]||0)}`]
       :[`${fmt(vals[hi])} · ${new Date(s.t*1000).toLocaleTimeString()}`];
     x.font='11px ui-monospace,monospace';
     const tw=Math.max(...rows.map(r=>x.measureText(r).width))+12,th=rows.length*15+6;
