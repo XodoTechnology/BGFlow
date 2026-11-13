@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
+use tokio::time::Duration;
 
 pub struct IngestShared {
     pub geo: Arc<MmdbGeo>,
@@ -205,8 +206,18 @@ async fn handle_tcp_conn(
 ) -> anyhow::Result<()> {
     let mut dec = IpfixTcpDecoder::new(exporter);
     let mut buf = vec![0u8; 65536];
+    // Idle connections are closed so a peer that connects but never sends
+    // can't hold a max_connections permit forever.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
     loop {
-        let n = sock.read(&mut buf).await?;
+        let n = match tokio::time::timeout(IDLE_TIMEOUT, sock.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                tracing::debug!("tcp conn from {} idle >10min, closing", exporter);
+                return Ok(());
+            }
+        };
         if n == 0 {
             return Ok(()); // peer closed
         }

@@ -1243,6 +1243,9 @@ const PTR_POS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 const PTR_NEG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Don't queue more than this many in-flight lookups.
 const PTR_PENDING_MAX: usize = 50_000;
+/// Bound on cached PTR entries (~15MB worst case) — without it the map
+/// grows forever on busy long-lived deployments.
+const PTR_MAP_MAX: usize = 262_144;
 
 /// Reverse-DNS cache. `get` is a cheap sync read — misses enqueue a
 /// background `getnameinfo` and return "unknown" so query paths never
@@ -1318,12 +1321,27 @@ impl PtrCache {
     }
 
     fn insert(&self, ip_u128: u128, name: Option<String>) {
-        self.map.write().unwrap().insert(
-            ip_u128,
-            PtrEntry { name, at: std::time::Instant::now() },
-        );
+        ptr_insert(&self.map, ip_u128, name);
         self.pending.lock().unwrap().remove(&ip_u128);
     }
+}
+
+/// Bounded insert shared by the cache and the resolve worker. When the
+/// map is full, expired entries are reclaimed; if everything is still
+/// fresh the new entry is skipped (callers still got their answer — it
+/// just isn't remembered).
+fn ptr_insert(map: &RwLock<HashMap<u128, PtrEntry>>, ip_u128: u128, name: Option<String>) {
+    let mut g = map.write().unwrap();
+    if g.len() >= PTR_MAP_MAX && !g.contains_key(&ip_u128) {
+        g.retain(|_, e| e.at.elapsed() < PTR_POS_TTL);
+        if g.len() >= PTR_MAP_MAX {
+            return;
+        }
+    }
+    g.insert(
+        ip_u128,
+        PtrEntry { name, at: std::time::Instant::now() },
+    );
 }
 
 /// Worker-side state (shares the Arc'd maps with the cache).
@@ -1339,10 +1357,7 @@ impl PtrWorker {
             .await
             .ok()
             .flatten();
-        self.map.write().unwrap().insert(
-            ip_u128,
-            PtrEntry { name, at: std::time::Instant::now() },
-        );
+        ptr_insert(&self.map, ip_u128, name);
         self.pending.lock().unwrap().remove(&ip_u128);
     }
 }

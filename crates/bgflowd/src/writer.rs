@@ -101,20 +101,16 @@ pub async fn run(
                     Some(rec) => {
                         pending.push(rec);
                         if pending.len() >= BATCH {
-                            ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics)?;
+                            ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics);
                         }
                     }
                     None => {
                         // All senders gone: flush everything and exit.
-                        ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics)?;
+                        ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics);
                         // drain_all: keep the still-open buckets too — their
                         // raw flows exist, so rollups shouldn't lose them.
-                        for rec in agg.drain_all() {
-                            rollups.push(&rec)?;
-                        }
-                        for rec in coarse_agg.drain_all() {
-                            hourly.push(&rec)?;
-                        }
+                        push_all(&mut rollups, agg.drain_all().into_iter(), &metrics, "rollups");
+                        push_all(&mut hourly, coarse_agg.drain_all().into_iter(), &metrics, "hourly");
                         flows.flush()?;
                         rollups.flush()?;
                         hourly.flush()?;
@@ -124,21 +120,17 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
-                ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics)?;
+                ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics);
                 let now = now_ms();
                 let cur_min = bgflow_store::timeutil::minute_floor(now);
                 if cur_min != last_drain_min {
                     last_drain_min = cur_min;
-                    for rec in agg.drain_finished(now) {
-                        rollups.push(&rec)?;
-                    }
+                    push_all(&mut rollups, agg.drain_finished(now).into_iter(), &metrics, "rollups");
                 }
                 let cur_hour = bgflow_store::timeutil::hour_floor(now);
                 if cur_hour != last_drain_hour {
                     last_drain_hour = cur_hour;
-                    for rec in coarse_agg.drain_finished(now) {
-                        hourly.push(&rec)?;
-                    }
+                    push_all(&mut hourly, coarse_agg.drain_finished(now).into_iter(), &metrics, "hourly");
                 }
 
                 // Periodic explicit flush + retention.
@@ -148,9 +140,18 @@ pub async fn run(
                 let fbytes = flows.total_bytes();
                 let rbytes = rollups.total_bytes();
                 let hbytes = hourly.total_bytes();
-                flows.flush()?;
-                rollups.flush()?;
-                hourly.flush()?;
+                // Flush errors are counted + logged but don't kill the
+                // writer — the next tick retries. Only a dead dataset
+                // (open failure at startup) is fatal.
+                if let Err(e) = flows.flush() {
+                    write_err(&metrics, "flows flush", &e);
+                }
+                if let Err(e) = rollups.flush() {
+                    write_err(&metrics, "rollups flush", &e);
+                }
+                if let Err(e) = hourly.flush() {
+                    write_err(&metrics, "hourly flush", &e);
+                }
                 let segs = (flows.segment_count() - fb)
                     + (rollups.segment_count() - rb)
                     + (hourly.segment_count() - hb);
@@ -163,7 +164,9 @@ pub async fn run(
                 }
                 if now.saturating_sub(last_retention) >= retention_iv.as_millis() as u64 {
                     last_retention = now;
-                    retention(&mut flows, &mut rollups, &mut hourly, &cfg, &metrics)?;
+                    if let Err(e) = retention(&mut flows, &mut rollups, &mut hourly, &cfg, &metrics) {
+                        write_err(&metrics, "retention", &e);
+                    }
                 }
                 if flows.segment_count() != fb
                     || rollups.segment_count() != rb
@@ -177,6 +180,11 @@ pub async fn run(
     }
 }
 
+/// Push a batch of flow records. Storage errors are counted and logged
+/// but never propagate — a transient IO failure must not kill the writer
+/// (which would silently drop every subsequent flow). The rollup
+/// aggregators only see records that were actually stored, keeping raw
+/// and rollup data consistent.
 fn ingest_batch(
     pending: &mut Vec<FlowRecord>,
     flows: &mut Dataset<FlowRecord>,
@@ -184,22 +192,67 @@ fn ingest_batch(
     coarse_agg: &mut RollupAggregator,
     coarse_on: bool,
     metrics: &Metrics,
-) -> anyhow::Result<()> {
+) {
     if pending.is_empty() {
-        return Ok(());
+        return;
     }
-    let n = pending.len() as u64;
+    let mut stored = 0u64;
+    let mut errs = 0u64;
+    let mut first_err: Option<String> = None;
     for rec in pending.drain(..) {
-        agg.add(&rec);
-        if coarse_on {
-            coarse_agg.add(&rec);
+        match flows.push(&rec) {
+            Ok(()) => {
+                stored += 1;
+                agg.add(&rec);
+                if coarse_on {
+                    coarse_agg.add(&rec);
+                }
+            }
+            Err(e) => {
+                errs += 1;
+                if first_err.is_none() {
+                    first_err = Some(format!("{:#}", e));
+                }
+            }
         }
-        flows.push(&rec)?;
     }
-    metrics
-        .rows_stored
-        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
+    metrics.rows_stored.fetch_add(stored, std::sync::atomic::Ordering::Relaxed);
+    if errs > 0 {
+        metrics.write_errors.fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            "writer: {} flow record(s) failed to store ({} stored); first error: {}",
+            errs,
+            stored,
+            first_err.unwrap_or_default()
+        );
+    }
+}
+
+/// Push rollup records, tolerating per-record errors (see ingest_batch).
+fn push_all<R: bgflow_store::Record>(
+    ds: &mut Dataset<R>,
+    recs: impl Iterator<Item = R>,
+    metrics: &Metrics,
+    what: &str,
+) {
+    let mut stored = 0u64;
+    let mut errs = 0u64;
+    for rec in recs {
+        match ds.push(&rec) {
+            Ok(()) => stored += 1,
+            Err(_) => errs += 1,
+        }
+    }
+    if errs > 0 {
+        metrics.write_errors.fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!("writer: {} {} record(s) failed to store", errs, what);
+    }
+}
+
+/// Count + log a storage error without killing the writer.
+fn write_err(metrics: &Metrics, what: &str, e: &anyhow::Error) {
+    metrics.write_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::error!("writer: {} failed: {:#}", what, e);
 }
 
 fn retention(

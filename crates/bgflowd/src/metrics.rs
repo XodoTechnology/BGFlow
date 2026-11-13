@@ -28,6 +28,9 @@ pub struct Metrics {
     pub bytes_in: AtomicU64,
     pub parse_errors: AtomicU64,
     pub channel_dropped: AtomicU64,
+    /// Storage write/flush failures (dataset push, segment flush,
+    /// retention). The writer survives these — this counter is the signal.
+    pub write_errors: AtomicU64,
     pub unknown_proto: AtomicU64,
     pub flushes: AtomicU64,
     pub bytes_stored: AtomicU64,
@@ -75,6 +78,8 @@ impl Metrics {
         s.push_str(&format!("bgflow_parse_errors_total {}\n", g(&self.parse_errors)));
         s.push_str("# HELP bgflow_channel_dropped_total Records dropped (channel full)\n# TYPE bgflow_channel_dropped_total counter\n");
         s.push_str(&format!("bgflow_channel_dropped_total {}\n", g(&self.channel_dropped)));
+        s.push_str("# HELP bgflow_write_errors_total Storage write/flush errors (writer keeps running)\n# TYPE bgflow_write_errors_total counter\n");
+        s.push_str(&format!("bgflow_write_errors_total {}\n", g(&self.write_errors)));
         s.push_str("# HELP bgflow_unknown_proto_total Datagrams with unknown protocol\n# TYPE bgflow_unknown_proto_total counter\n");
         s.push_str(&format!("bgflow_unknown_proto_total {}\n", g(&self.unknown_proto)));
         s.push_str("# HELP bgflow_enrich_http_lookups_total HTTP enrichment lookups\n# TYPE bgflow_enrich_http_lookups_total counter\n");
