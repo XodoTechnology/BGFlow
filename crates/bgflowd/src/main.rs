@@ -290,6 +290,7 @@ async fn main() -> Result<()> {
         auth: auth.clone(),
         admin: admin.clone(),
         exporter_policy: exporter_policy.clone(),
+        asn_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Alert evaluation loop (reloadable; no-op scan when no rules configured).

@@ -18,6 +18,8 @@ use axum::{
 use bgflow_store::Record;
 use bgflow_types::ip_to_u128;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
@@ -31,6 +33,8 @@ pub struct AppState {
     pub auth: Arc<AuthState>,
     pub admin: Arc<AdminShared>,
     pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
+    /// AS registry lookups (BGPView), asn → (fetched_at, payload).
+    pub asn_cache: Mutex<HashMap<u32, (Instant, serde_json::Value)>>,
 }
 
 type Q = HashMap<String, String>;
@@ -1455,6 +1459,9 @@ fn openapi_spec() -> serde_json::Value {
                 {"name": "from", "in": "query"}, {"name": "to", "in": "query"},
                 {"name": "limit", "in": "query", "description": "max bubbles (default 300)"},
             ]}},
+            "/api/v1/asn": {"get": {"summary": "AS registry lookup (BGPView): name/description/country/prefixes", "parameters": [
+                {"name": "asn", "in": "query", "description": "AS number"},
+            ]}},
             "/api/v1/lookup": {"get": {"summary": "Manual enrichment lookup", "parameters": [
                 {"name": "ip", "in": "query"},
             ]}},
@@ -1487,6 +1494,110 @@ async fn lookup(
         }
     }
     Ok(Json(v))
+}
+
+/// GET /api/v1/asn?asn=61138 — AS registry info via IRR whois
+/// (irrd3.net, with RIPEstat fallback). Cached ~6h; private/reserved
+/// ASNs answer locally. Returns 502 when upstreams are unreachable so
+/// the UI can fall back to the bare AS number.
+async fn asn_lookup(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<Q>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s = q.get("asn").ok_or_else(|| err("missing asn"))?;
+    let asn: u32 = s
+        .trim()
+        .trim_start_matches("AS")
+        .trim_start_matches("as")
+        .parse()
+        .map_err(|_| err("bad asn"))?;
+    // Private/reserved ASN ranges have no registry entry.
+    if asn == 0 || (64512..=65534).contains(&asn) || asn >= 4200000000 {
+        return Ok(Json(serde_json::json!({"asn": asn, "private": true})));
+    }
+    {
+        let c = st.asn_cache.lock().unwrap();
+        if let Some((t, v)) = c.get(&asn) {
+            if t.elapsed() < Duration::from_secs(6 * 3600) {
+                return Ok(Json(v.clone()));
+            }
+        }
+    }
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .user_agent("bgflowd/0.1")
+            .build()
+            .expect("reqwest client")
+    });
+    // Primary: IRR aut-num object from irrd3.net (plain-text whois).
+    let mut out: Option<serde_json::Value> = None;
+    if let Ok(resp) = client
+        .get(format!("https://irrd3.net/api/whois?q=AS{}", asn))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                let mut as_name = String::new();
+                let mut descr = String::new();
+                for line in text.lines() {
+                    let l = line.trim();
+                    if let Some(v) = l.strip_prefix("as-name:") {
+                        as_name = v.trim().to_string();
+                    } else if descr.is_empty() {
+                        if let Some(v) = l.strip_prefix("descr:") {
+                            let v = v.trim();
+                            if !v.is_empty() {
+                                descr = v.to_string();
+                            }
+                        }
+                    }
+                }
+                if !as_name.is_empty() || !descr.is_empty() {
+                    out = Some(serde_json::json!({
+                        "asn": asn,
+                        "name": as_name,
+                        "description": descr,
+                        "source": "irrd3",
+                    }));
+                }
+            }
+        }
+    }
+    // Fallback: RIPEstat as-overview holder string.
+    if out.is_none() {
+        if let Ok(resp) = client
+            .get(format!(
+                "https://stat.ripe.net/data/as-overview/data.json?resource=AS{}",
+                asn
+            ))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let holder = body["data"]["holder"].as_str().unwrap_or("");
+                    if !holder.is_empty() {
+                        out = Some(serde_json::json!({
+                            "asn": asn,
+                            "name": holder,
+                            "description": "",
+                            "source": "ripestat",
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    let out = out.ok_or_else(|| err("asn lookup failed (upstream unreachable)"))?;
+    let mut c = st.asn_cache.lock().unwrap();
+    if c.len() > 5000 {
+        c.clear();
+    }
+    c.insert(asn, (Instant::now(), out.clone()));
+    Ok(Json(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +1898,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/interfaces", get(interfaces))
         .route("/api/v1/labels", get(labels))
         .route("/api/v1/enrichers", get(enrichers))
+        .route("/api/v1/asn", get(asn_lookup))
         .route("/api/v1/lookup", get(lookup))
         .route("/api/v1/config", get(config_view))
         .route("/api/v1/openapi.json", get(openapi))
