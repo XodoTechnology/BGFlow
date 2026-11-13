@@ -242,6 +242,7 @@ fn parse_flow_sample(
                     b.src_port = pkt.src_port;
                     b.dst_port = pkt.dst_port;
                     b.tcp_flags = pkt.tcp_flags;
+                    b.vlan = pkt.vlan;
                     b.bytes = pkt.ip_len.max(frame_len as u32) as u64;
                     b.packets = 1;
                     b.sampler_interval = sampling_rate;
@@ -294,10 +295,12 @@ fn parse_flow_sample(
             FLOW_EXT_SWITCH => {
                 // src_vlan, src_priority, dst_vlan, dst_priority
                 if let Some(b) = current.as_mut() {
-                    if let Ok(v) = rc.u32() {
-                        if b.vlan == 0 {
-                            b.vlan = v as u16;
-                        }
+                    let sv = rc.u32().unwrap_or(0) as u16;
+                    let _sp = rc.u32();
+                    let dv = rc.u32().unwrap_or(0) as u16;
+                    let _dp = rc.u32();
+                    if b.vlan == 0 {
+                        b.vlan = if dv != 0 { dv } else { sv };
                     }
                 }
             }
@@ -334,7 +337,17 @@ fn parse_flow_sample(
                     // length-delimited so we simply stop reading)
                 }
             }
-            _ => {} // ETH and other record types carry no usable L3 info
+            FLOW_ETH => {
+                // sampled_ethernet: opaque L2 header — may carry 802.1Q tags.
+                if let Ok(h) = read_xdr_opaque(&mut rc) {
+                    if let Some(b) = current.as_mut() {
+                        if b.vlan == 0 {
+                            b.vlan = vlan_from_eth(&h);
+                        }
+                    }
+                }
+            }
+            _ => {} // other record types carry no usable L3 info
         }
     }
 
@@ -379,6 +392,32 @@ struct ParsedPacket {
     dst_port: u16,
     tcp_flags: u8,
     ip_len: u32,
+    vlan: u16,
+}
+
+/// First non-zero 802.1Q/1ad/9100 VID in an ethernet header (0 = untagged).
+fn vlan_from_eth(h: &[u8]) -> u16 {
+    if h.len() < 14 {
+        return 0;
+    }
+    let mut et = be16(h, 12);
+    let mut off = 14usize;
+    let mut vlan = 0u16;
+    loop {
+        match et {
+            0x8100 | 0x88a8 | 0x9100 => {
+                if h.len() < off + 4 {
+                    return vlan;
+                }
+                if vlan == 0 {
+                    vlan = (be16(h, off) & 0x0fff) as u16;
+                }
+                et = be16(h, off + 2);
+                off += 4;
+            }
+            _ => return vlan,
+        }
+    }
 }
 
 /// Parse a sampled packet header (L2 or raw IP) into flow tuple fields.
@@ -394,6 +433,7 @@ fn parse_l2_packet(data: &[u8], hdr_proto: u32) -> Option<ParsedPacket> {
             if data.len() < 14 {
                 return None;
             }
+            let vlan = vlan_from_eth(data);
             off = 12;
             let mut ethertype = be16(data, off);
             off += 2;
@@ -436,8 +476,14 @@ fn parse_l2_packet(data: &[u8], hdr_proto: u32) -> Option<ParsedPacket> {
                         // version nibble decides v4/v6
                         let v = data[off] >> 4;
                         return match v {
-                            4 => parse_ipv4(&data[off..]),
-                            6 => parse_ipv6(&data[off..]),
+                            4 => parse_ipv4(&data[off..]).map(|mut p| {
+                                p.vlan = vlan;
+                                p
+                            }),
+                            6 => parse_ipv6(&data[off..]).map(|mut p| {
+                                p.vlan = vlan;
+                                p
+                            }),
                             _ => None,
                         };
                     }
@@ -445,8 +491,18 @@ fn parse_l2_packet(data: &[u8], hdr_proto: u32) -> Option<ParsedPacket> {
                 }
             }
             match ethertype {
-                0x0800 => return parse_ipv4(&data[off..]),
-                0x86DD => return parse_ipv6(&data[off..]),
+                0x0800 => {
+                    return parse_ipv4(&data[off..]).map(|mut p| {
+                        p.vlan = vlan;
+                        p
+                    })
+                }
+                0x86DD => {
+                    return parse_ipv6(&data[off..]).map(|mut p| {
+                        p.vlan = vlan;
+                        p
+                    })
+                }
                 _ => return None,
             }
         }
@@ -493,6 +549,7 @@ fn parse_ipv4(p: &[u8]) -> Option<ParsedPacket> {
         dst_port: 0,
         tcp_flags: 0,
         ip_len: total_len.max(ihl as u32),
+        vlan: 0,
     };
 
     // Only first fragments carry ports.
@@ -573,6 +630,7 @@ fn parse_ipv6(p: &[u8]) -> Option<ParsedPacket> {
                         dst_port: 0,
                         tcp_flags: 0,
                         ip_len: 40 + payload_len,
+                        vlan: 0,
                     });
                 }
             }
@@ -595,6 +653,7 @@ fn parse_ipv6(p: &[u8]) -> Option<ParsedPacket> {
         dst_port: 0,
         tcp_flags: 0,
         ip_len: 40 + payload_len,
+        vlan: 0,
     };
     if p.len() >= off + 4 {
         let l4 = &p[off..];

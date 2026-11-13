@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use bgflow_store::Record;
-use bgflow_types::ip_to_u128;
+use bgflow_types::{country_str, ip_to_u128};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -400,6 +400,12 @@ async fn geo(
         lat_sum: f64,
         lon_sum: f64,
         city: u32,
+        // country code + byte weight per endpoint side, so a bubble can be
+        // tied back to a src_country/dst_country filter.
+        dst_cc: u16,
+        dst_w: u64,
+        src_cc: u16,
+        src_w: u64,
     }
     let mut cells: std::collections::HashMap<(i32, i32), Cell> = std::collections::HashMap::new();
     let infos = st.ctx.flow_index.read().unwrap().clone();
@@ -418,11 +424,12 @@ async fn geo(
                 // Weight each endpoint's geo by its share — simpler: count
                 // dst geo for outbound-ish and src for the rest? Use dst
                 // when present else src (matches "where traffic goes").
-                let (lat, lon, city) = if f.dst_lat != 0 || f.dst_lon != 0 || f.dst_city != 0 {
-                    (f.dst_lat, f.dst_lon, f.dst_city)
-                } else {
-                    (f.src_lat, f.src_lon, f.src_city)
-                };
+                let (lat, lon, city, cc, is_dst) =
+                    if f.dst_lat != 0 || f.dst_lon != 0 || f.dst_city != 0 {
+                        (f.dst_lat, f.dst_lon, f.dst_city, f.dst_country, true)
+                    } else {
+                        (f.src_lat, f.src_lon, f.src_city, f.src_country, false)
+                    };
                 if lat == 0 && lon == 0 {
                     continue;
                 }
@@ -437,6 +444,17 @@ async fn geo(
                 if c.city == 0 {
                     c.city = city;
                 }
+                if is_dst {
+                    if c.dst_cc == 0 {
+                        c.dst_cc = cc;
+                    }
+                    c.dst_w += f.bytes;
+                } else {
+                    if c.src_cc == 0 {
+                        c.src_cc = cc;
+                    }
+                    c.src_w += f.bytes;
+                }
             }
             std::ops::ControlFlow::Continue(())
         },
@@ -446,6 +464,18 @@ async fn geo(
     let mut pts: Vec<_> = cells
         .into_iter()
         .map(|((_, _), c)| {
+            // Dominant side wins; fall back to whichever has a country code.
+            let (cc, side) = if c.dst_w >= c.src_w {
+                if c.dst_cc != 0 {
+                    (c.dst_cc, "dst")
+                } else {
+                    (c.src_cc, "src")
+                }
+            } else if c.src_cc != 0 {
+                (c.src_cc, "src")
+            } else {
+                (c.dst_cc, "dst")
+            };
             serde_json::json!({
                 "lat": c.lat_sum / c.flows as f64,
                 "lon": c.lon_sum / c.flows as f64,
@@ -453,6 +483,8 @@ async fn geo(
                 "packets": c.packets,
                 "flows": c.flows,
                 "city": st.ctx.cities.name(c.city),
+                "country": country_str(cc),
+                "side": side,
             })
         })
         .collect();

@@ -59,6 +59,7 @@ th.num{text-align:right}
 .vbadge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10.5px;font-weight:700;font-family:var(--mono);background:color-mix(in srgb,var(--accent2) 14%,var(--panel2));color:var(--accent2)}
 .vbadge.v6{background:color-mix(in srgb,#e879f9 16%,var(--panel2));color:var(--pink)}
 .flg{font-family:'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif;font-size:15px;letter-spacing:0}
+.asn{display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 .clickable{color:var(--accent2);cursor:pointer}
 .clickable:hover{text-decoration:underline}
 canvas{width:100%;height:260px;display:block}
@@ -278,8 +279,15 @@ function flag(cc){if(!/^[A-Za-z]{2}$/.test(cc||''))return'';return String.fromCo
 const PCOL={TCP:'#3b82f6',UDP:'#22c55e',ICMP:'#f59e0b','ICMPv6':'#f59e0b',GRE:'#a855f7',ESP:'#ef4444'};
 function protoBadge(n){return `<span class="pbadge" style="--pc:${PCOL[n]||'#64748b'}">${esc(n)}</span>`}
 // dim-aware key rendering: flags, proto badges, ipver/asn styling
-// org name or country code → flag when it's a 2-letter country code
-function ocCell(v){v=v||'';return /^[A-Z]{2}$/.test(v)?countryHtml(v):esc(v)}
+// Flows table: org AND country together — "Zappie Host LLC 🇳🇿" / "🇳🇿 New Zealand"
+function ocPair(org,cc){
+  cc=String(cc||'').toUpperCase();
+  const cOk=/^[A-Z]{2}$/.test(cc);
+  if(org&&cOk)return `${esc(org)} <span class="muted" title="${esc(countryName(cc)||cc)}">${flag(cc)}</span>`;
+  if(org)return esc(org);
+  if(cOk)return countryHtml(cc);
+  return '<span class="muted">-</span>';
+}
 function dimLabel(dim,key){
   const k=typeof key==='object'?JSON.stringify(key):String(key??'');
   if(dim.includes('country'))return countryHtml(k);
@@ -353,8 +361,17 @@ async function enhanceAsns(){
   }));
   for(const e of els){e.dataset.done='1';const d=_asnCache[e.dataset.asn];
     const label=d&&(d.description||d.name);
+    // data-asn-compact: keep "AS<n>" text, registry name goes to the tooltip
+    // only (dense tables where the name would duplicate the Org column).
+    if(e.hasAttribute('data-asn-compact')){
+      if(label){const full=`AS${e.dataset.asn} ${label}`;
+        const extra=[d.name&&d.name!==label?d.name:'',d.source].filter(Boolean).join(' · ');
+        e.title=extra?`${full} — ${extra}`:full}
+      continue}
     if(label){e.innerHTML=`<span class="muted">AS${esc(e.dataset.asn)}</span> ${esc(label)}`;
-      e.title=[d.name!==label?d.name:'',d.source].filter(Boolean).join(' · ')||''}}
+      const full=`AS${e.dataset.asn} ${label}`;
+      const extra=[d.name&&d.name!==label?d.name:'',d.source].filter(Boolean).join(' · ');
+      e.title=extra?`${full} — ${extra}`:full}}
 }
 
 // click-to-filter: set an active filter and reload
@@ -428,8 +445,11 @@ function topTbl(items, dim){
       // IP-keyed rows show the endpoint's ASN in the rank column (rank is
       // implicit in ordering anyway); resolved lazily by enhanceTopIps().
       const rank=looksIp(k)?`<span class="muted" data-topip="${esc(k)}">·</span>`:`<span class="muted">${i+1}</span>`;
+      // Front page stays compact: ASN dims show the number only, no registry
+      // name (names live on the dedicated Top/Flows views).
+      const lbl=dim.includes('asn')?`<span class="asn"><span class="muted">AS</span>${esc(k)}</span>`:dimLabel(dim,t.key);
       return `<tr><td class="num">${rank}</td>
-      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${dimLabel(dim,t.key)}</td>
+      <td class="clickable" data-k="${esc(t.key)}" onclick="setFilter('${fk}',this.dataset.k)">${lbl}</td>
       <td class="num">${fmtB(t.bytes)}</td><td class="num">${fmtN(t.flows)}</td></tr>`}).join('')
     ||'<tr><td colspan=4 class=muted>No data</td></tr>'}</table>`;
 }
@@ -448,8 +468,7 @@ async function enhanceTopIps(){
     _topAsn[ip]=asn||0;
   }));
   for(const e of cells){e.dataset.done='1';const a=_topAsn[e.dataset.topip];
-    e.innerHTML=a?`<span class="asn" data-asn="${a}"><span class="muted">AS</span>${a}</span>`:'<span class="muted">-</span>'}
-  enhanceAsns();
+    e.innerHTML=a?`<span class="asn"><span class="muted">AS</span>${a}</span>`:'<span class="muted">-</span>'}
 }
 
 async function vOverview(){
@@ -472,7 +491,7 @@ async function vOverview(){
   // live rate from the most recent bucket
   const last=ts.series&&ts.series[ts.series.length-1];
   if(last&&ts.bucket_ms){const secs=ts.bucket_ms/1000;state.rate={bps:last.bytes/secs,pps:last.packets/secs}}
-  content.innerHTML=filterBar()+activeChips()+cards+
+  content.innerHTML=filterBar()+cards+
    `<div class="panel"><h3>Traffic — ${esc(state.bucket)}
      <span style="float:right">
        ${['bytes','packets','flows'].map(m=>`<span class="chip ${state.metric===m?'on':''}" data-m="${m}" style="font-size:11px;padding:2px 9px">${m}</span>`).join('')}
@@ -582,7 +601,7 @@ function filterBar(extra=''){
     <input id="f_vlan" placeholder="vlan" value="${esc(F.vlan||'')}" style="width:70px">
     <button class="btn" onclick="applyFilters()">Apply</button>
     <button class="btn ghost" onclick="clearFilters()">Clear</button>${extra}
-  </div>`;
+  </div>${activeChips()}`;
 }
 function readFilters(){F.src=$('#f_src')?.value||'';F.dst=$('#f_dst')?.value||'';F.proto=$('#f_proto')?.value||'';F.sport=$('#f_sport')?.value||'';F.dport=$('#f_dport')?.value||'';F.exporter=$('#f_exporter')?.value||'';const asn=$('#f_asn')?.value||'';F.src_asn=asn;F.dst_asn='';F.src_ipver=$('#f_sipv')?.value||'';F.dst_ipver=$('#f_dipv')?.value||'';F.label=$('#f_label')?.value||'';F.src_city=$('#f_scity')?.value||'';F.dst_city=$('#f_dcity')?.value||'';F.vlan=$('#f_vlan')?.value||'';for(const k in F)if(!F[k])delete F[k]}
 function applyFilters(){readFilters();load()}
@@ -615,8 +634,8 @@ async function vFlows(){
     <td><span class="clickable" data-ip="${esc(f.dst_ip)}" onclick="setFilter('dst','${esc(f.dst_ip)}')">${esc(f.dst_ip)}</span><span class="muted" title="${esc(portName(f.dst_port))}">:${f.dst_port}</span></td>
     <td>${protoBadge(f.protocol_name||protoName(f.protocol))}</td>
     <td class="num">${fmtB(f.bytes)}</td><td class="num">${fmtN(f.packets)}</td>
-    <td class="muted">${f.src_asn?`<span class="asn" data-asn="${f.src_asn}"><span class="muted">AS</span>${f.src_asn}</span>`:'-'} → ${f.dst_asn?`<span class="asn" data-asn="${f.dst_asn}"><span class="muted">AS</span>${f.dst_asn}</span>`:'-'}</td>
-    <td>${ocCell(f.src_org||f.src_country)} → ${ocCell(f.dst_org||f.dst_country)}</td>
+    <td class="muted">${f.src_asn?`<span class="asn" data-asn="${f.src_asn}" data-asn-compact><span class="muted">AS</span>${f.src_asn}</span>`:'-'} → ${f.dst_asn?`<span class="asn" data-asn="${f.dst_asn}" data-asn-compact><span class="muted">AS</span>${f.dst_asn}</span>`:'-'}</td>
+    <td>${ocPair(f.src_org,f.src_country)} → ${ocPair(f.dst_org,f.dst_country)}</td>
     <td>${f.label?`<span class="tag clickable" onclick="setFilter('label','${esc(f.label)}')">${esc(f.label)}</span>`:'<span class="muted">-</span>'}</td>
     <td class="muted clickable" onclick="setFilter('exporter','${esc(f.exporter)}')" title="${esc(f.exporter)}">${esc(expLabel(f.exporter))}</td>
     <td>${vlanLabel(f.vlan)}</td>
@@ -824,17 +843,40 @@ async function vGeo(){
       ctx2.strokeStyle='rgba(79,140,255,.8)';ctx2.stroke();
     }
   };
+  // "Auckland, New Zealand" — city plus full country name (code fallback).
+  const geoName=p=>{
+    const c=countryName(p.country)||(p.country||'');
+    if(p.city&&c)return `${p.city}, ${c}`;
+    return p.city||c||'unknown';
+  };
+  // hit-test bubbles at canvas coords (shared by hover + click)
+  const geoHit=(mx,my)=>{
+    let best=null,bd=18;
+    for(const p of cv._pts||[]){const dd=Math.hypot(p.x-mx,p.y-my);if(dd<bd+p.r&&dd<bd+14){best=p;bd=dd}}
+    return best;
+  };
+  // click a bubble → filter flows to the traffic touching that country
+  window.geoPick=(side,cc)=>{
+    if(!cc){toast('no country data for this area');return}
+    F[side==='src'?'src_country':'dst_country']=cc;
+    const nav=document.querySelector('#nav a[data-v="flows"]');
+    document.querySelectorAll('#nav a').forEach(x=>x.classList.toggle('on',x===nav));
+    state.view='flows';$('#viewtitle').textContent=nav?nav.textContent.trim():'Flows';load();
+  };
   draw();window.addEventListener('resize',draw);
   cv.onmousemove=e=>{
     const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
-    let best=null,bd=18;
-    for(const p of cv._pts||[]){const dd=Math.hypot(p.x-mx,p.y-my);if(dd<bd+p.r&&dd<bd+14){best=p;bd=dd}}
+    const best=geoHit(mx,my);
     const el=$('#geohint');
-    if(best&&el)el.innerHTML=`<b>${esc(best.city||'unknown')}</b> ${best.lat.toFixed(2)},${best.lon.toFixed(2)} — ${fmtB(best.bytes)} · ${fmtN(best.flows)} flows`;
-    else if(el)el.textContent='hover a bubble';
+    if(best&&el)el.innerHTML=`<b>${esc(geoName(best))}</b> ${best.lat.toFixed(2)},${best.lon.toFixed(2)} — ${fmtB(best.bytes)} · ${fmtN(best.flows)} flows · <span class="muted">click to filter</span>`;
+    else if(el)el.textContent='hover a bubble · click to filter by country';
   };
-  const rows=pts.slice(0,15).map(p=>`<tr><td>${p.city?esc(p.city):'<span class="muted">-</span>'}</td><td class="num">${p.lat.toFixed(2)}, ${p.lon.toFixed(2)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.flows)}</td></tr>`).join('');
-  $('#getbl').innerHTML=`<table><tr><th>City</th><th>Coords</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=4 class=muted>No geo data in range (need city MMDB + recent flows)</td></tr>'}</table>`;
+  cv.onclick=e=>{
+    const r=cv.getBoundingClientRect(),best=geoHit(e.clientX-r.left,e.clientY-r.top);
+    if(best)geoPick(best.side,best.country);
+  };
+  const rows=pts.slice(0,15).map(p=>`<tr class="clickable" title="filter ${p.side==='src'?'source':'destination'} country" onclick="geoPick('${p.side||'dst'}','${esc(p.country||'')}')"><td>${esc(geoName(p))}</td><td class="num">${p.lat.toFixed(2)}, ${p.lon.toFixed(2)}</td><td class="num">${fmtB(p.bytes)}</td><td class="num">${fmtN(p.flows)}</td></tr>`).join('');
+  $('#getbl').innerHTML=`<table><tr><th>Location</th><th>Coords</th><th class="num">Bytes</th><th class="num">Flows</th></tr>${rows||'<tr><td colspan=4 class=muted>No geo data in range (need city MMDB + recent flows)</td></tr>'}</table>`;
 }
 
 // ---------- flow detail drawer ----------
@@ -851,7 +893,7 @@ function flowDetail(i){
    ${kv('Region',`${f.src_region||'-'} → ${f.dst_region||'-'}`)}
    ${kv('Proto',`${f.protocol_name||f.protocol} flags=0x${(f.tcp_flags||0).toString(16)}`)}
    ${kv('ASN',`AS${f.src_asn||'-'} → AS${f.dst_asn||'-'}`)}
-   ${kv('Org',`${f.src_org||f.src_country||'-'} → ${f.dst_org||f.dst_country||'-'}`)}
+   ${kv('Org',`${ocPair(f.src_org,f.src_country)} → ${ocPair(f.dst_org,f.dst_country)}`)}
    ${kv('Bytes/Pkts',`${fmtB(f.bytes)} / ${fmtN(f.packets)}`)}
    ${kv('Duration',f.duration_ms?f.duration_ms+' ms':'-')}
    ${kv('Ifaces',`${ifLabel(f.ingress_if)} → ${ifLabel(f.egress_if)}`)}
