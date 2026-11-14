@@ -120,11 +120,30 @@ country_db = "/usr/share/GeoIP/GeoLite2-Country.mmdb"
 # update_secs = 604800
 # update_dir = "/usr/share/GeoIP"
 
-# Optional: friendly interface names shown in the UI flows view.
+# Optional: per-exporter naming — the recommended scheme. Each line is
+#   "<exporter-ip>|<name>|<ifindex>-<ifname>|<vlanid>-<vlanname>"
+# where the name and pair fields may be left empty to skip them.
+# ifIndex and VLAN ids are only meaningful on the exporting device, so
+# the same id can map to different names on different exporters — there
+# is never a global guess:
+#   10.0.0.1|core-rtr-01|2-ae0|250-cogent
+#   10.0.0.1||3-ae1|251-mercury
+#   10.0.0.2|core-rtr-02|2-eth0|250-ixp1
+# naming = [
+#   "10.0.0.1|core-rtr-01|2-ae0|250-cogent",
+#   "10.0.0.1||3-ae1|251-mercury",
+#   "10.0.0.2|core-rtr-02|2-eth0|250-ixp1",
+# ]
+# Resolution order for display names: UI-set labels (Exporters view)
+# > naming lines > SNMP-learned > the legacy global maps below.
+naming = []
+
+# Legacy global fallbacks — applied to EVERY exporter only when no
+# exporter-scoped name exists. Avoid these when devices disagree on
+# ifIndex/VLAN numbering; prefer `naming` above.
 # [interface_names]
 # "2" = "ae0"
 
-# Optional: VLAN names shown across the UI (flows, top-by-vlan, filters).
 # [vlan_names]
 # "10" = "Devoli"
 # "250" = "Cogent"

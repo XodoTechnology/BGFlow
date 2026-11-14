@@ -7,6 +7,7 @@ pub(super) async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_jso
     let names = st.ctx.exporter_names.read().unwrap();
     let policy = st.exporter_policy.entries();
     let snmp_map = st.snmp.read().unwrap();
+    let naming = st.ctx.naming.read().unwrap();
     let require = st.exporter_policy.require_approval();
     // Union of observed senders (metrics) and policy-known IPs — pending
     // exporters appear here even though their traffic is dropped.
@@ -28,9 +29,29 @@ pub(super) async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_jso
                 None if require => "pending",
                 None => "active",
             };
+            // Effective per-exporter names: `naming` config lines as
+            // the base, UI-set policy labels overriding per-key (they
+            // are the runtime source of truth). SNMP-learned names are
+            // emitted separately under "snmp".
+            let mut vlans: std::collections::BTreeMap<u16, String> = naming
+                .vlans_for(u)
+                .map(|h| h.iter().map(|(k, v)| (*k, v.clone())).collect())
+                .unwrap_or_default();
+            let mut ifs: std::collections::BTreeMap<u32, String> = naming
+                .ifs_for(u)
+                .map(|h| h.iter().map(|(k, v)| (*k, v.clone())).collect())
+                .unwrap_or_default();
+            if let Some(pe) = p {
+                vlans.extend(pe.vlans.iter().map(|(k, v)| (*k, v.clone())));
+                ifs.extend(pe.interfaces.iter().map(|(k, v)| (*k, v.clone())));
+            }
+            let name = p
+                .and_then(|x| x.name.clone())
+                .or_else(|| naming.exporter_name(u).map(str::to_string))
+                .or_else(|| names.name_of(u).map(str::to_string));
             serde_json::json!({
                 "ip": ip.to_string(),
-                "name": names.name_of(u),
+                "name": name,
                 "datagrams": e.map(|x| x.datagrams).unwrap_or(0),
                 "records": e.map(|x| x.records).unwrap_or(0),
                 "bytes_in": e.map(|x| x.bytes_in).unwrap_or(0),
@@ -41,8 +62,8 @@ pub(super) async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_jso
                 "first_seen_ms": p.map(|x| x.first_seen_ms).unwrap_or(0),
                 "approved_at_ms": p.map(|x| x.approved_at_ms).unwrap_or(0),
                 "note": p.and_then(|x| x.note.clone()),
-                "vlans": p.map(|x| x.vlans.clone()).unwrap_or_default(),
-                "interfaces": p.map(|x| x.interfaces.clone()).unwrap_or_default(),
+                "vlans": vlans,
+                "interfaces": ifs,
                 // SNMP overrides — community itself is never echoed,
                 // only whether a per-exporter one is set.
                 "snmp_community_set": p.map(|x| x.snmp_community.is_some()).unwrap_or(false),
@@ -290,15 +311,101 @@ pub(super) fn merge_unanimous<V: Ord + Clone>(
     map
 }
 
+#[derive(Clone, Copy)]
+enum NamingKind {
+    Ifaces,
+    Vlans,
+}
+
+/// Effective per-exporter interface/VLAN names:
+/// `{"<exporter-ip>": {"<id>": "<name>", ...}, ...}` built from the
+/// exporter-scoped sources only (UI labels > `naming` config > SNMP).
+/// The legacy global maps are deliberately excluded — an ifIndex or
+/// VLAN id is meaningless outside its exporting device.
+fn per_exporter_names(st: &Arc<AppState>, kind: NamingKind) -> serde_json::Value {
+    // Collect id sets per exporter first so no naming/snmp/policy lock
+    // is held while the resolvers take their own read locks.
+    let mut per_ids: std::collections::BTreeMap<u128, std::collections::BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
+    {
+        let policy_entries = st.exporter_policy.entries();
+        let naming = st.ctx.naming.read().unwrap();
+        let snmp = st.snmp.read().unwrap();
+        let us: std::collections::BTreeSet<u128> = policy_entries
+            .keys()
+            .map(|ip| ip_to_u128(ip))
+            .chain(snmp.keys().map(|ip| ip_to_u128(ip)))
+            .chain(naming.ips())
+            .collect();
+        for u in us {
+            let addr = u128_to_ip(u);
+            let mut ids = std::collections::BTreeSet::new();
+            match kind {
+                NamingKind::Ifaces => {
+                    if let Some(pe) = policy_entries.get(&addr) {
+                        ids.extend(pe.interfaces.keys().copied());
+                    }
+                    if let Some(h) = naming.ifs_for(u) {
+                        ids.extend(h.keys().copied());
+                    }
+                    if let Some(e) = snmp.get(&addr) {
+                        ids.extend(e.interfaces.keys().copied());
+                    }
+                }
+                NamingKind::Vlans => {
+                    if let Some(pe) = policy_entries.get(&addr) {
+                        ids.extend(pe.vlans.keys().map(|v| *v as u32));
+                    }
+                    if let Some(h) = naming.vlans_for(u) {
+                        ids.extend(h.keys().map(|v| *v as u32));
+                    }
+                    if let Some(e) = snmp.get(&addr) {
+                        ids.extend(e.vlans.keys().map(|v| *v as u32));
+                    }
+                }
+            }
+            if !ids.is_empty() {
+                per_ids.insert(u, ids);
+            }
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (u, ids) in per_ids {
+        let m: serde_json::Map<String, serde_json::Value> = ids
+            .into_iter()
+            .filter_map(|i| {
+                let name = match kind {
+                    NamingKind::Ifaces => st.ctx.ifname_scoped(u, i),
+                    NamingKind::Vlans => st.ctx.vlan_name_scoped(u, i as u16),
+                };
+                name.map(|n| (i.to_string(), serde_json::Value::String(n)))
+            })
+            .collect();
+        if !m.is_empty() {
+            out.insert(ip_string(u), serde_json::Value::Object(m));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
 pub(super) async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let g = st.ctx.interface_names.read().unwrap();
     let global: std::collections::BTreeMap<u32, String> =
         g.all().iter().map(|(k, v)| (*k, v.clone())).collect();
     let labels = st.exporter_policy.interface_labels();
-    // UI-set labels + SNMP-learned names vote; only unanimous names
-    // surface in the global map (device-local names differ per box).
+    // UI-set labels + SNMP-learned + naming-config names vote; only
+    // unanimous names surface in the global map (device-local names
+    // differ per box — conflicts stay hidden, never guessed).
     let mut owned: Vec<std::collections::BTreeMap<u32, String>> =
         labels.values().cloned().collect();
+    {
+        let naming = st.ctx.naming.read().unwrap();
+        for u in naming.ips() {
+            if let Some(h) = naming.ifs_for(u) {
+                owned.push(h.iter().map(|(k, v)| (*k, v.clone())).collect());
+            }
+        }
+    }
     {
         let snmp = st.snmp.read().unwrap();
         for e in snmp.values() {
@@ -317,8 +424,14 @@ pub(super) async fn interfaces(State(st): State<Arc<AppState>>) -> Json<serde_js
     let merged = merge_unanimous(&global, per);
     let mut items: Vec<_> = merged.iter().collect();
     items.sort_by_key(|(k, _)| **k);
+    // Per-exporter effective names — ifIndex is device-local, so the
+    // unambiguous view is keyed by exporter IP. Scoped sources only
+    // (UI labels > naming config > SNMP); the global map is never
+    // borrowed for a specific exporter.
+    let exporters = per_exporter_names(&st, NamingKind::Ifaces);
     Json(serde_json::json!({
-        "items": items.iter().map(|(k, v)| serde_json::json!({"ifindex": k, "name": v})).collect::<Vec<_>>()
+        "items": items.iter().map(|(k, v)| serde_json::json!({"ifindex": k, "name": v})).collect::<Vec<_>>(),
+        "exporters": exporters,
     }))
 }
 
@@ -329,6 +442,14 @@ pub(super) async fn vlans(State(st): State<Arc<AppState>>) -> Json<serde_json::V
     let labels = st.exporter_policy.vlan_labels();
     let mut owned: Vec<std::collections::BTreeMap<u16, String>> =
         labels.values().cloned().collect();
+    {
+        let naming = st.ctx.naming.read().unwrap();
+        for u in naming.ips() {
+            if let Some(h) = naming.vlans_for(u) {
+                owned.push(h.iter().map(|(k, v)| (*k, v.clone())).collect());
+            }
+        }
+    }
     {
         let snmp = st.snmp.read().unwrap();
         for e in snmp.values() {
@@ -341,8 +462,10 @@ pub(super) async fn vlans(State(st): State<Arc<AppState>>) -> Json<serde_json::V
     let merged = merge_unanimous(&global, per);
     let mut items: Vec<_> = merged.iter().collect();
     items.sort_by_key(|(k, _)| **k);
+    let exporters = per_exporter_names(&st, NamingKind::Vlans);
     Json(serde_json::json!({
-        "items": items.iter().map(|(k, v)| serde_json::json!({"vlan": k, "name": v})).collect::<Vec<_>>()
+        "items": items.iter().map(|(k, v)| serde_json::json!({"vlan": k, "name": v})).collect::<Vec<_>>(),
+        "exporters": exporters,
     }))
 }
 

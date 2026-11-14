@@ -199,6 +199,32 @@ impl ExporterPolicy {
         self.inner.lock().unwrap().map.clone()
     }
 
+    /// UI-set display name for one exporter (per-ip lookup — cheaper
+    /// than cloning `entries()` for per-row resolution).
+    pub fn name_of(&self, ip: IpAddr) -> Option<String> {
+        self.inner.lock().unwrap().map.get(&ip).and_then(|e| e.name.clone())
+    }
+
+    /// UI-set interface name for (exporter, ifIndex).
+    pub fn interface_name(&self, ip: IpAddr, ifindex: u32) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .get(&ip)
+            .and_then(|e| e.interfaces.get(&ifindex).cloned())
+    }
+
+    /// UI-set VLAN name for (exporter, VLAN id).
+    pub fn vlan_name(&self, ip: IpAddr, vlan: u16) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .get(&ip)
+            .and_then(|e| e.vlans.get(&vlan).cloned())
+    }
+
     /// Whether the IP matches a configured trusted entry (IP or CIDR).
     pub fn is_trusted(&self, ip: IpAddr) -> bool {
         let g = self.inner.lock().unwrap();

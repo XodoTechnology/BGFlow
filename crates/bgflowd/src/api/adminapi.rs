@@ -66,7 +66,7 @@ pub(super) fn openapi_spec() -> serde_json::Value {
             "/api/v1/exporters/{ip}/interfaces": {"post": {"summary": "Replace exporter interface name map (admin): {\"interfaces\":{\"1\":\"xe-0/0/0\"}}"}},
             "/api/v1/exporters/{ip}/snmp": {"post": {"summary": "Replace exporter SNMP overrides (admin): {\"community\":\"…\",\"port\":1161,\"disabled\":false} — empty clears to global"}},
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
-            "/api/v1/vlans": {"get": {"summary": "Configured VLAN names ([vlan_names])"}},
+            "/api/v1/vlans": {"get": {"summary": "VLAN names: global items + per-exporter 'exporters' map (naming config/UI labels/SNMP)"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
             "/api/v1/geo": {"get": {"summary": "Geo bubbles: lat/lon aggregates from the geo rollup (raw-flow fallback for pre-rollup history; needs city MMDB)", "parameters": [
                 {"name": "from", "in": "query"}, {"name": "to", "in": "query"},

@@ -8,7 +8,7 @@ use anyhow::Result;
 use bgflow_store::encode::ColumnData;
 use bgflow_store::schema::rollup_idx;
 use bgflow_store::{for_each_segment_info, Record};
-use bgflow_types::{ip_string, ip_to_u128, is_v4_mapped, country_str, protocol_name, FlowRecord, RollupRecord};
+use bgflow_types::{ip_string, ip_to_u128, u128_to_ip, is_v4_mapped, country_str, protocol_name, FlowRecord, RollupRecord};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
@@ -123,6 +123,98 @@ impl VlanNames {
     }
 }
 
+/// Per-exporter display names parsed from `naming = [...]` config lines:
+/// `"<exporter-ip>|<name>|<ifindex>-<ifname>|<vlanid>-<vlanname>"`.
+/// Interface and VLAN ids are only meaningful on the exporting device,
+/// so names are always keyed by exporter — never applied globally.
+#[derive(Default)]
+pub struct NamingBook {
+    by_exporter: HashMap<u128, ExporterNaming>,
+}
+
+#[derive(Default)]
+pub struct ExporterNaming {
+    pub name: Option<String>,
+    pub ifs: HashMap<u32, String>,
+    pub vlans: HashMap<u16, String>,
+}
+
+/// Parse one `id-name` pair field ("2-ae0", "250-cogent"); the name may
+/// itself contain '-' — split on the first one only.
+fn parse_named<T>(field: &str, parse_id: impl Fn(&str) -> Option<T>) -> Option<(T, String)> {
+    let (id_s, name) = field.split_once('-')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    parse_id(id_s.trim()).map(|id| (id, name.to_string()))
+}
+
+impl NamingBook {
+    /// Build from raw config lines. Malformed lines are logged and
+    /// skipped — a typo must not keep the daemon from starting.
+    pub fn build(lines: &[String]) -> Self {
+        let mut book = NamingBook::default();
+        for (i, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split('|');
+            let ip_s = it.next().unwrap_or("").trim();
+            let Ok(ip) = ip_s.parse::<std::net::IpAddr>() else {
+                tracing::warn!("naming[{}]: bad exporter address '{}'", i, ip_s);
+                continue;
+            };
+            let key = ip_to_u128(&ip);
+            let e = book.by_exporter.entry(key).or_default();
+            // name (field 2) — first non-empty wins; later lines may
+            // repeat or omit it.
+            if let Some(n) = it.next().map(str::trim).filter(|s| !s.is_empty()) {
+                if e.name.is_none() {
+                    e.name = Some(n.to_string());
+                }
+            }
+            if let Some(pair) = it.next() {
+                if let Some((idx, n)) = parse_named(pair, |s| s.parse::<u32>().ok()) {
+                    e.ifs.insert(idx, n);
+                } else if !pair.trim().is_empty() {
+                    tracing::warn!("naming[{}]: bad interface pair '{}'", i, pair);
+                }
+            }
+            if let Some(pair) = it.next() {
+                if let Some((vid, n)) = parse_named(pair, |s| s.parse::<u16>().ok()) {
+                    e.vlans.insert(vid, n);
+                } else if !pair.trim().is_empty() {
+                    tracing::warn!("naming[{}]: bad vlan pair '{}'", i, pair);
+                }
+            }
+        }
+        book
+    }
+
+    pub fn exporter_name(&self, ip: u128) -> Option<&str> {
+        self.by_exporter.get(&ip).and_then(|e| e.name.as_deref())
+    }
+    pub fn ifname(&self, ip: u128, ifindex: u32) -> Option<&str> {
+        self.by_exporter.get(&ip)?.ifs.get(&ifindex).map(|s| s.as_str())
+    }
+    pub fn vlan_name(&self, ip: u128, vlan: u16) -> Option<&str> {
+        self.by_exporter.get(&ip)?.vlans.get(&vlan).map(|s| s.as_str())
+    }
+    /// (ifindex → name) map for one exporter, for payload merging.
+    pub fn ifs_for(&self, ip: u128) -> Option<&HashMap<u32, String>> {
+        self.by_exporter.get(&ip).map(|e| &e.ifs)
+    }
+    pub fn vlans_for(&self, ip: u128) -> Option<&HashMap<u16, String>> {
+        self.by_exporter.get(&ip).map(|e| &e.vlans)
+    }
+    /// Exporter keys (u128) present in the book.
+    pub fn ips(&self) -> impl Iterator<Item = u128> + '_ {
+        self.by_exporter.keys().copied()
+    }
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub flow_index: SegmentIndex,
@@ -138,6 +230,12 @@ pub struct Ctx {
     pub exporter_names: Arc<RwLock<ExporterNames>>,
     pub interface_names: Arc<RwLock<InterfaceNames>>,
     pub vlan_names: Arc<RwLock<VlanNames>>,
+    /// Per-exporter names from `naming = [...]` config lines.
+    pub naming: Arc<RwLock<NamingBook>>,
+    /// UI-set per-exporter labels + SNMP-learned names, used by the
+    /// name resolvers below (flow_json).
+    pub exporter_policy: Arc<crate::exporter_policy::ExporterPolicy>,
+    pub snmp_names: crate::snmp::SnmpStore,
     /// "Our" ASNs for in/out direction classification ([local_asns]).
     pub local_asns: Arc<RwLock<Vec<u32>>>,
     /// Reverse-DNS cache — non-blocking lookups for flow rows.
@@ -1124,6 +1222,92 @@ where
 
 /// Serialize a FlowRecord to JSON, resolving org ids to names and label ids
 /// to rule names.
+impl Ctx {
+    /// Display name for an exporter. Precedence: UI-set label >
+    /// `naming` config lines > `[exporter_names]` map.
+    pub fn exporter_name(&self, ip: u128) -> Option<String> {
+        let addr = u128_to_ip(ip);
+        if let Some(n) = self.exporter_policy.name_of(addr) {
+            return Some(n);
+        }
+        if let Some(n) = self.naming.read().unwrap().exporter_name(ip) {
+            return Some(n.to_string());
+        }
+        self.exporter_names.read().unwrap().name_of(ip).map(str::to_string)
+    }
+
+    /// Interface display name for (exporter, ifIndex), scoped sources
+    /// only — no global-map fallback. Used for per-exporter listings
+    /// where borrowing another device's name for the same ifIndex
+    /// would be wrong.
+    /// Precedence: UI labels > naming config > SNMP-learned.
+    pub fn ifname_scoped(&self, exporter: u128, ifindex: u32) -> Option<String> {
+        if ifindex == 0 {
+            return None;
+        }
+        let addr = u128_to_ip(exporter);
+        if let Some(n) = self.exporter_policy.interface_name(addr, ifindex) {
+            return Some(n);
+        }
+        if let Some(n) = self.naming.read().unwrap().ifname(exporter, ifindex) {
+            return Some(n.to_string());
+        }
+        if let Some(e) = self.snmp_names.read().unwrap().get(&addr) {
+            if let Some(f) = e.interfaces.get(&ifindex) {
+                if !f.name.is_empty() {
+                    return Some(f.name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Interface display name for (exporter, ifIndex) — `ifname_scoped`
+    /// plus the legacy global `[interface_names]` map as a last-resort
+    /// fallback (only when no exporter-scoped name exists).
+    pub fn ifname(&self, exporter: u128, ifindex: u32) -> Option<String> {
+        self.ifname_scoped(exporter, ifindex).or_else(|| {
+            self.interface_names
+                .read()
+                .unwrap()
+                .name_of(ifindex)
+                .map(str::to_string)
+        })
+    }
+
+    /// VLAN display name for (exporter, VLAN id), scoped sources only.
+    pub fn vlan_name_scoped(&self, exporter: u128, vlan: u16) -> Option<String> {
+        if vlan == 0 {
+            return None;
+        }
+        let addr = u128_to_ip(exporter);
+        if let Some(n) = self.exporter_policy.vlan_name(addr, vlan) {
+            return Some(n);
+        }
+        if let Some(n) = self.naming.read().unwrap().vlan_name(exporter, vlan) {
+            return Some(n.to_string());
+        }
+        self.snmp_names
+            .read()
+            .unwrap()
+            .get(&addr)
+            .and_then(|e| e.vlans.get(&vlan))
+            .cloned()
+    }
+
+    /// VLAN display name for (exporter, VLAN id) — `vlan_name_scoped`
+    /// plus the legacy global `[vlan_names]` fallback.
+    pub fn vlan_name(&self, exporter: u128, vlan: u16) -> Option<String> {
+        self.vlan_name_scoped(exporter, vlan).or_else(|| {
+            self.vlan_names
+                .read()
+                .unwrap()
+                .name_of(vlan)
+                .map(str::to_string)
+        })
+    }
+}
+
 pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
     let label = ctx.rules.name_of(f.label_id);
     let mut out = serde_json::json!({
@@ -1154,6 +1338,10 @@ pub fn flow_json(ctx: &Ctx, f: &FlowRecord) -> serde_json::Value {
         "bytes": f.bytes,
         "packets": f.packets,
         "exporter": ip_string(f.exporter),
+        "exporter_name": ctx.exporter_name(f.exporter),
+        "ingress_if_name": ctx.ifname(f.exporter, f.ingress_if),
+        "egress_if_name": ctx.ifname(f.exporter, f.egress_if),
+        "vlan_name": ctx.vlan_name(f.exporter, f.vlan),
         "engine_id": f.engine_id,
         "engine_type": f.engine_type,
         "sampler_interval": f.sampler_interval,
@@ -1366,6 +1554,98 @@ mod tests {
         assert!(parse_ip_filter("10.0.0.0/abc").is_none());
     }
 
+    fn u(s: &str) -> u128 {
+        ip_to_u128(&s.parse::<IpAddr>().unwrap())
+    }
+
+    #[test]
+    fn naming_book_is_exporter_scoped() {
+        let book = NamingBook::build(&[
+            "10.0.0.1|core-rtr-01|2-ae0|250-cogent".to_string(),
+            "10.0.0.1||3-ae1|251-mercury".to_string(),
+            "10.0.0.2|core-rtr-02|2-eth0|250-ixp1".to_string(),
+            "not-a-line".to_string(),
+            "10.0.0.3|bad|notanum-x".to_string(),
+        ]);
+        let (e1, e2, e3) = (u("10.0.0.1"), u("10.0.0.2"), u("10.0.0.3"));
+        // The collision case: same ifIndex/VLAN id, different names
+        // per exporter — each resolves to its own device's name.
+        assert_eq!(book.ifname(e1, 2).unwrap(), "ae0");
+        assert_eq!(book.ifname(e2, 2).unwrap(), "eth0");
+        assert_eq!(book.vlan_name(e1, 250).unwrap(), "cogent");
+        assert_eq!(book.vlan_name(e2, 250).unwrap(), "ixp1");
+        // Second line for e1 adds pairs without repeating the name.
+        assert_eq!(book.exporter_name(e1).unwrap(), "core-rtr-01");
+        assert_eq!(book.ifname(e1, 3).unwrap(), "ae1");
+        assert_eq!(book.vlan_name(e1, 251).unwrap(), "mercury");
+        // Unknown ids/exporters resolve to nothing — never guessed.
+        assert_eq!(book.ifname(e1, 99), None);
+        assert_eq!(book.vlan_name(e2, 251), None);
+        assert_eq!(book.ifname(u("10.9.9.9"), 2), None);
+        // Malformed lines are skipped; a bad pair doesn't kill the name.
+        assert_eq!(book.exporter_name(e3).unwrap(), "bad");
+        assert_eq!(book.ifname(e3, 2), None);
+    }
+
+    #[tokio::test]
+    async fn name_resolution_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path(), vec![]);
+        *ctx.naming.write().unwrap() = NamingBook::build(&[
+            "10.0.0.1|rtr-a|2-ae0|250-cogent".to_string(),
+            "10.0.0.2|rtr-b|2-eth0|250-ixp1".to_string(),
+        ]);
+        // Legacy global maps: same ifIndex/VLAN everywhere — the old
+        // conflict-prone scheme, now only a fallback.
+        let mut im = std::collections::BTreeMap::new();
+        im.insert("2".to_string(), "global-if".to_string());
+        im.insert("7".to_string(), "global-if7".to_string());
+        *ctx.interface_names.write().unwrap() = InterfaceNames::build(&im);
+        let mut vm = std::collections::BTreeMap::new();
+        vm.insert("250".to_string(), "global-vlan".to_string());
+        vm.insert("99".to_string(), "global-vlan99".to_string());
+        *ctx.vlan_names.write().unwrap() = VlanNames::build(&vm);
+
+        let (a, b) = (u("10.0.0.1"), u("10.0.0.2"));
+        // Scoped names beat the global guess — no cross-exporter bleed.
+        assert_eq!(ctx.ifname(a, 2).unwrap(), "ae0");
+        assert_eq!(ctx.ifname(b, 2).unwrap(), "eth0");
+        assert_eq!(ctx.vlan_name(a, 250).unwrap(), "cogent");
+        assert_eq!(ctx.vlan_name(b, 250).unwrap(), "ixp1");
+        // No scoped name → documented global fallback still applies.
+        assert_eq!(ctx.ifname(a, 7).unwrap(), "global-if7");
+        assert_eq!(ctx.vlan_name(a, 99).unwrap(), "global-vlan99");
+        // Scoped resolvers never see the global map.
+        assert_eq!(ctx.ifname_scoped(a, 7), None);
+        assert_eq!(ctx.vlan_name_scoped(a, 99), None);
+        // UI-set labels outrank naming config.
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut ifs = std::collections::BTreeMap::new();
+        ifs.insert(2u32, "ui-if".to_string());
+        ctx.exporter_policy.set_interfaces(ip_a, ifs, 0);
+        let mut vl = std::collections::BTreeMap::new();
+        vl.insert(250u16, "ui-vlan".to_string());
+        ctx.exporter_policy.set_vlans(ip_a, vl, 0);
+        ctx.exporter_policy.set_name(ip_a, Some("ui-rtr".to_string()), 0);
+        assert_eq!(ctx.ifname(a, 2).unwrap(), "ui-if");
+        assert_eq!(ctx.vlan_name(a, 250).unwrap(), "ui-vlan");
+        assert_eq!(ctx.exporter_name(a).unwrap(), "ui-rtr");
+        // Exporter B is untouched — names stay isolated per device.
+        assert_eq!(ctx.ifname(b, 2).unwrap(), "eth0");
+        assert_eq!(ctx.exporter_name(b).unwrap(), "rtr-b");
+        // flow_json carries the resolved names.
+        let f = FlowRecord {
+            exporter: a,
+            ingress_if: 2,
+            vlan: 250,
+            ..Default::default()
+        };
+        let j = flow_json(&ctx, &f);
+        assert_eq!(j["ingress_if_name"], "ui-if");
+        assert_eq!(j["vlan_name"], "ui-vlan");
+        assert_eq!(j["exporter_name"], "ui-rtr");
+    }
+
     fn test_ctx(dir: &std::path::Path, infos: Vec<bgflow_store::SegmentInfo>) -> Ctx {
         let empty: SegmentIndex = Arc::new(RwLock::new(Arc::new(Vec::new())));
         Ctx {
@@ -1379,6 +1659,13 @@ mod tests {
             exporter_names: Arc::new(RwLock::new(ExporterNames::default())),
             interface_names: Arc::new(RwLock::new(InterfaceNames::default())),
             vlan_names: Arc::new(RwLock::new(VlanNames::default())),
+            naming: Arc::new(RwLock::new(NamingBook::default())),
+            exporter_policy: Arc::new(crate::exporter_policy::ExporterPolicy::open(
+                dir.join("exporters.json"),
+                false,
+                vec![],
+            )),
+            snmp_names: crate::snmp::new_store(),
             local_asns: Arc::new(RwLock::new(Vec::new())),
             ptr: PtrCache::new(),
             scan_sem: Arc::new(tokio::sync::Semaphore::new(3)),

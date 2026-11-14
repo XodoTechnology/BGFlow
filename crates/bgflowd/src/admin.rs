@@ -22,6 +22,7 @@ pub struct AdminShared {
     pub exporter_names: Arc<RwLock<ExporterNames>>,
     pub interface_names: Arc<RwLock<InterfaceNames>>,
     pub vlan_names: Arc<RwLock<VlanNames>>,
+    pub naming: Arc<RwLock<crate::query::NamingBook>>,
     pub local_asns: Arc<RwLock<Vec<u32>>>,
     pub auth: Arc<AuthState>,
     pub alerts: Arc<RwLock<AlertsConfig>>,
@@ -103,6 +104,8 @@ impl AdminShared {
         *self.interface_names.write().unwrap() = InterfaceNames::build(&cfg.interface_names);
 
         *self.vlan_names.write().unwrap() = VlanNames::build(&cfg.vlan_names);
+
+        *self.naming.write().unwrap() = crate::query::NamingBook::build(&cfg.naming);
 
         *self.local_asns.write().unwrap() = cfg.analytics.local_asns.clone();
 

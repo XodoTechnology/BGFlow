@@ -29,6 +29,19 @@ pub struct Config {
     /// [vlan_names] "10" = "Devoli"
     #[serde(default)]
     pub vlan_names: std::collections::BTreeMap<String, String>,
+    /// Per-exporter naming — the preferred scheme. Each line is
+    /// "<exporter-ip>|<name>|<ifindex>-<ifname>|<vlanid>-<vlanname>";
+    /// the name and pair fields may be left empty to skip them:
+    /// naming = [
+    ///   "10.0.0.1|core-rtr-01|2-ae0|250-cogent",
+    ///   "10.0.0.1||3-ae1",
+    ///   "10.0.0.2|core-rtr-02|2-eth0|250-ixp1",
+    /// ]
+    /// Interface ifIndex and VLAN ids are only meaningful on the
+    /// exporting device, so names are always resolved per exporter —
+    /// the same id may map to different names on different exporters.
+    #[serde(default)]
+    pub naming: Vec<String>,
     /// Multi-user accounts for the UI/API.
     /// [[users]] name = "admin" password_hash = "pbkdf2-sha256$..." role = "admin"
     /// Generate hashes with `bgflowd hash-password`. Roles: admin | viewer.
@@ -537,6 +550,7 @@ impl Default for Config {
             exporter_names: Default::default(),
             interface_names: Default::default(),
             vlan_names: Default::default(),
+            naming: Default::default(),
             users: vec![],
             exporters: ExportersConfig::default(),
             analytics: AnalyticsConfig::default(),

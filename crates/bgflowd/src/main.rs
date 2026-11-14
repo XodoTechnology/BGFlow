@@ -329,6 +329,8 @@ async fn main() -> Result<()> {
         Arc::new(RwLock::new(query::VlanNames::build(
             &cfg.vlan_names,
         )));
+    let naming =
+        Arc::new(RwLock::new(query::NamingBook::build(&cfg.naming)));
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
     let alert_rt = Arc::new(alerts::AlertRuntime::default());
@@ -346,6 +348,7 @@ async fn main() -> Result<()> {
         exporter_names: exporter_names.clone(),
         interface_names: interface_names.clone(),
         vlan_names: vlan_names.clone(),
+        naming: naming.clone(),
         local_asns: local_asns.clone(),
         auth: auth.clone(),
         alerts: alerts_cfg.clone(),
@@ -375,6 +378,9 @@ async fn main() -> Result<()> {
             exporter_names: exporter_names.clone(),
             interface_names: interface_names.clone(),
             vlan_names: vlan_names.clone(),
+            naming: naming.clone(),
+            exporter_policy: exporter_policy.clone(),
+            snmp_names: snmp_store.clone(),
             local_asns: local_asns.clone(),
             ptr: ptr.clone(),
             scan_sem: Arc::new(tokio::sync::Semaphore::new(3)),
