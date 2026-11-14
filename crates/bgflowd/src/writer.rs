@@ -8,7 +8,7 @@
 use crate::config::StorageConfig;
 use crate::hot::{HotRec, HotStats};
 use crate::metrics::{now_ms, Metrics};
-use bgflow_store::{Dataset, DatasetOpts, GeoAggregator, RollupAggregator, SegmentInfo};
+use bgflow_store::{Dataset, DatasetOpts, GeoAggregator, Record, RollupAggregator, SegmentInfo};
 use bgflow_types::{FlowRecord, GeoRecord, RollupRecord};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -476,7 +476,106 @@ fn retention(
             tracing::info!("disk cap: evicted oldest segments, freed {} bytes", freed);
         }
     }
+    // fs_guard always runs: it samples bgflow_disk_free_bytes every
+    // sweep and only evicts when a free-space floor is configured.
+    let freed = fs_guard(flows, rollups, hourly, geos, cfg, metrics)?;
+    metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+    if freed > 0 {
+        tracing::info!("fs guard: evicted oldest segments, freed {} bytes", freed);
+    }
     Ok(())
+}
+
+/// (available-to-unprivileged, total) bytes on the filesystem holding
+/// `root`, via statvfs. None on non-unix or on error.
+fn fs_free(root: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(root.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let fr = (st.f_frsize as u64).max(1);
+        Some((st.f_bavail as u64 * fr, st.f_blocks as u64 * fr))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+/// Evict a single dataset's oldest segments (by data end time) until
+/// roughly `need` bytes are freed. Returns actual bytes freed.
+fn evict_oldest<R: Record>(ds: &mut Dataset<R>, need: u64) -> u64 {
+    let snap = ds.segment_snapshot();
+    let mut order: Vec<usize> = (0..snap.len()).collect();
+    order.sort_by_key(|&i| snap[i].header.max_ts_ms);
+    let mut planned = 0u64;
+    let mut victims = Vec::new();
+    for i in order {
+        if planned >= need {
+            break;
+        }
+        planned += snap[i].file_size;
+        victims.push(i);
+    }
+    // Indices descending so removals don't shift later victims.
+    victims.sort_unstable_by(|a, b| b.cmp(a));
+    victims.iter().map(|&i| ds.drop_segment(i)).sum()
+}
+
+/// Filesystem free-space guard: when a dataset's filesystem drops
+/// below `min_free_pct` of its size or `min_free_bytes` (whichever is
+/// larger), evict that dataset's oldest segments until the floor is
+/// met plus ~10% hysteresis. Per-dataset on purpose — a dataset on a
+/// separate mount only yields its own segments, and datasets sharing
+/// one fs naturally let the first (flows, the bulk) absorb eviction.
+fn fs_guard(
+    flows: &mut Dataset<FlowRecord>,
+    rollups: &mut Dataset<RollupRecord>,
+    hourly: &mut Dataset<RollupRecord>,
+    geos: &mut Dataset<GeoRecord>,
+    cfg: &StorageConfig,
+    metrics: &Metrics,
+) -> anyhow::Result<u64> {
+    // Snapshot roots first so the immutable borrows end before the
+    // mutable evictions below.
+    let roots: [(u8, std::path::PathBuf); 4] = [
+        (0, flows.root().to_path_buf()),
+        (1, rollups.root().to_path_buf()),
+        (2, hourly.root().to_path_buf()),
+        (3, geos.root().to_path_buf()),
+    ];
+    let mut freed = 0u64;
+    let mut min_free = u64::MAX;
+    for (tag, root) in &roots {
+        let Some((free, total)) = fs_free(root) else { continue };
+        min_free = min_free.min(free);
+        let floor = cfg.min_free_bytes.max(
+            total.saturating_mul(cfg.min_free_pct.min(99) as u64) / 100,
+        );
+        if free >= floor {
+            continue;
+        }
+        // Deficit + 10%-of-floor headroom so we don't evict every sweep
+        // while hovering at the line.
+        let need = floor.saturating_sub(free) + floor / 10 + 1;
+        freed += match tag {
+            0 => evict_oldest(flows, need),
+            1 => evict_oldest(rollups, need),
+            2 => evict_oldest(hourly, need),
+            _ => evict_oldest(geos, need),
+        };
+    }
+    if min_free != u64::MAX {
+        metrics
+            .disk_free_bytes
+            .store(min_free, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(freed)
 }
 
 /// Enforce `max_bytes` across all datasets: evict globally oldest
@@ -595,4 +694,18 @@ fn update_status(
     s.geo_bytes = geos.total_bytes();
     s.geo_buffered = geos.buffered_rows();
     s.geo_pending_buckets = geo_agg.len();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_free_reports_real_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let (free, total) = fs_free(dir.path()).expect("statvfs should succeed on a real dir");
+        assert!(total > 0);
+        assert!(free <= total || free > 0);
+        eprintln!("fs_free: free={} total={}", free, total);
+    }
 }

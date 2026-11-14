@@ -1353,7 +1353,9 @@ function renderSettings(){
      ${num('storage.raw_retention_days','Raw flows retention (days)')}
      ${num('storage.rollup_retention_days','Rollup retention (days)')}
      ${num('storage.coarse_retention_days','Hourly rollup retention (days)')}
-     ${fld('storage.max_bytes','Max disk usage (GiB, 0 = unlimited)',`<input type="number" step="0.1" style="width:110px" value="${giB(s.max_bytes)}" placeholder="0" oninput="ssetGiB('storage.max_bytes',this.value)">`)}
+     ${fld('storage.max_bytes','Max bgflow disk usage (GiB, 0 = unlimited)',`<input type="number" step="0.1" style="width:110px" value="${giB(s.max_bytes)}" placeholder="0" oninput="ssetGiB('storage.max_bytes',this.value)">`)}
+     ${num('storage.min_free_pct','Keep filesystem % free (0 = off)')}
+     ${fld('storage.min_free_bytes','Keep filesystem free ≥ (GiB, 0 = off)',`<input type="number" step="0.1" style="width:110px" value="${giB(s.min_free_bytes)}" placeholder="0" oninput="ssetGiB('storage.min_free_bytes',this.value)">`)}
      ${chk('storage.sample_weighting','Sample-rate weighting')}
      ${chk('storage.coarse_rollup','Coarse hourly rollups')}
      ${txt('storage.data_dir','Data dir','/var/lib/bgflow')}

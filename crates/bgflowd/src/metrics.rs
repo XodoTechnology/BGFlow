@@ -39,6 +39,9 @@ pub struct Metrics {
     pub bytes_stored: AtomicU64,
     pub rows_stored: AtomicU64,
     pub bytes_freed: AtomicU64,
+    /// Free bytes on the data filesystem, sampled on retention sweeps
+    /// (0 until the first sample).
+    pub disk_free_bytes: AtomicU64,
     pub mmdb_hits: AtomicU64,
     pub http_hits: AtomicU64,
     pub http_misses: AtomicU64,
@@ -157,6 +160,8 @@ impl Metrics {
         s.push_str(&format!("bgflow_stored_rows_total {}\n", g(&self.rows_stored)));
         s.push_str("# HELP bgflow_retention_freed_bytes_total Bytes freed by retention\n# TYPE bgflow_retention_freed_bytes_total counter\n");
         s.push_str(&format!("bgflow_retention_freed_bytes_total {}\n", g(&self.bytes_freed)));
+        s.push_str("# HELP bgflow_disk_free_bytes Free bytes on the data filesystem\n# TYPE bgflow_disk_free_bytes gauge\n");
+        s.push_str(&format!("bgflow_disk_free_bytes {}\n", g(&self.disk_free_bytes)));
 
         let map = self.exporters.lock().unwrap();
         s.push_str("# HELP bgflow_exporter_datagrams_total Datagrams per exporter\n# TYPE bgflow_exporter_datagrams_total counter\n");

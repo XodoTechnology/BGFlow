@@ -259,6 +259,18 @@ pub struct StorageConfig {
     /// retention sweep interval.
     #[serde(default, deserialize_with = "de_size")]
     pub max_bytes: u64,
+    /// Filesystem guard: keep at least this percent of the data
+    /// filesystem(s) free. When free space drops below it, each
+    /// dataset evicts its own oldest segments until the floor is met
+    /// (plus hysteresis). Complements max_bytes — this protects the
+    /// whole disk, not just bgflow's footprint. 0 = off.
+    #[serde(default)]
+    pub min_free_pct: u8,
+    /// Absolute free-space floor, same guard as min_free_pct —
+    /// whichever demands more free space wins. Accepts "5GiB" etc.
+    /// 0 = off.
+    #[serde(default, deserialize_with = "de_size")]
+    pub min_free_bytes: u64,
     /// Optional per-dataset directory overrides — e.g. point bulk raw
     /// flows at one mount and rollup stats at another. Each defaults
     /// to <data_dir>/{flows,rollups,hourly,geo}.
@@ -592,6 +604,8 @@ impl Default for StorageConfig {
             coarse_retention_days: 365,
             sample_weighting: false,
             max_bytes: 0,
+            min_free_pct: 0,
+            min_free_bytes: 0,
             flows_dir: None,
             rollups_dir: None,
             hourly_dir: None,
