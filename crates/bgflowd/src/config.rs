@@ -153,6 +153,11 @@ pub struct ServerConfig {
     pub session_secret: Option<String>,
     /// Session lifetime in seconds (default 86400 = 24h).
     pub session_ttl_secs: Option<u64>,
+    /// Max seconds a single segment scan may run before aborting with a
+    /// timeout error (default 120; 0 = no limit). Scans check the
+    /// deadline between segments/row-blocks, so CPU is released promptly
+    /// instead of running to completion after the client gave up.
+    pub query_timeout_secs: u64,
     /// Override the version string shown in the UI/status footer.
     /// Empty = the compile-time git-derived value. The BGFLOW_VERSION
     /// environment variable takes precedence over this.
@@ -505,6 +510,7 @@ impl Default for ServerConfig {
             tls_key: None,
             session_secret: None,
             session_ttl_secs: None,
+            query_timeout_secs: 120,
             version: String::new(),
             git_describe: String::new(),
         }

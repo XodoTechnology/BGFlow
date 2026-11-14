@@ -66,10 +66,15 @@ async fn scan_permit(ctx: &query::Ctx) -> tokio::sync::OwnedSemaphorePermit {
 }
 
 fn err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"error": msg.into()})),
-    )
+    let msg = msg.into();
+    // Scan timeouts are server-side saturation, not bad input — 503 so
+    // clients/backoff treat it as retryable rather than a 4xx.
+    let code = if msg.contains("scan timeout") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (code, Json(serde_json::json!({"error": msg})))
 }
 
 fn range(q: &Q) -> (u64, u64) {
@@ -687,6 +692,8 @@ async fn geo(
     let mut cells: std::collections::HashMap<(i32, i32), Cell> = std::collections::HashMap::new();
     let infos = st.ctx.flow_index.read().unwrap().clone();
     let _scan = scan_permit(&st.ctx).await;
+    let deadline = query::scan_deadline(&st.ctx);
+    let mut timed_out = false;
     // Column-subset decode: geo needs 11 of 40 columns — ~3-4x less
     // decompression work than decode_all. Segments written under older
     // schemas simply lack the geo columns (read as 0).
@@ -724,6 +731,12 @@ async fn geo(
                     .unwrap_or(0)
             };
             for i in 0..rows {
+                if let Some(d) = deadline {
+                    if i & 0x3FFF == 0 && std::time::Instant::now() > d {
+                        timed_out = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
                 let ts = get(ix::TS_MS, i) as u64;
                 if ts < from || ts > to {
                     continue;
@@ -783,6 +796,9 @@ async fn geo(
         },
     )
     .map_err(|e| err(e.to_string()))?;
+    if timed_out {
+        return Err(err("query exceeded scan timeout"));
+    }
 
     let mut pts: Vec<_> = cells
         .into_iter()

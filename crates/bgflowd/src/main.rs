@@ -363,6 +363,7 @@ async fn main() -> Result<()> {
             local_asns: local_asns.clone(),
             ptr: ptr.clone(),
             scan_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+            scan_timeout: std::time::Duration::from_secs(cfg.server.query_timeout_secs),
         },
         status: shared.status.clone(),
         metrics: metrics.clone(),

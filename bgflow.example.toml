@@ -31,6 +31,10 @@ http_listen = "0.0.0.0:8080"
 # random string to keep sessions across restarts.
 # session_secret = "change-me-long-random"
 # session_ttl_secs = 86400
+# Max seconds a single segment scan may run before aborting (503).
+# Keeps timed-out queries from burning CPU after the client disconnects.
+# 0 disables the limit. Default 120.
+# query_timeout_secs = 120
 #
 # Allow cross-origin API access (UI is same-origin; off by default).
 # cors = true plus cors_origins restricts CORS to those origins (credentials

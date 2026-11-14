@@ -144,6 +144,19 @@ pub struct Ctx {
     /// alert evaluator share it so heavy queries queue instead of
     /// stampeding disk/CPU (ingest and hot-path queries stay responsive).
     pub scan_sem: Arc<tokio::sync::Semaphore>,
+    /// Per-scan wall-clock budget — scans abort between segments/row
+    /// blocks once exceeded so timed-out queries don't burn CPU forever.
+    /// Zero disables the deadline.
+    pub scan_timeout: std::time::Duration,
+}
+
+/// Deadline for a scan started now; None when timeouts are disabled.
+pub(crate) fn scan_deadline(ctx: &Ctx) -> Option<std::time::Instant> {
+    if ctx.scan_timeout.is_zero() {
+        None
+    } else {
+        Some(std::time::Instant::now() + ctx.scan_timeout)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +352,8 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<(Vec<FlowRecord>, Option<String
     let (cur_seg, cur_row) = q.resume.clone().unwrap_or_default();
     let mut seeking = q.resume.is_some();
     let mut next_cursor: Option<String> = None;
+    let deadline = scan_deadline(ctx);
+    let mut timed_out = false;
     // Cursor snapshot taken once `cursor_after` rows are collected —
     // survives the probe row so pagination resumes at the page edge.
     let cursor_after = if q.cursor_after > 0 {
@@ -363,6 +378,12 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<(Vec<FlowRecord>, Option<String
                 start = cur_row.min(scan.rows as u64) as usize;
             }
             for row in start..scan.rows {
+                if let Some(d) = deadline {
+                    if row & 0x3FFF == 0 && std::time::Instant::now() > d {
+                        timed_out = true;
+                        return ControlFlow::Break(());
+                    }
+                }
                 let f = FlowRecord::from_scan(scan, row);
                 if f.ts_ms < q.from_ms || f.ts_ms > q.to_ms {
                     continue;
@@ -390,6 +411,9 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<(Vec<FlowRecord>, Option<String
     )?;
     if q.resume.is_some() && seeking {
         anyhow::bail!("cursor expired — the segment it points into was removed");
+    }
+    if timed_out {
+        anyhow::bail!("query exceeded scan timeout");
     }
     Ok((out, next_cursor))
 }
@@ -778,6 +802,8 @@ pub fn rollup_scan(
         RollupSet::Hourly => ctx.hourly_index.read().unwrap().clone(),
     };
     let period = set.period_ms();
+    let deadline = scan_deadline(ctx);
+    let mut timed_out = false;
     bgflow_store::for_each_segment_cols(
         &infos,
         RollupRecord::schema(),
@@ -791,6 +817,12 @@ pub fn rollup_scan(
                 arr[*ci] = Some(data);
             }
             for i in 0..rows {
+                if let Some(d) = deadline {
+                    if i & 0x3FFF == 0 && std::time::Instant::now() > d {
+                        timed_out = true;
+                        return ControlFlow::Break(());
+                    }
+                }
                 let row = RollupRow { arr: &arr, i };
                 if row.bucket_ms() + period < from_ms || row.bucket_ms() > to_ms {
                     continue;
@@ -801,7 +833,11 @@ pub fn rollup_scan(
             }
             ControlFlow::Continue(())
         },
-    )
+    )?;
+    if timed_out {
+        anyhow::bail!("query exceeded scan timeout");
+    }
+    Ok(())
 }
 
 /// Parallel rollup aggregation. Partitions the overlapping segments
@@ -841,6 +877,7 @@ where
     let nth = bgflow_store::scan_threads().min(idx.len().max(1));
     let chunk_size = idx.len().div_ceil(nth).max(1);
     let ncols = RollupRecord::schema().columns.len();
+    let deadline = scan_deadline(ctx);
 
     let results: Vec<Result<T>> = std::thread::scope(|s| {
         let mut handles = Vec::new();
@@ -853,6 +890,11 @@ where
             handles.push(s.spawn(move || -> Result<T> {
                 let mut state = init();
                 for &i in &chunk {
+                    if let Some(d) = deadline {
+                        if std::time::Instant::now() > d {
+                            return Err(anyhow::anyhow!("query exceeded scan timeout"));
+                        }
+                    }
                     let info = &infos[i];
                     let reader = bgflow_store::segment::SegmentReader::open(&info.path)?;
                     let columns = reader.decode_columns(&needed)?;
@@ -946,6 +988,7 @@ where
 
     let nth = bgflow_store::scan_threads().min(idx.len().max(1));
     let shards = shards.max(1);
+    let deadline = scan_deadline(ctx);
     // Hard bound on distinct keys across all shards: high-cardinality
     // extractions (conversation tuples on minute data) can otherwise
     // grow maps without limit and OOM the daemon. ~3M keys × ~150B
@@ -1007,6 +1050,11 @@ where
                     }
                 };
                 for &i in &chunk {
+                    if let Some(d) = deadline {
+                        if std::time::Instant::now() > d {
+                            return Err(anyhow::anyhow!("query exceeded scan timeout"));
+                        }
+                    }
                     let info = &infos[i];
                     let reader = bgflow_store::segment::SegmentReader::open(&info.path)?;
                     let columns = reader.decode_columns(&needed)?;
@@ -1331,6 +1379,7 @@ mod tests {
             local_asns: Arc::new(RwLock::new(Vec::new())),
             ptr: PtrCache::new(),
             scan_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+            scan_timeout: std::time::Duration::from_secs(120),
         }
     }
 
@@ -1392,6 +1441,32 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, (1..=25).collect::<Vec<_>>(), "cursor pages must cover every row exactly once");
+    }
+
+    #[tokio::test]
+    async fn flows_scan_timeout_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = bgflow_store::DatasetOpts {
+            segment_rows: 10,
+            segment_interval: std::time::Duration::from_secs(3600),
+        };
+        let mut ds = bgflow_store::Dataset::<FlowRecord>::open(dir.path(), opts).unwrap();
+        let now = crate::metrics::now_ms();
+        for i in 0..5u64 {
+            ds.push(&flow_at(now - i * 1000, i + 1)).unwrap();
+        }
+        ds.flush().unwrap();
+        let mut ctx = test_ctx(dir.path(), ds.segment_snapshot());
+        // 1ns budget: already expired by the first row-block check.
+        ctx.scan_timeout = std::time::Duration::from_nanos(1);
+        let q = FlowQuery {
+            from_ms: 0,
+            to_ms: now + 60_000,
+            limit: 10,
+            ..Default::default()
+        };
+        let err = flows(&ctx, &q).unwrap_err();
+        assert!(err.to_string().contains("scan timeout"), "got: {}", err);
     }
 
     #[tokio::test]

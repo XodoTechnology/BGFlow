@@ -90,14 +90,34 @@ pub async fn run(store: SnmpStore, policy: Arc<ExporterPolicy>, cfg: SnmpConfig)
         }
         let st = store.clone();
         let c = cfg.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            for (ip, community, port) in targets {
-                let mut info = poll_exporter(ip, &community, port, &c);
-                info.polled_ms = now_ms();
-                st.write().unwrap().insert(ip, info);
-            }
-        })
-        .await;
+        // Whole-sweep deadline: parallel polls mean the sweep lasts about
+        // as long as the slowest single agent (≤30s each), not the sum —
+        // dead exporters can no longer stall the loop for many minutes.
+        let sweep_deadline = Instant::now() + Duration::from_secs(cfg.interval_secs.max(60));
+        // Bound concurrent blocking SNMP sessions.
+        let sem = Arc::new(tokio::sync::Semaphore::new(32));
+        let mut handles = Vec::with_capacity(targets.len());
+        for (ip, community, port) in targets {
+            let st = st.clone();
+            let c = c.clone();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let Ok(_permit) = sem.acquire().await else {
+                    return;
+                };
+                let res = tokio::task::spawn_blocking(move || {
+                    poll_exporter(ip, &community, port, &c, sweep_deadline)
+                })
+                .await;
+                if let Ok(mut info) = res {
+                    info.polled_ms = now_ms();
+                    st.write().unwrap().insert(ip, info);
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
     }
 }
 
@@ -172,7 +192,13 @@ fn walk_col<F: FnMut(u64, &Value)>(
     }
 }
 
-fn poll_exporter(ip: IpAddr, community: &str, port: u16, cfg: &SnmpConfig) -> ExporterSnmp {
+fn poll_exporter(
+    ip: IpAddr,
+    community: &str,
+    port: u16,
+    cfg: &SnmpConfig,
+    sweep_deadline: Instant,
+) -> ExporterSnmp {
     let mut info = ExporterSnmp::default();
     let addr = if ip.is_ipv6() {
         format!("[{}]:{}", ip, port)
@@ -192,8 +218,9 @@ fn poll_exporter(ip: IpAddr, community: &str, port: u16, cfg: &SnmpConfig) -> Ex
         }
     };
     // Whole-poll deadline — a dead/blackholed agent shouldn't stall the
-    // poller (each request already has the session timeout).
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // poller (each request already has the session timeout), and the
+    // sweep deadline keeps one slow agent from eating the whole budget.
+    let deadline = (Instant::now() + Duration::from_secs(30)).min(sweep_deadline);
     // Track whether the agent answered at all — an unreachable host or
     // wrong community otherwise looks identical to "device has no
     // interfaces", which is confusing in the UI.
