@@ -81,6 +81,12 @@ sample_weighting = false
 # flows_dir = "/bulk/bgflow/flows"
 # rollups_dir = "/stats/bgflow/rollups"
 # hourly_dir = "/stats/bgflow/hourly"
+# Scheduled backups: every N seconds write a timestamped, CRC-verified
+# copy of the data dir under backup_dir, keeping the newest backup_keep.
+# 0 = disabled (the `bgflowd backup` CLI command still works ad-hoc).
+# backup_interval_secs = 86400
+# backup_keep = 3
+# backup_dir = "/var/backups/bgflow"   # default: <data_dir>/backups
 
 [geoip]
 # GeoIP MMDB databases (optional) — fills in ASN/org/country for flows
