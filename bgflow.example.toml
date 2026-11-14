@@ -171,6 +171,18 @@ protocol = "auto"
 # listen = "0.0.0.0:6343"
 # protocol = "sflow"
 
+# --- Flow export -------------------------------------------------------------
+# Re-encode stored flows and forward them to other collectors over UDP.
+# Only flows that were actually stored are exported; export is
+# best-effort — a slow/lossy link drops datagrams (see bgflow_export_*
+# metrics), it never affects ingestion or storage.
+#
+# [[export]]
+# address = "10.0.0.5:2055"        # UDP destination
+# protocol = "netflow9"            # netflow9 (default) | ipfix
+# name = "upstream-collector"      # optional label for logs/status
+# max_datagram = 1400              # UDP payload cap per datagram
+
 # --- HTTP enrichment backends ------------------------------------------------
 # Query external whois/RDAP/IRR services for prefixes/IPs not covered by MMDB.
 # Results are cached per prefix (IPv4 /24, IPv6 /48) and applied to later flows.

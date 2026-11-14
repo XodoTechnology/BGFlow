@@ -75,6 +75,52 @@ impl WriterShared {
 }
 
 const BATCH: usize = 8192;
+/// Max FlowRecords per outbound-export channel message. Keeps each
+/// encode pass bounded (~4096 × ~200B ≈ 800KB per batch).
+const EXPORT_BATCH: usize = 4096;
+
+/// Non-blocking tap feeding the NetFlow/IPFIX exporter. Stored records
+/// are copied into a small buffer; when it fills (or the batch drains)
+/// the buffer is `try_send`n — a full/closed channel just drops the
+/// batch and bumps `export_dropped`, so export can never stall storage.
+pub struct ExportTap {
+    tx: mpsc::Sender<Vec<FlowRecord>>,
+    buf: Vec<FlowRecord>,
+}
+
+impl ExportTap {
+    pub fn new(tx: mpsc::Sender<Vec<FlowRecord>>) -> Self {
+        ExportTap {
+            tx,
+            buf: Vec::with_capacity(EXPORT_BATCH),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, rec: FlowRecord, metrics: &Metrics) {
+        self.buf.push(rec);
+        if self.buf.len() >= EXPORT_BATCH {
+            self.flush(metrics);
+        }
+    }
+
+    fn flush(&mut self, metrics: &Metrics) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.buf);
+        self.buf.reserve(EXPORT_BATCH);
+        match self.tx.try_send(batch) {
+            Ok(()) => {}
+            Err(e) => {
+                let n = e.into_inner().len() as u64;
+                metrics
+                    .export_dropped
+                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
 /// Live-tuple caps for the rollup aggregators (~200B/entry incl.
 /// hashmap overhead → ≈60MB / ≈120MB worst case). A cardinality
 /// explosion — e.g. a DDoS with spoofed sources — would otherwise grow
@@ -121,6 +167,7 @@ pub async fn run(
     mut rx: mpsc::Receiver<FlowRecord>,
     hot: Arc<RwLock<HotStats>>,
     local_asns: Arc<RwLock<Vec<u32>>>,
+    mut export: Option<ExportTap>,
 ) -> anyhow::Result<()> {
     // Open-time settings snapshot — dataset dirs/segment sizing are
     // fixed for the process lifetime. Retention knobs are re-read from
@@ -174,12 +221,12 @@ pub async fn run(
                         }
                         pending.push(rec);
                         if pending.len() >= BATCH {
-                            ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics);
+                            ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics, &mut export);
                         }
                     }
                     None => {
                         // All senders gone: flush everything and exit.
-                        ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics);
+                        ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics, &mut export);
                         // drain_all: keep the still-open buckets too — their
                         // raw flows exist, so rollups shouldn't lose them.
                         let recs = agg.drain_all();
@@ -197,7 +244,7 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
-                ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics);
+                ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics, &mut export);
                 // Cardinality circuit-breaker: drain a subset of live
                 // tuples early when a map exceeds its cap. Records land
                 // in the still-open bucket; readers sum duplicate
@@ -309,6 +356,7 @@ fn ingest_batch(
     geo_agg: &mut GeoAggregator,
     coarse_on: bool,
     metrics: &Metrics,
+    export: &mut Option<ExportTap>,
 ) {
     if pending.is_empty() {
         return;
@@ -325,6 +373,11 @@ fn ingest_batch(
                     coarse_agg.add(&rec);
                 }
                 geo_agg.add(&rec);
+                // Export only what was actually stored — mirrors the
+                // rollup consistency rule above.
+                if let Some(tap) = export.as_mut() {
+                    tap.push(rec, metrics);
+                }
             }
             Err(e) => {
                 errs += 1;
@@ -335,6 +388,9 @@ fn ingest_batch(
         }
     }
     metrics.rows_stored.fetch_add(stored, std::sync::atomic::Ordering::Relaxed);
+    if let Some(tap) = export.as_mut() {
+        tap.flush(metrics);
+    }
     if errs > 0 {
         metrics.write_errors.fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(

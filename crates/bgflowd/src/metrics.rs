@@ -50,6 +50,11 @@ pub struct Metrics {
     pub qcache_hit: AtomicU64,
     pub qcache_stale: AtomicU64,
     pub qcache_miss: AtomicU64,
+    /// Outbound NetFlow/IPFIX export counters.
+    pub export_flows: AtomicU64,
+    pub export_datagrams: AtomicU64,
+    pub export_errors: AtomicU64,
+    pub export_dropped: AtomicU64,
     /// Per-path HTTP stats: count, total handler ms, 5xx count.
     pub http: Mutex<HashMap<String, HttpStat>>,
     pub exporters: Mutex<HashMap<IpAddr, ExporterStat>>,
@@ -114,6 +119,14 @@ impl Metrics {
         s.push_str(&format!("bgflow_qcache_stale_total {}\n", g(&self.qcache_stale)));
         s.push_str("# HELP bgflow_qcache_miss_total Query-cache misses\n# TYPE bgflow_qcache_miss_total counter\n");
         s.push_str(&format!("bgflow_qcache_miss_total {}\n", g(&self.qcache_miss)));
+        s.push_str("# HELP bgflow_export_flows_total Flow records exported\n# TYPE bgflow_export_flows_total counter\n");
+        s.push_str(&format!("bgflow_export_flows_total {}\n", g(&self.export_flows)));
+        s.push_str("# HELP bgflow_export_datagrams_total Export datagrams sent\n# TYPE bgflow_export_datagrams_total counter\n");
+        s.push_str(&format!("bgflow_export_datagrams_total {}\n", g(&self.export_datagrams)));
+        s.push_str("# HELP bgflow_export_errors_total Export send errors\n# TYPE bgflow_export_errors_total counter\n");
+        s.push_str(&format!("bgflow_export_errors_total {}\n", g(&self.export_errors)));
+        s.push_str("# HELP bgflow_export_dropped_total Flow batches dropped (export queue full)\n# TYPE bgflow_export_dropped_total counter\n");
+        s.push_str(&format!("bgflow_export_dropped_total {}\n", g(&self.export_dropped)));
         {
             let http = self.http.lock().unwrap();
             s.push_str("# HELP bgflow_http_requests_total HTTP requests by path\n# TYPE bgflow_http_requests_total counter\n");

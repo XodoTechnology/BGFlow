@@ -44,6 +44,43 @@ pub struct Config {
     /// Analytics/direction settings ([analytics] section).
     #[serde(default)]
     pub analytics: AnalyticsConfig,
+    /// Outbound flow export targets ([[export]] entries).
+    #[serde(default)]
+    pub export: Vec<ExportTargetConfig>,
+}
+
+/// One [[export]] target: stored flows are re-encoded and sent over UDP.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExportTargetConfig {
+    /// UDP destination, e.g. "10.0.0.1:2055" or "[2001:db8::1]:4739".
+    pub address: String,
+    /// "netflow9" (default) or "ipfix".
+    #[serde(default = "default_export_proto")]
+    pub protocol: String,
+    /// Optional label used in logs and the /status endpoint.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Max UDP payload bytes per datagram (default 1400, min 256).
+    #[serde(default = "default_export_dgram")]
+    pub max_datagram: usize,
+}
+
+fn default_export_proto() -> String {
+    "netflow9".into()
+}
+fn default_export_dgram() -> usize {
+    1400
+}
+
+impl Default for ExportTargetConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            protocol: default_export_proto(),
+            name: None,
+            max_datagram: default_export_dgram(),
+        }
+    }
 }
 
 /// [analytics] — traffic analytics settings.
@@ -496,6 +533,7 @@ impl Default for Config {
             exporters: ExportersConfig::default(),
             analytics: AnalyticsConfig::default(),
             snmp: SnmpConfig::default(),
+            export: vec![],
         }
     }
 }

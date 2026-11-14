@@ -13,7 +13,7 @@ use bgflow_types::FlowRecord;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-pub const HEADER_LEN: usize = 20;
+pub const HEADER_LEN: usize = 24;
 
 /// Templates for one observation domain, keyed by template id.
 pub type DomainTemplates = HashMap<u16, Template>;
@@ -54,6 +54,13 @@ pub fn parse(
     };
     let unix_secs = match cur.u32() {
         Ok(v) => v as u64,
+        Err(_) => return Vec::new(),
+    };
+    // RFC 3954 header: unixNsecs sits between unixSecs and flowSequence —
+    // skipping it misaligns every subsequent field (and the first
+    // flowset) by 4 bytes.
+    let _unix_nsecs = match cur.u32() {
+        Ok(v) => v,
         Err(_) => return Vec::new(),
     };
     let _seq = match cur.u32() {

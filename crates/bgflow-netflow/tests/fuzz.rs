@@ -93,7 +93,8 @@ fn nfv9_datagram() -> Vec<u8> {
     p.extend_from_slice(&2u16.to_be_bytes()); // count: template + data
     p.extend_from_slice(&5_000u32.to_be_bytes());
     p.extend_from_slice(&1_700_000_000u32.to_be_bytes());
-    p.extend_from_slice(&1u32.to_be_bytes());
+    p.extend_from_slice(&0u32.to_be_bytes()); // unixNsecs
+    p.extend_from_slice(&1u32.to_be_bytes()); // flowSequence
     p.extend_from_slice(&0u32.to_be_bytes()); // domain
     // template flowset (id 0)
     let mut tb = Vec::new();

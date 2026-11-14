@@ -16,6 +16,7 @@ mod geoip;
 mod hot;
 mod ingest;
 mod metrics;
+mod netexp;
 mod qcache;
 mod query;
 mod rules;
@@ -214,16 +215,29 @@ async fn main() -> Result<()> {
     // Shared storage config — the writer re-reads retention/disk-cap
     // knobs each sweep so admin settings apply without a restart.
     let storage_cfg = Arc::new(RwLock::new(cfg.storage.clone()));
+    // Outbound NetFlow/IPFIX export: the writer taps stored records into
+    // a bounded channel; netexp re-encodes per [[export]] target and
+    // sends UDP. Best-effort — never blocks storage.
+    let export_targets = netexp::resolve(&cfg.export, metrics::now_ms() as i64);
+    let (export_tx, export_rx) = tokio::sync::mpsc::channel::<Vec<bgflow_types::FlowRecord>>(4);
+    let export_tap = (!export_targets.is_empty()).then(|| writer::ExportTap::new(export_tx));
     {
         let cfg_s = storage_cfg.clone();
         let sh = shared.clone();
         let m = metrics.clone();
         let h = hot.clone();
         let la = local_asns.clone();
+        let ex = export_tap;
         tokio::spawn(async move {
-            if let Err(e) = writer::run(cfg_s, sh, m, rx, h, la).await {
+            if let Err(e) = writer::run(cfg_s, sh, m, rx, h, la, ex).await {
                 tracing::error!("writer failed: {}", e);
             }
+        });
+    }
+    if !export_targets.is_empty() {
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            netexp::run(export_targets, export_rx, m).await;
         });
     }
 
