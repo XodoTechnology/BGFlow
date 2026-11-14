@@ -257,6 +257,9 @@ pub struct MmdbGeo {
     /// City names interned separately from org names.
     cities: Arc<StringTable>,
     metrics: Arc<Metrics>,
+    /// Bumped on every reader swap so cached per-IP results can detect
+    /// stale MMDB data without a TTL-only wait.
+    gen: AtomicU64,
 }
 
 /// Build readers + file stamps for a geoip config. Shared by `open` and
@@ -322,7 +325,14 @@ impl MmdbGeo {
             orgs,
             cities,
             metrics,
+            gen: AtomicU64::new(1),
         }
+    }
+
+    /// Reader generation — increments on every `swap`. Cached enrichment
+    /// results tagged with an older generation are recomputed.
+    pub fn generation(&self) -> u64 {
+        self.gen.load(Ordering::Relaxed)
     }
 
     /// Rebuild readers from `cfg` and swap them in atomically. Old
@@ -332,6 +342,7 @@ impl MmdbGeo {
         let n = readers.asn.len() + readers.country.len();
         *self.readers.write().unwrap() = readers;
         *self.stamps.write().unwrap() = stamps;
+        self.gen.fetch_add(1, Ordering::Relaxed);
         if n == 0 {
             tracing::warn!("geoip: no MMDB readers after reload — geo enrichment disabled");
         } else {
@@ -438,101 +449,149 @@ impl MmdbGeo {
 
     /// Enrich one IP's fields in the record. Only fills fields that are
     /// still unset (0), so exporter-provided values win.
-    fn enrich_ip(&self, readers: &GeoReaders, ip_u128: u128, is_src: bool, rec: &mut FlowRecord) {
+    /// MMDB fields for one IP, side-agnostic (caller picks src/dst).
+    /// Locks readers briefly; returns default when geoip is disabled.
+    pub(crate) fn ip_fields(&self, ip_u128: u128) -> IpFields {
+        let readers = self.readers.read().unwrap();
+        if readers.asn.is_empty() && readers.country.is_empty() {
+            return IpFields::default();
+        }
+        self.ip_fields_in(&readers, ip_u128)
+    }
+
+    /// Lookup half of `enrich_ip`: resolve one IP against the readers and
+    /// intern names, returning raw field values (0 = unset).
+    fn ip_fields_in(&self, readers: &GeoReaders, ip_u128: u128) -> IpFields {
+        let mut f = IpFields::default();
         let ip = u128_to_ip(ip_u128);
         for g in readers.asn.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(a)) = g.r.lookup::<Option<AsnRecord>>(ip) {
-                self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let asn = a.asn.unwrap_or(0) as u32;
-                let org = a.organization.map(|o| self.orgs.intern(&o)).unwrap_or(0);
-                if is_src {
-                    if rec.src_asn == 0 && asn != 0 {
-                        rec.src_asn = asn;
-                    }
-                    if rec.src_org == 0 && org != 0 {
-                        rec.src_org = org;
-                    }
-                } else {
-                    if rec.dst_asn == 0 && asn != 0 {
-                        rec.dst_asn = asn;
-                    }
-                    if rec.dst_org == 0 && org != 0 {
-                        rec.dst_org = org;
-                    }
-                }
+                self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
+                f.asn = a.asn.unwrap_or(0) as u32;
+                f.org = a.organization.map(|o| self.orgs.intern(&o)).unwrap_or(0);
                 break;
             }
         }
         for g in readers.country.iter().filter(|g| g.serves(&ip)) {
             if let Ok(Some(c)) = g.r.lookup::<Option<CountryRecord>>(ip) {
-                self.metrics.mmdb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let packed = country_pack(c.iso_code());
-                if packed != 0 {
-                    if is_src && rec.src_country == 0 {
-                        rec.src_country = packed;
-                    } else if !is_src && rec.dst_country == 0 {
-                        rec.dst_country = packed;
-                    }
-                }
+                self.metrics.mmdb_hits.fetch_add(1, Ordering::Relaxed);
+                f.country = country_pack(c.iso_code());
                 // City-level geo — only *-city-*.mmdb databases carry these.
-                let city = c
+                f.city = c
                     .city_name()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(|s| self.cities.intern(s))
                     .unwrap_or(0);
-                let region = c
+                f.region = c
                     .region_name()
                     .map(|s| self.cities.intern(s))
                     .unwrap_or(0);
-                let lat = c
+                f.lat = c
                     .lat()
                     .map(|v| ((v + 90.0) * 100000.0).clamp(0.0, u32::MAX as f64) as u32)
                     .unwrap_or(0);
-                let lon = c
+                f.lon = c
                     .lon()
                     .map(|v| ((v + 180.0) * 100000.0).clamp(0.0, u32::MAX as f64) as u32)
                     .unwrap_or(0);
-                if is_src {
-                    if rec.src_city == 0 {
-                        rec.src_city = city;
-                    }
-                    if rec.src_region == 0 {
-                        rec.src_region = region;
-                    }
-                    if rec.src_lat == 0 {
-                        rec.src_lat = lat;
-                    }
-                    if rec.src_lon == 0 {
-                        rec.src_lon = lon;
-                    }
-                } else {
-                    if rec.dst_city == 0 {
-                        rec.dst_city = city;
-                    }
-                    if rec.dst_region == 0 {
-                        rec.dst_region = region;
-                    }
-                    if rec.dst_lat == 0 {
-                        rec.dst_lat = lat;
-                    }
-                    if rec.dst_lon == 0 {
-                        rec.dst_lon = lon;
-                    }
-                }
                 break;
             }
         }
+        f
     }
 
-    /// Enrich both endpoints of a record.
-    pub fn enrich(&self, rec: &mut FlowRecord) {
-        let readers = self.readers.read().unwrap();
-        if readers.asn.is_empty() && readers.country.is_empty() {
-            return;
+}
+
+/// Side-agnostic enrichment outcome for one IP: MMDB geo fields merged
+/// with table/HTTP enricher results (first-wins per field, 0 = unset).
+/// Cached per-IP by `HttpEnrichers` so ingest and flow reads don't
+/// repeat MMDB/table lookups for every record.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IpFields {
+    pub asn: u32,
+    /// Interned org id (0 = none).
+    pub org: u32,
+    /// Packed country code.
+    pub country: u16,
+    /// Interned city/region name ids.
+    pub city: u32,
+    pub region: u32,
+    /// Scaled lat/lon ((v+90|180)*1e5).
+    pub lat: u32,
+    pub lon: u32,
+}
+
+impl IpFields {
+    /// Write nonzero fields into unset record fields on one side.
+    fn apply(&self, rec: &mut FlowRecord, is_src: bool) {
+        let (asn_f, org_f, ctry_f, city_f, region_f, lat_f, lon_f) = if is_src {
+            (
+                &mut rec.src_asn,
+                &mut rec.src_org,
+                &mut rec.src_country,
+                &mut rec.src_city,
+                &mut rec.src_region,
+                &mut rec.src_lat,
+                &mut rec.src_lon,
+            )
+        } else {
+            (
+                &mut rec.dst_asn,
+                &mut rec.dst_org,
+                &mut rec.dst_country,
+                &mut rec.dst_city,
+                &mut rec.dst_region,
+                &mut rec.dst_lat,
+                &mut rec.dst_lon,
+            )
+        };
+        if *asn_f == 0 && self.asn != 0 {
+            *asn_f = self.asn;
         }
-        self.enrich_ip(&readers, rec.src_ip, true, rec);
-        self.enrich_ip(&readers, rec.dst_ip, false, rec);
+        if *org_f == 0 && self.org != 0 {
+            *org_f = self.org;
+        }
+        if *ctry_f == 0 && self.country != 0 {
+            *ctry_f = self.country;
+        }
+        if *city_f == 0 && self.city != 0 {
+            *city_f = self.city;
+        }
+        if *region_f == 0 && self.region != 0 {
+            *region_f = self.region;
+        }
+        if *lat_f == 0 && self.lat != 0 {
+            *lat_f = self.lat;
+        }
+        if *lon_f == 0 && self.lon != 0 {
+            *lon_f = self.lon;
+        }
+    }
+}
+
+/// Merge an enricher `LookupResult` into per-IP fields, first-wins per
+/// field — mirrors `apply_result`'s fill-unset precedence.
+fn merge_lookup(f: &mut IpFields, res: &LookupResult, orgs: &StringTable) {
+    if f.asn == 0 {
+        if let Some(a) = res.asn {
+            f.asn = a;
+        }
+    }
+    if f.org == 0 {
+        if let Some(o) = &res.org {
+            let id = orgs.intern(o);
+            if id != 0 {
+                f.org = id;
+            }
+        }
+    }
+    if f.country == 0 {
+        if let Some(c) = res.country {
+            if c != 0 {
+                f.country = c;
+            }
+        }
     }
 }
 
@@ -678,9 +737,12 @@ impl HttpEnricher {
     fn store(&self, key: PrefixKey, result: LookupResult, negative: bool) {
         let ttl = if negative { self.neg_ttl } else { self.ttl };
         let expires = crate::metrics::now_ms() + ttl.as_millis() as u64;
-        {
+        // Only queue keys that are new to the cache — TTL refreshes of an
+        // existing key must not grow `order` (it would leak unboundedly).
+        let is_new = {
             let mut g = self.cache.lock().unwrap();
-            if g.len() >= self.cap {
+            let is_new = !g.contains_key(&key);
+            if g.len() >= self.cap && is_new {
                 // FIFO evict ~10% to amortize.
                 let mut order = self.order.lock().unwrap();
                 for _ in 0..(self.cap / 10) {
@@ -690,8 +752,11 @@ impl HttpEnricher {
                 }
             }
             g.insert(key, CacheEntry { result, expires_ms: expires });
+            is_new
+        };
+        if is_new {
+            self.order.lock().unwrap().push_back(key);
         }
-        self.order.lock().unwrap().push_back(key);
         self.pending.lock().unwrap().remove(&key);
     }
 
@@ -768,34 +833,6 @@ impl HttpEnricher {
         Some(out)
     }
 
-    /// Apply a cached result to a record (fills only unset fields).
-    pub fn apply(&self, res: &LookupResult, orgs: &StringTable, rec: &mut FlowRecord, is_src: bool) {
-        apply_result(res, orgs, rec, is_src);
-    }
-}
-
-/// Fill unset asn/org/country fields from a lookup result.
-fn apply_result(res: &LookupResult, orgs: &StringTable, rec: &mut FlowRecord, is_src: bool) {
-        let (asn_f, org_f, ctry_f) = if is_src {
-            (&mut rec.src_asn, &mut rec.src_org, &mut rec.src_country)
-        } else {
-            (&mut rec.dst_asn, &mut rec.dst_org, &mut rec.dst_country)
-        };
-        if let Some(a) = res.asn {
-            if *asn_f == 0 {
-                *asn_f = a;
-            }
-        }
-        if let Some(o) = &res.org {
-            if *org_f == 0 {
-                *org_f = orgs.intern(o);
-            }
-        }
-        if let Some(c) = res.country {
-            if *ctry_f == 0 && c != 0 {
-                *ctry_f = c;
-            }
-        }
 }
 
 /// Minimal JSON dot-path: "$.a.b.c", "a.b.c", with numeric array indices.
@@ -1063,6 +1100,20 @@ struct EnricherSet {
     tables: Vec<Arc<TableEnricher>>,
 }
 
+/// TTL for merged per-IP enrichment results. Short enough that table
+/// refreshes, HTTP enricher TTLs and MMDB swaps propagate quickly;
+/// long enough that repeated IPs (the common case) never re-lookup.
+const IP_CACHE_TTL_MS: u64 = 120_000;
+/// Bound on cached IPs (~30MB worst case at ~110B/entry).
+const IP_CACHE_MAX: usize = 262_144;
+
+struct IpCacheEntry {
+    fields: IpFields,
+    /// MmdbGeo generation at compute time — a geo swap invalidates.
+    geo_gen: u64,
+    expires_ms: u64,
+}
+
 /// Owns all enrichers + the background lookup worker. `set` is an
 /// `Arc`-swapped snapshot so reloads are race-free: in-flight lookups keep
 /// their old enricher, new flows see the new set.
@@ -1072,6 +1123,10 @@ pub struct HttpEnrichers {
     tx: tokio::sync::mpsc::Sender<(Arc<HttpEnricher>, PrefixKey)>,
     metrics: Arc<Metrics>,
     orgs: Arc<StringTable>,
+    /// Merged per-IP enrichment (geo+tables+http cached results) — turns
+    /// per-flow MMDB/table lookups into one hashmap hit per IP.
+    ip_cache: RwLock<HashMap<u128, IpCacheEntry>>,
+    ip_order: Mutex<VecDeque<u128>>,
 }
 
 fn build_set(cfgs: &[EnricherConfig]) -> anyhow::Result<EnricherSet> {
@@ -1112,17 +1167,23 @@ impl HttpEnrichers {
             tx,
             metrics,
             orgs,
+            ip_cache: RwLock::new(HashMap::new()),
+            ip_order: Mutex::new(VecDeque::new()),
         })
     }
 
     /// Hot-reload: rebuild the enricher set from new config (SIGHUP).
     /// In-flight HTTP lookups complete against the old set harmlessly.
+    /// The per-IP cache is dropped — merged results embed the old set's
+    /// table/http output.
     pub fn reload(&self, cfgs: &[EnricherConfig]) -> anyhow::Result<()> {
         let set = Arc::new(build_set(cfgs)?);
         for t in &set.tables {
             t.spawn_refresh();
         }
         *self.set.write().unwrap() = set;
+        self.ip_cache.write().unwrap().clear();
+        self.ip_order.lock().unwrap().clear();
         tracing::info!("enrichers reloaded");
         Ok(())
     }
@@ -1137,30 +1198,73 @@ impl HttpEnrichers {
         s.http.len() + s.tables.len()
     }
 
-    /// Ingest-path hook: apply cached/table results and enqueue misses.
-    /// Called per flow record, per endpoint.
-    pub fn enrich_record(&self, rec: &mut FlowRecord) {
-        let set = self.set.read().unwrap().clone();
-        for (ip_u128, is_src) in [(rec.src_ip, true), (rec.dst_ip, false)] {
-            let ip = u128_to_ip(ip_u128);
-            // Table enrichers: synchronous, exact LPM, fill unset fields.
-            for t in &set.tables {
-                if let Some(res) = t.lookup(ip_u128) {
-                    self.metrics.table_hits.fetch_add(1, Ordering::Relaxed);
-                    apply_result(&res, &self.orgs, rec, is_src);
-                }
-            }
-            // HTTP enrichers: cache hit applies, miss enqueues.
-            for e in &set.http {
-                if let Some(res) = e.cached(ip) {
-                    self.metrics.http_hits.fetch_add(1, Ordering::Relaxed);
-                    e.apply(&res, &self.orgs, rec, is_src);
-                } else {
-                    self.metrics.http_misses.fetch_add(1, Ordering::Relaxed);
-                    e.enqueue(ip, &self.tx);
+    /// Ingest/query-path hook: geo + table + cached-HTTP enrichment per
+    /// endpoint, backed by the per-IP cache. Called per flow record.
+    pub fn enrich_record(&self, rec: &mut FlowRecord, geo: &MmdbGeo) {
+        let src = self.ip_fields(rec.src_ip, geo);
+        src.apply(rec, true);
+        let dst = self.ip_fields(rec.dst_ip, geo);
+        dst.apply(rec, false);
+    }
+
+    /// Merged enrichment fields for one IP: MMDB geo + table lookups +
+    /// cached HTTP results, cached for IP_CACHE_TTL_MS. Cache misses
+    /// compute live — which also enqueues HTTP backend lookups — then
+    /// store the merged outcome.
+    fn ip_fields(&self, ip_u128: u128, geo: &MmdbGeo) -> IpFields {
+        let now = crate::metrics::now_ms();
+        let gen = geo.generation();
+        {
+            let g = self.ip_cache.read().unwrap();
+            if let Some(e) = g.get(&ip_u128) {
+                if e.expires_ms > now && e.geo_gen == gen {
+                    return e.fields;
                 }
             }
         }
+        let mut f = geo.ip_fields(ip_u128);
+        let ip = u128_to_ip(ip_u128);
+        let set = self.set.read().unwrap().clone();
+        for t in &set.tables {
+            if let Some(res) = t.lookup(ip_u128) {
+                self.metrics.table_hits.fetch_add(1, Ordering::Relaxed);
+                merge_lookup(&mut f, &res, &self.orgs);
+            }
+        }
+        for e in &set.http {
+            if let Some(res) = e.cached(ip) {
+                self.metrics.http_hits.fetch_add(1, Ordering::Relaxed);
+                merge_lookup(&mut f, &res, &self.orgs);
+            } else {
+                self.metrics.http_misses.fetch_add(1, Ordering::Relaxed);
+                e.enqueue(ip, &self.tx);
+            }
+        }
+        // Store: bounded FIFO. Refresh of a live key keeps its original
+        // queue slot (no order-queue growth on TTL refreshes).
+        let mut g = self.ip_cache.write().unwrap();
+        let is_new = !g.contains_key(&ip_u128);
+        if is_new && g.len() >= IP_CACHE_MAX {
+            let mut order = self.ip_order.lock().unwrap();
+            for _ in 0..(IP_CACHE_MAX / 10) {
+                if let Some(old) = order.pop_front() {
+                    g.remove(&old);
+                }
+            }
+        }
+        g.insert(
+            ip_u128,
+            IpCacheEntry {
+                fields: f,
+                geo_gen: gen,
+                expires_ms: now + IP_CACHE_TTL_MS,
+            },
+        );
+        drop(g);
+        if is_new {
+            self.ip_order.lock().unwrap().push_back(ip_u128);
+        }
+        f
     }
 
     /// Background worker: performs HTTP lookups and fills caches.
@@ -1189,6 +1293,7 @@ impl HttpEnrichers {
         let s = self.set.read().unwrap();
         serde_json::json!({
             "enabled": self.enabled(),
+            "ip_cache_entries": self.ip_cache.read().unwrap().len(),
             "backends": s.http.iter().map(|e| serde_json::json!({
                 "name": e.name,
                 "type": "http",
@@ -1371,14 +1476,15 @@ impl PtrWorker {
     }
 }
 
-/// Convenience: apply all synchronous enrichment to a record.
+/// Convenience: apply all synchronous enrichment to a record. Per-IP
+/// results are cached inside `HttpEnrichers` (geo generation + TTL
+/// guarded), so repeated IPs cost one hashmap hit.
 pub fn enrich_record(
     rec: &mut FlowRecord,
     geo: &MmdbGeo,
     http: &HttpEnrichers,
 ) {
-    geo.enrich(rec);
-    http.enrich_record(rec);
+    http.enrich_record(rec, geo);
 }
 
 #[cfg(test)]
@@ -1503,6 +1609,7 @@ route: 9.9.9.0/24 origin: AS13335
             orgs: Arc::new(StringTable::open(dir.path().join("orgs.txt")).unwrap()),
             cities: Arc::new(StringTable::open(dir.path().join("cities.txt")).unwrap()),
             metrics: Arc::new(Metrics::default()),
+            gen: std::sync::atomic::AtomicU64::new(0),
         };
         geo.swap(&cfg);
         assert!(!geo.files_changed(&cfg));
@@ -1521,5 +1628,44 @@ route: 9.9.9.0/24 origin: AS13335
         assert!(!geo.files_changed(&cfg));
         std::fs::write(&db, b"v3").unwrap();
         assert!(geo.files_changed(&cfg));
+    }
+
+    fn bare_geo(dir: &std::path::Path) -> MmdbGeo {
+        MmdbGeo {
+            readers: RwLock::new(GeoReaders::default()),
+            stamps: RwLock::new(HashMap::new()),
+            orgs: Arc::new(StringTable::open(dir.join("orgs.txt")).unwrap()),
+            cities: Arc::new(StringTable::open(dir.join("cities.txt")).unwrap()),
+            metrics: Arc::new(Metrics::default()),
+            gen: AtomicU64::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn ip_cache_reuses_and_invalidates_on_geo_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let geo = bare_geo(dir.path());
+        let http = HttpEnrichers::new(
+            &[],
+            Arc::new(Metrics::default()),
+            geo.orgs.clone(),
+        )
+        .unwrap();
+        let mut f = FlowRecord::default();
+        f.src_ip = ip_to_u128(&"10.1.2.3".parse::<IpAddr>().unwrap());
+        f.dst_ip = ip_to_u128(&"2001:db8::1".parse::<IpAddr>().unwrap());
+
+        http.enrich_record(&mut f, &geo);
+        assert_eq!(http.status()["ip_cache_entries"], 2);
+        // Repeat enrichment of the same IPs: cache hits, no growth.
+        http.enrich_record(&mut f, &geo);
+        http.enrich_record(&mut f, &geo);
+        assert_eq!(http.status()["ip_cache_entries"], 2);
+
+        // MMDB reader swap bumps the generation → cached entries are
+        // stale and recomputed (count stays bounded at 2 IPs).
+        geo.swap(&GeoIpConfig::default());
+        http.enrich_record(&mut f, &geo);
+        assert_eq!(http.status()["ip_cache_entries"], 2);
     }
 }

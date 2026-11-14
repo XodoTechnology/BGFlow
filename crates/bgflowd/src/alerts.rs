@@ -16,6 +16,42 @@ use std::time::Duration;
 /// (alert_idx, group_key) -> last fire time ms.
 type FiredMap = HashMap<(usize, u128), u64>;
 
+/// Webhook delivery outcome for one alert name.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct HookStat {
+    pub last_ok_ms: u64,
+    pub last_err_ms: u64,
+    pub last_err: String,
+    pub failures: u32,
+}
+
+/// Shared alert runtime state — fired/suppression map plus webhook
+/// delivery stats, exposed to the API for the alerts status view.
+#[derive(Default)]
+pub struct AlertRuntime {
+    pub fired: Mutex<FiredMap>,
+    pub hooks: Mutex<HashMap<String, HookStat>>,
+}
+
+impl AlertRuntime {
+    /// Drop fired entries older than the cooldown horizon — past that
+    /// age they can no longer suppress a refire, so they're dead weight.
+    /// Without this the map grows for the daemon's lifetime.
+    pub fn gc_fired(&self, cooldown_ms: u64, now: u64) {
+        self.fired
+            .lock()
+            .unwrap()
+            .retain(|_, t| now.saturating_sub(*t) < cooldown_ms);
+    }
+}
+
+/// Cap on per-alert group cardinality during evaluation. High-cardinality
+/// group_by dims (src_ip over a busy window) would otherwise build
+/// multi-million-entry maps per rule per eval tick.
+const GROUP_MAP_MAX: usize = 262_144;
+/// Webhook delivery attempts before giving up (exponential backoff).
+const HOOK_ATTEMPTS: u32 = 3;
+
 /// Build a RollupFilter from an AlertConfig's optional filter fields.
 fn alert_filter(ctx: &Ctx, a: &AlertConfig) -> Result<RollupFilter, String> {
     let mut f = RollupFilter::default();
@@ -91,14 +127,18 @@ fn op_holds(op: &str, value: f64, threshold: f64) -> bool {
 /// Spawn the evaluation loop. Runs until the process exits.
 /// `cfg` is shared so admin reload / SIGHUP can swap rules live; the loop
 /// re-reads it every tick (1s granularity, eval gated by eval_secs).
-pub async fn run(cfg: Arc<std::sync::RwLock<AlertsConfig>>, ctx: Ctx, metrics: Arc<Metrics>) {
+pub async fn run(
+    cfg: Arc<std::sync::RwLock<AlertsConfig>>,
+    ctx: Ctx,
+    metrics: Arc<Metrics>,
+    rt: Arc<AlertRuntime>,
+) {
     let n = cfg.read().unwrap().items.len();
     if n == 0 {
         tracing::info!("alerts: no rules configured (reloadable via SIGHUP/admin API)");
     } else {
         tracing::info!("alerts: {} rule(s) configured", n);
     }
-    let fired: Arc<Mutex<FiredMap>> = Arc::new(Mutex::new(HashMap::new()));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -114,7 +154,7 @@ pub async fn run(cfg: Arc<std::sync::RwLock<AlertsConfig>>, ctx: Ctx, metrics: A
             continue;
         }
         last_run = now;
-        evaluate(&snap, &ctx, &metrics, &fired, &client).await;
+        evaluate(&snap, &ctx, &metrics, &rt, &client).await;
     }
 }
 
@@ -122,10 +162,11 @@ async fn evaluate(
     cfg: &AlertsConfig,
     ctx: &Ctx,
     metrics: &Metrics,
-    fired: &Arc<Mutex<FiredMap>>,
+    rt: &Arc<AlertRuntime>,
     client: &reqwest::Client,
 ) {
     let now = now_ms();
+    rt.gc_fired(cfg.cooldown_secs.max(1).saturating_mul(1000), now);
     for (idx, a) in cfg.items.iter().enumerate() {
         if a.name.is_empty() {
             continue;
@@ -161,10 +202,10 @@ async fn evaluate(
             n2.push(mcol);
             n2.sort_unstable();
             n2.dedup();
-            eval_alert(ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &n2, a, idx, cfg, metrics, fired, client).await;
+            eval_alert(ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &n2, a, idx, cfg, metrics, rt, client).await;
             continue;
         }
-        eval_alert(ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &needed, a, idx, cfg, metrics, fired, client).await;
+        eval_alert(ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &needed, a, idx, cfg, metrics, rt, client).await;
     }
 }
 
@@ -184,17 +225,26 @@ async fn eval_alert(
     idx: usize,
     cfg: &AlertsConfig,
     metrics: &Metrics,
-    fired: &Arc<Mutex<FiredMap>>,
+    rt: &Arc<AlertRuntime>,
     client: &reqwest::Client,
 ) {
     // Per group: (current_window_total, previous_window_total)
     let mut sums: HashMap<u128, (u64, u64)> = HashMap::new();
+    let mut group_overflow = false;
     let cur_start = now.saturating_sub(window_ms);
+    // Share the global scan budget with API queries.
+    let _scan = ctx.scan_sem.clone().acquire_owned().await.unwrap();
     let _ = query::rollup_scan(ctx, set, from, now, needed, |r| {
         if !f.matches(r) {
             return std::ops::ControlFlow::Continue(());
         }
         let key = group_dim.map(|d| query::dim_key(d, r)).unwrap_or(0);
+        // Bound group cardinality — beyond the cap, new keys are skipped
+        // (existing keys keep accumulating) rather than growing unbounded.
+        if group_dim.is_some() && !sums.contains_key(&key) && sums.len() >= GROUP_MAP_MAX {
+            group_overflow = true;
+            return std::ops::ControlFlow::Continue(());
+        }
         let v = r.v(mcol) as u64;
         let e = sums.entry(key).or_default();
         if r.bucket_ms() + set.period_ms() > cur_start {
@@ -204,6 +254,13 @@ async fn eval_alert(
         }
         std::ops::ControlFlow::Continue(())
     });
+    if group_overflow {
+        tracing::warn!(
+            "alert '{}': group_by cardinality exceeded {} — light groups dropped this eval",
+            a.name,
+            GROUP_MAP_MAX
+        );
+    }
 
     let cooldown = cfg.cooldown_secs.max(1).saturating_mul(1000);
     let w_secs = a.window_secs.max(1);
@@ -231,11 +288,11 @@ async fn eval_alert(
 
     for (key, value, prev_rate, change_pct) in to_fire {
         let fkey = (idx, key);
-        let last = fired.lock().unwrap().get(&fkey).copied().unwrap_or(0);
+        let last = rt.fired.lock().unwrap().get(&fkey).copied().unwrap_or(0);
         if now.saturating_sub(last) < cooldown {
             continue;
         }
-        fired.lock().unwrap().insert(fkey, now);
+        rt.fired.lock().unwrap().insert(fkey, now);
         metrics.alerts_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let key_json = group_dim
@@ -265,9 +322,77 @@ async fn eval_alert(
             });
             let c = client.clone();
             let u = url.clone();
+            let name = a.name.clone();
+            let rt2 = rt.clone();
             tokio::spawn(async move {
-                let _ = c.post(u).json(&body).send().await;
+                // Bounded retries with backoff; delivery outcome is
+                // recorded per alert name for the status endpoint.
+                let mut last_err = String::new();
+                for attempt in 0..HOOK_ATTEMPTS {
+                    if attempt > 0 {
+                        // ~1s, ~2s backoff between the 3 delivery attempts.
+                        tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                    }
+                    match c.post(&u).json(&body).send().await {
+                        Ok(r) if r.status().is_success() => {
+                            rt2.hooks.lock().unwrap().entry(name.clone()).or_default().last_ok_ms = now_ms();
+                            return;
+                        }
+                        Ok(r) => last_err = format!("HTTP {}", r.status()),
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+                let mut g = rt2.hooks.lock().unwrap();
+                let st = g.entry(name.clone()).or_default();
+                st.last_err_ms = now_ms();
+                st.last_err = last_err;
+                st.failures += 1;
+                tracing::warn!("alert '{}': webhook delivery failed: {}", name, st.last_err);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_and_ops() {
+        assert_eq!(rate_of("bytes", 1000, 10), 100.0);
+        assert_eq!(rate_of("mbps", 1_000_000, 1), 8.0);
+        assert!(op_holds("gt", 5.0, 4.0));
+        assert!(!op_holds("gt", 4.0, 4.0));
+        assert!(op_holds("gte", 4.0, 4.0));
+        assert!(op_holds("lt", 3.0, 4.0));
+        assert!(op_holds("lte", 4.0, 4.0));
+        assert!(op_holds("bogus", 5.0, 4.0)); // defaults to gt
+    }
+
+    #[test]
+    fn metric_col_mapping() {
+        use bgflow_store::schema::rollup_idx as ix;
+        assert_eq!(metric_col("bytes"), ix::BYTES);
+        assert_eq!(metric_col("packets"), ix::PACKETS);
+        assert_eq!(metric_col("pps"), ix::PACKETS);
+        assert_eq!(metric_col("flows"), ix::FLOWS);
+        assert_eq!(metric_col("mbps"), ix::BYTES);
+    }
+
+    #[test]
+    fn fired_gc_drops_only_expired() {
+        let rt = AlertRuntime::default();
+        let now = 1_000_000u64;
+        {
+            let mut m = rt.fired.lock().unwrap();
+            m.insert((0, 1), now - 500); // within cooldown → kept
+            m.insert((0, 2), now - 5000); // expired → dropped
+            m.insert((1, 3), now); // fresh → kept
+        }
+        rt.gc_fired(1000, now);
+        let m = rt.fired.lock().unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(m.contains_key(&(0, 1)));
+        assert!(m.contains_key(&(1, 3)));
     }
 }

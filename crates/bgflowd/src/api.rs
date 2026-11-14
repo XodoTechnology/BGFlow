@@ -47,9 +47,23 @@ pub struct AppState {
     /// Incremental per-bucket aggregates — serves unfiltered in-window
     /// dashboard queries without touching segment files.
     pub hot: Arc<RwLock<crate::hot::HotStats>>,
+    /// Alert suppression state + webhook delivery stats.
+    pub alert_rt: Arc<crate::alerts::AlertRuntime>,
+    /// Live flow broadcast — source for the /flows/stream SSE tail.
+    pub live_tx: tokio::sync::broadcast::Sender<bgflow_types::FlowRecord>,
 }
 
 type Q = HashMap<String, String>;
+
+/// Queue for a global segment-scan slot — heavy endpoints wait here
+/// rather than running unbounded concurrent scans.
+async fn scan_permit(ctx: &query::Ctx) -> tokio::sync::OwnedSemaphorePermit {
+    ctx.scan_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("scan semaphore closed")
+}
 
 fn err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -399,6 +413,100 @@ async fn stream(
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))
 }
 
+/// SSE tail of incoming flows — each record is broadcast by the writer
+/// as it arrives (pre-flush), filtered by the same params as /flows.
+/// Lagged clients skip bursts rather than stalling ingest.
+async fn flow_stream(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<Q>,
+) -> Result<
+    Sse<tokio_stream::wrappers::ReceiverStream<Result<axum::response::sse::Event, std::convert::Infallible>>>,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    #[derive(Default)]
+    struct F {
+        src: Option<(u128, u128)>,
+        dst: Option<(u128, u128)>,
+        proto: Option<u8>,
+        sport: Option<u16>,
+        dport: Option<u16>,
+    }
+    impl F {
+        fn matches(&self, r: &bgflow_types::FlowRecord) -> bool {
+            if let Some((b, m)) = self.src {
+                if (r.src_ip & m) != b {
+                    return false;
+                }
+            }
+            if let Some((b, m)) = self.dst {
+                if (r.dst_ip & m) != b {
+                    return false;
+                }
+            }
+            if let Some(p) = self.proto {
+                if r.protocol != p {
+                    return false;
+                }
+            }
+            if let Some(p) = self.sport {
+                if r.src_port != p {
+                    return false;
+                }
+            }
+            if let Some(p) = self.dport {
+                if r.dst_port != p {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+    let mut f = F::default();
+    if let Some(s) = q.get("src") {
+        f.src = Some(query::parse_ip_filter(s).ok_or_else(|| err("bad src"))?);
+    }
+    if let Some(s) = q.get("dst") {
+        f.dst = Some(query::parse_ip_filter(s).ok_or_else(|| err("bad dst"))?);
+    }
+    if let Some(s) = q.get("proto") {
+        f.proto = Some(parse_proto(s)?);
+    }
+    if let Some(s) = q.get("sport") {
+        f.sport = Some(s.parse().map_err(|_| err("bad sport"))?);
+    }
+    if let Some(s) = q.get("dport") {
+        f.dport = Some(s.parse().map_err(|_| err("bad dport"))?);
+    }
+
+    let mut rx = st.live_tx.subscribe();
+    let ctx = st.ctx.clone();
+    let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(rec) => {
+                    if !f.matches(&rec) {
+                        continue;
+                    }
+                    match Event::default().json_data(query::flow_json(&ctx, &rec)) {
+                        Ok(ev) => {
+                            if tx.send(Ok(ev)).await.is_err() {
+                                break; // client gone
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    Ok(Sse::new(tokio_stream::wrappers::ReceiverStream::new(out_rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping")))
+}
+
 async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -410,7 +518,7 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
 async fn flows(
     State(st): State<Arc<AppState>>,
     Query(q): Query<Q>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
     // Probe one row past the page size — `has_more` tells the UI whether
     // a Next page exists without a separate count scan.
@@ -419,11 +527,34 @@ async fn flows(
         .and_then(|s| s.parse().ok())
         .unwrap_or(500)
         .min(10_000);
+    // Keyset cursor ("<segment>:<row>") resumes where the previous page
+    // stopped — deep pages don't re-scan skipped rows. `offset` remains
+    // for backwards compatibility but is ignored when `cursor` is given.
+    let resume = if let Some(c) = q.get("cursor") {
+        let (seg, row) = c
+            .rsplit_once(':')
+            .and_then(|(s, r)| r.parse::<u64>().ok().map(|r| (s.to_string(), r)))
+            .ok_or_else(|| err("bad cursor"))?;
+        if seg.is_empty() || seg.contains(['/', '\\']) {
+            return Err(err("bad cursor"));
+        }
+        Some((seg, row))
+    } else {
+        None
+    };
     let mut fq = FlowQuery {
         from_ms: from,
         to_ms: to,
         limit: want + 1,
-        offset: q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0),
+        offset: if resume.is_some() {
+            0
+        } else {
+            q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0)
+        },
+        resume,
+        // Probe row (limit = want+1) decides has_more; the cursor still
+        // resumes right after the `want`-th returned row.
+        cursor_after: want,
         newest_first: q.get("order").map(|s| s != "asc").unwrap_or(true),
         ..Default::default()
     };
@@ -494,8 +625,9 @@ async fn flows(
         }
     }
 
-    let mut recs = query::flows(&st.ctx, &fq).map_err(|e| err(e.to_string()))?;
-    let has_more = recs.len() > want;
+    let _scan = scan_permit(&st.ctx).await;
+    let (mut recs, next_cursor) = query::flows(&st.ctx, &fq).map_err(|e| err(e.to_string()))?;
+    let has_more = recs.len() > want || next_cursor.is_some();
     recs.truncate(want);
     // Enrich-at-read: fills org/country/asn fields the ingest-time pipeline
     // missed (pre-enrichment data, cold caches, table lookups).
@@ -504,15 +636,27 @@ async fn flows(
     }
 
     if q.get("format").map(|s| s.as_str()) == Some("csv") {
-        return csv_response(&st.ctx, &recs);
+        let s = csv_string(&st.ctx, &recs);
+        // raw=1 → a real text/csv body for downloads/scripts; default
+        // stays JSON {"csv": ...} for the UI's fetch+blob path.
+        if q.get("raw").map(|s| s.as_str()) == Some("1") {
+            return Ok((
+                [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+                s,
+            )
+                .into_response());
+        }
+        return Ok(Json(serde_json::json!({"count": recs.len(), "csv": s})).into_response());
     }
     let out: Vec<_> = recs.iter().map(|f| query::flow_json(&st.ctx, f)).collect();
     Ok(Json(serde_json::json!({
         "count": out.len(),
         "offset": fq.offset,
         "has_more": has_more,
+        "next_cursor": next_cursor,
         "flows": out,
-    })))
+    }))
+    .into_response())
 }
 
 /// GET /api/v1/geo — aggregate recent raw flows into lat/lon bubbles for
@@ -542,35 +686,81 @@ async fn geo(
     }
     let mut cells: std::collections::HashMap<(i32, i32), Cell> = std::collections::HashMap::new();
     let infos = st.ctx.flow_index.read().unwrap().clone();
-    bgflow_store::for_each_segment_info::<bgflow_types::FlowRecord>(
+    let _scan = scan_permit(&st.ctx).await;
+    // Column-subset decode: geo needs 11 of 40 columns — ~3-4x less
+    // decompression work than decode_all. Segments written under older
+    // schemas simply lack the geo columns (read as 0).
+    use bgflow_store::schema::raw_idx as ix;
+    const GEO_COLS: &[usize] = &[
+        ix::TS_MS,
+        ix::BYTES,
+        ix::PACKETS,
+        ix::SRC_COUNTRY,
+        ix::DST_COUNTRY,
+        ix::SRC_CITY,
+        ix::DST_CITY,
+        ix::SRC_LAT,
+        ix::DST_LAT,
+        ix::SRC_LON,
+        ix::DST_LON,
+    ];
+    bgflow_store::for_each_segment_cols(
         &infos,
         bgflow_types::FlowRecord::schema(),
+        GEO_COLS,
         from,
         to,
         false,
-        |scan| {
-            for i in 0..scan.rows {
-                let f = bgflow_types::FlowRecord::from_scan(scan, i);
-                if f.ts_ms < from || f.ts_ms > to {
+        |columns, rows| {
+            let mut arr: Vec<Option<&bgflow_store::ColumnData>> =
+                vec![None; bgflow_types::FlowRecord::schema().columns.len()];
+            for (ci, data) in columns {
+                arr[*ci] = Some(data);
+            }
+            let get = |ci: usize, i: usize| -> u128 {
+                arr.get(ci)
+                    .and_then(|o| *o)
+                    .map(|c| c.value_at(i))
+                    .unwrap_or(0)
+            };
+            for i in 0..rows {
+                let ts = get(ix::TS_MS, i) as u64;
+                if ts < from || ts > to {
                     continue;
                 }
+                let bytes = get(ix::BYTES, i) as u64;
+                let packets = get(ix::PACKETS, i) as u64;
                 // Weight each endpoint's geo by its share — simpler: count
                 // dst geo for outbound-ish and src for the rest? Use dst
                 // when present else src (matches "where traffic goes").
-                let (lat, lon, city, cc, is_dst) =
-                    if f.dst_lat != 0 || f.dst_lon != 0 || f.dst_city != 0 {
-                        (f.dst_lat, f.dst_lon, f.dst_city, f.dst_country, true)
-                    } else {
-                        (f.src_lat, f.src_lon, f.src_city, f.src_country, false)
-                    };
+                let dst_lat = get(ix::DST_LAT, i) as u32;
+                let dst_lon = get(ix::DST_LON, i) as u32;
+                let dst_city = get(ix::DST_CITY, i) as u32;
+                let (lat, lon, city, cc, is_dst) = if dst_lat != 0 || dst_lon != 0 || dst_city != 0 {
+                    (
+                        dst_lat,
+                        dst_lon,
+                        dst_city,
+                        get(ix::DST_COUNTRY, i) as u16,
+                        true,
+                    )
+                } else {
+                    (
+                        get(ix::SRC_LAT, i) as u32,
+                        get(ix::SRC_LON, i) as u32,
+                        get(ix::SRC_CITY, i) as u32,
+                        get(ix::SRC_COUNTRY, i) as u16,
+                        false,
+                    )
+                };
                 if lat == 0 && lon == 0 {
                     continue;
                 }
                 let la = (lat as f64 / 100000.0 - 90.0).round() as i32;
                 let lo = (lon as f64 / 100000.0 - 180.0).round() as i32;
                 let c = cells.entry((la, lo)).or_default();
-                c.bytes += f.bytes;
-                c.packets += f.packets;
+                c.bytes += bytes;
+                c.packets += packets;
                 c.flows += 1;
                 c.lat_sum += lat as f64 / 100000.0 - 90.0;
                 c.lon_sum += lon as f64 / 100000.0 - 180.0;
@@ -581,12 +771,12 @@ async fn geo(
                     if c.dst_cc == 0 {
                         c.dst_cc = cc;
                     }
-                    c.dst_w += f.bytes;
+                    c.dst_w += bytes;
                 } else {
                     if c.src_cc == 0 {
                         c.src_cc = cc;
                     }
-                    c.src_w += f.bytes;
+                    c.src_w += bytes;
                 }
             }
             std::ops::ControlFlow::Continue(())
@@ -627,6 +817,7 @@ async fn geo(
         "points": pts,
         "from": from,
         "to": to,
+        "set": "flows",
     })))
 }
 
@@ -638,10 +829,7 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn csv_response(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // CSV export — returned as JSON {"csv": "..."} so the UI can download it
-    // without a second content-type path; API clients can also request
-    // format=csv&raw=1 for a text body (see below).
+fn csv_string(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) -> String {
     let mut s = String::from(
         "ts,src_ip,dst_ip,src_port,dst_port,protocol,bytes,packets,exporter,src_asn,dst_asn,src_city,dst_city,src_region,dst_region,src_lat,src_lon,dst_lat,dst_lon,label_id\n",
     );
@@ -673,7 +861,7 @@ fn csv_response(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) -> Result<J
             f.label_id,
         ));
     }
-    Ok(Json(serde_json::json!({"count": recs.len(), "csv": s})))
+    s
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -808,9 +996,11 @@ async fn summary(
             "from": from, "to": to,
             "bytes": v.total.bytes, "packets": v.total.packets, "flows": v.total.flows,
             "by_protocol": protos,
+            "set": "hot",
         })));
     }
     let needed = query::rollup_needed(&f, &["proto"]);
+    let _scan = scan_permit(&st.ctx).await;
     let (total, by_proto) = query::rollup_scan_par(
         &st.ctx,
         set,
@@ -853,6 +1043,7 @@ async fn summary(
         "from": from, "to": to,
         "bytes": total.bytes, "packets": total.packets, "flows": total.flows,
         "by_protocol": protos,
+        "set": set_name(set),
     })))
 }
 
@@ -903,6 +1094,7 @@ async fn overview(
     // per worker; each top dim emits (dim_idx, key) pairs routed into
     // disjoint shard maps — exact top-N at one-map memory cost even for
     // the high-cardinality IP dims.
+    let _scan = scan_permit(&st.ctx).await;
     let (shards, acc) = query::rollup_scan_sharded(
         &st.ctx,
         set,
@@ -1059,6 +1251,7 @@ async fn overview(
         let span = to.saturating_sub(from);
         let pfrom = from.saturating_sub(span);
         let pneed = query::rollup_needed(&f, &[]);
+        let _scan = scan_permit(&st.ctx).await;
         let pt = query::rollup_scan_par(
             &st.ctx,
             set,
@@ -1239,6 +1432,7 @@ async fn matrix(
     let needed = query::rollup_needed(&f, &[sd, dd]);
     // Pair map can be large — key-sharded parallel aggregation keeps
     // memory at one global map's size while decoding in parallel.
+    let _scan = scan_permit(&st.ctx).await;
     let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
@@ -1285,6 +1479,13 @@ async fn matrix(
     })))
 }
 
+fn set_name(set: RollupSet) -> &'static str {
+    match set {
+        RollupSet::Minute => "minute",
+        RollupSet::Hourly => "hourly",
+    }
+}
+
 fn bucket_ms(s: Option<&str>) -> u64 {
     match s.unwrap_or("1m") {
         "1m" => 60_000,
@@ -1320,10 +1521,12 @@ async fn timeseries(
             })
             .collect();
         rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
-        return Ok(Json(serde_json::json!({"bucket_ms": hsize, "series": rows})));
+        return Ok(Json(serde_json::json!({"bucket_ms": hsize, "series": rows, "set": "hot"})));
     }
     let needed = query::rollup_needed(&f, &[]);
-    let buckets: HashMap<u64, Agg> = query::rollup_scan_par::<HashMap<u64, Agg>>(
+    let buckets: HashMap<u64, Agg> = {
+        let _scan = scan_permit(&st.ctx).await;
+        query::rollup_scan_par::<HashMap<u64, Agg>>(
         &st.ctx,
         set,
         from,
@@ -1342,7 +1545,8 @@ async fn timeseries(
         },
         |a, b| merge_agg_map(a, b),
     )
-    .map_err(|e| err(e.to_string()))?;
+    .map_err(|e| err(e.to_string()))?
+    };
 
     let mut rows: Vec<_> = buckets
         .into_iter()
@@ -1354,7 +1558,7 @@ async fn timeseries(
         })
         .collect();
     rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
-    Ok(Json(serde_json::json!({"bucket_ms": size, "series": rows})))
+    Ok(Json(serde_json::json!({"bucket_ms": size, "series": rows, "set": set_name(set)})))
 }
 
 const TOP_DIMS: &[&str] = &[
@@ -1417,6 +1621,7 @@ async fn top(
     // Full-cardinality dim map (ports/IPs can be huge) — key-sharded
     // parallel aggregation: memory stays at one map's size.
     let needed = query::rollup_needed(&f, &[by]);
+    let _scan = scan_permit(&st.ctx).await;
     let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
@@ -1456,7 +1661,10 @@ async fn top(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({"by": by, "set": match set { RollupSet::Minute => "minute", RollupSet::Hourly => "hourly" }, "items": out})))
+    Ok(Json(serde_json::json!({"by": by, "set": set_name(set), "items": out,
+        // Hourly rows mask IPs to /24·/48 — IP-dim top lists are approximate.
+        "approximate": set == RollupSet::Hourly && matches!(by, "src_ip" | "dst_ip"),
+    })))
 }
 
 async fn conversations(
@@ -1476,6 +1684,7 @@ async fn conversations(
             "src_ip", "dst_ip", "src_port", "dst_port", "proto", "src_asn", "dst_asn",
         ],
     );
+    let _scan = scan_permit(&st.ctx).await;
     let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
@@ -1524,7 +1733,13 @@ async fn conversations(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({"items": out})))
+    Ok(Json(serde_json::json!({
+        "items": out,
+        "set": set_name(set),
+        // Hourly rows mask IPs to /24·/48 — conversation endpoints are
+        // approximate at that granularity.
+        "approximate": set == RollupSet::Hourly,
+    })))
 }
 
 async fn exporters(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1886,6 +2101,59 @@ async fn enrichers(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(st.http_enrich.status())
 }
 
+/// Alert rules + live state: configured rules, currently-suppressed
+/// (recently fired) groups, and webhook delivery stats.
+async fn alerts_status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cfg = st.admin.alerts.read().unwrap().clone();
+    let now = crate::metrics::now_ms();
+    let fired = st.alert_rt.fired.lock().unwrap();
+    let rules: Vec<serde_json::Value> = cfg
+        .items
+        .iter()
+        .enumerate()
+        .map(|(idx, a)| {
+            // Groups currently inside cooldown for this rule.
+            let mut active: Vec<serde_json::Value> = fired
+                .iter()
+                .filter(|((i, _), _)| *i == idx)
+                .map(|((_, k), t)| {
+                    serde_json::json!({
+                        "group": a.group_by.as_deref().map(|d| query::format_key(&st.ctx, d, *k)),
+                        "last_fired_ms": t,
+                        "cooldown_remaining_ms": cfg.cooldown_secs.max(1).saturating_mul(1000).saturating_sub(now.saturating_sub(*t)),
+                    })
+                })
+                .collect();
+            active.sort_by_key(|v| v["last_fired_ms"].as_u64().unwrap_or(0));
+            serde_json::json!({
+                "name": a.name,
+                "metric": a.metric,
+                "op": a.op,
+                "threshold": a.threshold,
+                "window_secs": a.window_secs,
+                "group_by": a.group_by,
+                "granularity": a.granularity,
+                "active": active,
+            })
+        })
+        .collect();
+    let hooks: serde_json::Map<String, serde_json::Value> = st
+        .alert_rt
+        .hooks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+        .collect();
+    Json(serde_json::json!({
+        "eval_secs": cfg.eval_secs,
+        "cooldown_secs": cfg.cooldown_secs,
+        "webhook_configured": cfg.webhook_url.is_some(),
+        "rules": rules,
+        "webhook": hooks,
+    }))
+}
+
 /// Anomaly detection: per-key bytes-per-bucket series over the window;
 /// flags buckets whose value exceeds mean + `sigma`·stddev of the series.
 async fn anomalies(
@@ -1906,6 +2174,7 @@ async fn anomalies(
     // key -> bucket -> bytes. Flattened to (key, bucket) pairs so the
     // scan can run key-sharded in parallel; regrouped below. Each pair's
     // complete aggregate lives in exactly one shard.
+    let _scan = scan_permit(&st.ctx).await;
     let (shards, _) = query::rollup_scan_sharded(
         &st.ctx,
         set,
@@ -2012,7 +2281,13 @@ async fn anomalies(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({"by": by, "sigma": sigma, "items": items})))
+    Ok(Json(serde_json::json!({
+        "by": by,
+        "sigma": sigma,
+        "items": items,
+        "set": set_name(set),
+        "approximate": set == RollupSet::Hourly && matches!(by, "src_ip" | "dst_ip"),
+    })))
 }
 
 /// Traffic grouped by label (uses the label dimension).
@@ -2025,7 +2300,9 @@ async fn label_stats(
     let set = auto_rollup_set(&q, from, to, &f);
     let needed = query::rollup_needed(&f, &["label"]);
     // Label count is bounded by the ruleset — small state, parallel-safe.
-    let map: HashMap<u128, Agg> = query::rollup_scan_par::<HashMap<u128, Agg>>(
+    let map: HashMap<u128, Agg> = {
+        let _scan = scan_permit(&st.ctx).await;
+        query::rollup_scan_par::<HashMap<u128, Agg>>(
         &st.ctx,
         set,
         from,
@@ -2044,7 +2321,8 @@ async fn label_stats(
         },
         |a, b| merge_agg_map(a, b),
     )
-    .map_err(|e| err(e.to_string()))?;
+    .map_err(|e| err(e.to_string()))?
+    };
     let mut rows: Vec<(u128, Agg)> = map.into_iter().collect();
     rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
     let items: Vec<_> = rows
@@ -2057,7 +2335,7 @@ async fn label_stats(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({"items": items})))
+    Ok(Json(serde_json::json!({"items": items, "set": set_name(set)})))
 }
 
 /// Effective config for the UI settings view — secrets redacted.
@@ -2386,6 +2664,7 @@ async fn auth_logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
 /// {"auth":false,"open":true} when no auth is configured at all.
 async fn auth_me(
     State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     if st.auth.is_open() {
@@ -2397,7 +2676,7 @@ async fn auth_me(
     let authz = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    match st.auth.identity_from_headers(cookie, authz) {
+    match st.auth.identity_from_headers(peer.ip(), cookie, authz) {
         Some((user, role)) => Json(serde_json::json!({
             "user": user, "role": role.as_str(), "auth": true,
         }))
@@ -2670,6 +2949,7 @@ fn auth_exempt(path: &str) -> bool {
 
 async fn auth_mw(
     State(st): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -2692,7 +2972,9 @@ async fn auth_mw(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let ident = st.auth.identity_from_headers(cookie.as_deref(), authz.as_deref());
+    let ident = st
+        .auth
+        .identity_from_headers(peer.ip(), cookie.as_deref(), authz.as_deref());
 
     let Some((_user, role)) = ident else {
         // No WWW-Authenticate header: advertising Basic here makes browsers
@@ -2790,6 +3072,30 @@ async fn auth_mw(
 }
 
 /// Baseline security headers on every response.
+/// Per-path request count + summed handler time + 5xx tally, rendered
+/// into /metrics. Outermost app layer so auth rejections are counted too.
+async fn metrics_mw(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let t = Instant::now();
+    let resp = next.run(req).await;
+    let ms = t.elapsed().as_millis() as u64;
+    let mut m = st.metrics.http.lock().unwrap();
+    // Unknown paths (404s, scanners) must not grow the label set.
+    if m.contains_key(&path) || m.len() < 256 {
+        let e = m.entry(path).or_default();
+        e.count += 1;
+        e.total_ms += ms;
+        if resp.status().is_server_error() {
+            e.err5xx += 1;
+        }
+    }
+    resp
+}
+
 async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
@@ -2832,6 +3138,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .merge(
             Router::new()
                 .route("/api/v1/flows", get(flows))
+                .route("/api/v1/flows/stream", get(flow_stream))
                 .route("/api/v1/geo", get(geo))
                 .route("/api/v1/summary", get(summary))
                 .route("/api/v1/overview", get(overview))
@@ -2841,7 +3148,7 @@ pub fn router(st: Arc<AppState>) -> Router {
                 .route("/api/v1/conversations", get(conversations))
                 .route("/api/v1/anomalies", get(anomalies))
                 .route("/api/v1/label_stats", get(label_stats))
-                .layer(crate::qcache::SwrCacheLayer::new()),
+                .layer(crate::qcache::SwrCacheLayer::new(st.metrics.clone())),
         )
         .route("/api/v1/exporters", get(exporters))
         .route("/api/v1/exporters/:ip/name", post(exporter_rename))
@@ -2853,6 +3160,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/vlans", get(vlans))
         .route("/api/v1/labels", get(labels))
         .route("/api/v1/enrichers", get(enrichers))
+        .route("/api/v1/alerts", get(alerts_status))
         .route("/api/v1/asn", get(asn_lookup))
         .route("/api/v1/lookup", get(lookup))
         .route("/api/v1/config", get(config_view))
@@ -2882,7 +3190,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         // auth_mw so even 401/403 responses carry the baseline headers; CORS
         // is outermost so preflights bypass auth entirely.
         .layer(middleware::from_fn_with_state(st.clone(), auth_mw))
-        .layer(middleware::from_fn(security_headers));
+        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(st.clone(), metrics_mw));
 
     if cors_enabled {
         if cors_wildcard {

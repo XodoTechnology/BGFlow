@@ -46,7 +46,20 @@ pub struct Metrics {
     pub http_errors: AtomicU64,
     pub table_hits: AtomicU64,
     pub alerts_fired: AtomicU64,
+    /// SWR query-cache outcomes.
+    pub qcache_hit: AtomicU64,
+    pub qcache_stale: AtomicU64,
+    pub qcache_miss: AtomicU64,
+    /// Per-path HTTP stats: count, total handler ms, 5xx count.
+    pub http: Mutex<HashMap<String, HttpStat>>,
     pub exporters: Mutex<HashMap<IpAddr, ExporterStat>>,
+}
+
+#[derive(Debug, Default)]
+pub struct HttpStat {
+    pub count: u64,
+    pub total_ms: u64,
+    pub err5xx: u64,
 }
 
 impl Metrics {
@@ -95,6 +108,36 @@ impl Metrics {
         s.push_str(&format!("bgflow_enrich_table_hits_total {}\n", g(&self.table_hits)));
         s.push_str("# HELP bgflow_alerts_fired_total Alert rule fires\n# TYPE bgflow_alerts_fired_total counter\n");
         s.push_str(&format!("bgflow_alerts_fired_total {}\n", g(&self.alerts_fired)));
+        s.push_str("# HELP bgflow_qcache_hit_total Query-cache fresh hits\n# TYPE bgflow_qcache_hit_total counter\n");
+        s.push_str(&format!("bgflow_qcache_hit_total {}\n", g(&self.qcache_hit)));
+        s.push_str("# HELP bgflow_qcache_stale_total Query-cache stale serves (refresh spawned)\n# TYPE bgflow_qcache_stale_total counter\n");
+        s.push_str(&format!("bgflow_qcache_stale_total {}\n", g(&self.qcache_stale)));
+        s.push_str("# HELP bgflow_qcache_miss_total Query-cache misses\n# TYPE bgflow_qcache_miss_total counter\n");
+        s.push_str(&format!("bgflow_qcache_miss_total {}\n", g(&self.qcache_miss)));
+        {
+            let http = self.http.lock().unwrap();
+            s.push_str("# HELP bgflow_http_requests_total HTTP requests by path\n# TYPE bgflow_http_requests_total counter\n");
+            for (p, h) in http.iter() {
+                s.push_str(&format!(
+                    "bgflow_http_requests_total{{path=\"{}\"}} {}\n",
+                    p, h.count
+                ));
+            }
+            s.push_str("# HELP bgflow_http_request_duration_ms_total Summed handler time by path\n# TYPE bgflow_http_request_duration_ms_total counter\n");
+            for (p, h) in http.iter() {
+                s.push_str(&format!(
+                    "bgflow_http_request_duration_ms_total{{path=\"{}\"}} {}\n",
+                    p, h.total_ms
+                ));
+            }
+            s.push_str("# HELP bgflow_http_5xx_total Server errors by path\n# TYPE bgflow_http_5xx_total counter\n");
+            for (p, h) in http.iter() {
+                s.push_str(&format!(
+                    "bgflow_http_5xx_total{{path=\"{}\"}} {}\n",
+                    p, h.err5xx
+                ));
+            }
+        }
         s.push_str("# HELP bgflow_stored_bytes_total Bytes flushed to segments\n# TYPE bgflow_stored_bytes_total counter\n");
         s.push_str(&format!("bgflow_stored_bytes_total {}\n", g(&self.bytes_stored)));
         s.push_str("# HELP bgflow_stored_rows_total Rows flushed to segments\n# TYPE bgflow_stored_rows_total counter\n");
@@ -125,5 +168,28 @@ impl Metrics {
             ));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn render_includes_query_and_http_metrics() {
+        let m = Metrics::default();
+        m.qcache_hit.store(3, Ordering::Relaxed);
+        m.qcache_miss.store(7, Ordering::Relaxed);
+        m.http.lock().unwrap().insert(
+            "/api/v1/top".to_string(),
+            HttpStat { count: 2, total_ms: 50, err5xx: 1 },
+        );
+        let s = m.render();
+        assert!(s.contains("bgflow_qcache_hit_total 3"));
+        assert!(s.contains("bgflow_qcache_miss_total 7"));
+        assert!(s.contains("bgflow_http_requests_total{path=\"/api/v1/top\"} 2"));
+        assert!(s.contains("bgflow_http_request_duration_ms_total{path=\"/api/v1/top\"} 50"));
+        assert!(s.contains("bgflow_http_5xx_total{path=\"/api/v1/top\"} 1"));
     }
 }

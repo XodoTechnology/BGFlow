@@ -18,6 +18,7 @@ use axum::{
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::future::Future;
 use tower::{Layer, Service};
@@ -29,6 +30,9 @@ const MAX_STALE_MS: u64 = 600_000;
 /// If a background refresh appears stuck, allow another after this.
 const REFRESH_RETRY_MS: u64 = 30_000;
 const MAX_ENTRIES: usize = 256;
+/// Total bytes across all cached bodies — bounds worst-case memory
+/// (was implicitly ~2GB at 8MB × 256 entries).
+const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// Responses larger than this bypass the cache entirely.
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -54,18 +58,41 @@ impl CachedResp {
     }
 }
 
+struct CacheInner {
+    map: HashMap<String, CachedResp>,
+    /// Sum of cached body lengths — kept in lockstep with `map`.
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
 pub struct QueryCache {
-    map: Mutex<HashMap<String, CachedResp>>,
+    inner: Mutex<CacheInner>,
     /// Bound concurrent background recomputes — each scan can use every
     /// core, so unbounded refreshes would starve ingest and each other.
     refresh_sem: tokio::sync::Semaphore,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
-impl Default for QueryCache {
-    fn default() -> Self {
+impl QueryCache {
+    pub fn new(metrics: Arc<crate::metrics::Metrics>) -> Self {
+        Self::with_limits(metrics, MAX_ENTRIES, MAX_TOTAL_BYTES)
+    }
+
+    fn with_limits(
+        metrics: Arc<crate::metrics::Metrics>,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            inner: Mutex::new(CacheInner {
+                map: HashMap::new(),
+                bytes: 0,
+                max_entries,
+                max_bytes,
+            }),
             refresh_sem: tokio::sync::Semaphore::new(2),
+            metrics,
         }
     }
 }
@@ -80,8 +107,8 @@ pub enum Lookup {
 impl QueryCache {
     fn lookup(&self, key: &str) -> Lookup {
         let now = crate::metrics::now_ms();
-        let mut m = self.map.lock().unwrap();
-        match m.get_mut(key) {
+        let mut m = self.inner.lock().unwrap();
+        match m.map.get_mut(key) {
             Some(e) => {
                 let age = now.saturating_sub(e.fetched_ms);
                 if age > MAX_STALE_MS {
@@ -110,12 +137,8 @@ impl QueryCache {
                     .map(|s| (k.as_str().to_string(), s.to_string()))
             })
             .collect();
-        let mut m = self.map.lock().unwrap();
-        if m.len() >= MAX_ENTRIES {
-            m.clear();
-        }
-        m.insert(
-            key.to_string(),
+        self.insert(
+            key,
             CachedResp {
                 status,
                 headers: hdrs,
@@ -127,8 +150,38 @@ impl QueryCache {
         );
     }
 
+    /// Insert/replace an entry, evicting oldest-first until both the
+    /// entry-count and total-byte budgets fit. Replaces the old
+    /// clear-entire-map policy which thrashed under diverse query params.
+    fn insert(&self, key: &str, e: CachedResp) {
+        let incoming = e.body.len();
+        let mut m = self.inner.lock().unwrap();
+        let is_new = !m.map.contains_key(key);
+        let mut bytes = m.bytes;
+        if let Some(old) = m.map.remove(key) {
+            bytes = bytes.saturating_sub(old.body.len());
+        }
+        while (m.map.len() + usize::from(is_new)) > m.max_entries
+            || bytes + incoming > m.max_bytes
+        {
+            let Some(oldest) = m
+                .map
+                .iter()
+                .min_by_key(|(_, v)| v.fetched_ms)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(v) = m.map.remove(&oldest) {
+                bytes = bytes.saturating_sub(v.body.len());
+            }
+        }
+        m.bytes = bytes + incoming;
+        m.map.insert(key.to_string(), e);
+    }
+
     fn clear_refreshing(&self, key: &str) {
-        if let Some(e) = self.map.lock().unwrap().get_mut(key) {
+        if let Some(e) = self.inner.lock().unwrap().map.get_mut(key) {
             e.refreshing = false;
         }
     }
@@ -226,12 +279,8 @@ where
                             })
                             .collect();
                         // Store directly to avoid re-filtering header names.
-                        let mut m = cache.map.lock().unwrap();
-                        if m.len() >= MAX_ENTRIES {
-                            m.clear();
-                        }
-                        m.insert(
-                            key,
+                        cache.insert(
+                            &key,
                             CachedResp {
                                 status: parts.status.as_u16(),
                                 headers,
@@ -280,11 +329,16 @@ where
             let key = req.uri().to_string();
             match cache.lookup(&key) {
                 Lookup::Miss => {
+                    cache.metrics.qcache_miss.fetch_add(1, Ordering::Relaxed);
                     let resp = inner.call(req).await?;
                     Ok(buffer_store(resp, &cache, &key).await)
                 }
-                Lookup::Hit(c) => Ok(c.into_response("hit")),
+                Lookup::Hit(c) => {
+                    cache.metrics.qcache_hit.fetch_add(1, Ordering::Relaxed);
+                    Ok(c.into_response("hit"))
+                }
                 Lookup::Stale(c) => {
+                    cache.metrics.qcache_stale.fetch_add(1, Ordering::Relaxed);
                     let req2 = clone_request(&req);
                     spawn_refresh(inner, req2, Arc::clone(&cache), key);
                     Ok(c.into_response("stale"))
@@ -300,9 +354,9 @@ pub struct SwrCacheLayer {
 }
 
 impl SwrCacheLayer {
-    pub fn new() -> Self {
+    pub fn new(metrics: Arc<crate::metrics::Metrics>) -> Self {
         Self {
-            cache: Arc::new(QueryCache::default()),
+            cache: Arc::new(QueryCache::new(metrics)),
         }
     }
 }
@@ -315,5 +369,81 @@ impl<S> Layer<S> for SwrCacheLayer {
             inner,
             cache: Arc::clone(&self.cache),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache(entries: usize, bytes: usize) -> QueryCache {
+        QueryCache::with_limits(Arc::new(crate::metrics::Metrics::default()), entries, bytes)
+    }
+
+    fn resp(body: &[u8]) -> CachedResp {
+        CachedResp {
+            status: 200,
+            headers: vec![],
+            body: body.to_vec(),
+            fetched_ms: crate::metrics::now_ms(),
+            refreshing: false,
+            refresh_started_ms: 0,
+        }
+    }
+
+    #[test]
+    fn hit_and_miss() {
+        let c = cache(8, 1 << 20);
+        assert!(matches!(c.lookup("/a"), Lookup::Miss));
+        c.insert("/a", resp(b"hello"));
+        assert!(matches!(c.lookup("/a"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn entry_cap_evicts_oldest() {
+        let c = cache(2, 1 << 20);
+        c.insert("/a", resp(b"1"));
+        // Age /a so /b is strictly newer.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.insert("/b", resp(b"2"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.insert("/c", resp(b"3")); // exceeds cap → evicts /a
+        assert!(matches!(c.lookup("/a"), Lookup::Miss));
+        assert!(matches!(c.lookup("/b"), Lookup::Hit(_)));
+        assert!(matches!(c.lookup("/c"), Lookup::Hit(_)));
+    }
+
+    #[test]
+    fn byte_budget_evicts_oldest() {
+        let c = cache(8, 10);
+        c.insert("/a", resp(b"12345"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.insert("/b", resp(b"12345")); // 10 bytes total = budget
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.insert("/c", resp(b"1")); // over budget → evict oldest (/a)
+        assert!(matches!(c.lookup("/a"), Lookup::Miss));
+        assert!(matches!(c.lookup("/b"), Lookup::Hit(_)));
+        assert!(matches!(c.lookup("/c"), Lookup::Hit(_)));
+        let m = c.inner.lock().unwrap();
+        assert!(m.bytes <= 10, "bytes {} exceeds budget", m.bytes);
+    }
+
+    #[test]
+    fn replace_keeps_accounting() {
+        let c = cache(8, 100);
+        c.insert("/a", resp(b"1234567890"));
+        c.insert("/a", resp(b"1")); // replace shrinks accounting
+        let m = c.inner.lock().unwrap();
+        assert_eq!(m.bytes, 1);
+        assert_eq!(m.map.len(), 1);
+    }
+
+    #[test]
+    fn stale_then_miss_by_age() {
+        let c = cache(8, 1 << 20);
+        let mut e = resp(b"x");
+        e.fetched_ms = crate::metrics::now_ms() - MAX_STALE_MS - 1;
+        c.insert("/old", e);
+        assert!(matches!(c.lookup("/old"), Lookup::Miss));
     }
 }

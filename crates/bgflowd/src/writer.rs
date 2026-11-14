@@ -49,6 +49,9 @@ pub struct WriterShared {
     pub rollup_index: SegmentIndex,
     pub hourly_index: SegmentIndex,
     pub status: Arc<RwLock<StatusSnapshot>>,
+    /// Live flow tail for the SSE endpoint. Receivers that fall behind
+    /// get `RecvError::Lagged` and skip — ingest is never blocked.
+    pub live_tx: tokio::sync::broadcast::Sender<bgflow_types::FlowRecord>,
 }
 
 impl WriterShared {
@@ -58,6 +61,7 @@ impl WriterShared {
             rollup_index: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             hourly_index: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             status: Arc::new(RwLock::new(StatusSnapshot::default())),
+            live_tx: tokio::sync::broadcast::channel(8192).0,
         }
     }
 }
@@ -150,6 +154,11 @@ pub async fn run(
             msg = rx.recv() => {
                 match msg {
                     Some(rec) => {
+                        // Live tail for /flows/stream — Copy send is cheap;
+                        // skipped entirely when nobody is listening.
+                        if shared.live_tx.receiver_count() > 0 {
+                            let _ = shared.live_tx.send(rec);
+                        }
                         pending.push(rec);
                         if pending.len() >= BATCH {
                             ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, coarse_on, &metrics);

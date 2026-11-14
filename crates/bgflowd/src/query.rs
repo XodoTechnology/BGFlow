@@ -140,6 +140,10 @@ pub struct Ctx {
     pub local_asns: Arc<RwLock<Vec<u32>>>,
     /// Reverse-DNS cache — non-blocking lookups for flow rows.
     pub ptr: Arc<PtrCache>,
+    /// Global bound on concurrent segment scans — API handlers and the
+    /// alert evaluator share it so heavy queries queue instead of
+    /// stampeding disk/CPU (ingest and hot-path queries stay responsive).
+    pub scan_sem: Arc<tokio::sync::Semaphore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +188,7 @@ pub fn default_range() -> (u64, u64) {
 // Raw flow queries
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FlowQuery {
     pub from_ms: u64,
     pub to_ms: u64,
@@ -215,6 +219,14 @@ pub struct FlowQuery {
     pub limit: usize,
     /// Skip this many matching rows before collecting (pagination).
     pub offset: usize,
+    /// Keyset resume point `(segment file name, next row index)` from a
+    /// previous page's `next_cursor`. Mutually exclusive with `offset`.
+    pub resume: Option<(String, u64)>,
+    /// Emit `next_cursor` at the position after this many collected rows
+    /// instead of after the last one — lets callers probe one row past
+    /// the page size for `has_more` while the cursor still resumes at
+    /// the true page boundary. 0 = cursor after the last row.
+    pub cursor_after: usize,
     pub newest_first: bool,
 }
 
@@ -313,11 +325,28 @@ impl FlowQuery {
 }
 
 /// Scan raw flows newest-first (or oldest), collecting up to `limit` matches
-/// after skipping `offset`.
-pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<Vec<FlowRecord>> {
+/// after skipping `offset`. Returns the rows plus a `next_cursor` keyset
+/// (`"<segment>:<row>"`) pointing just past the last emitted row — pass it
+/// back as `FlowQuery::resume` to fetch the following page without
+/// re-scanning skipped rows. Segments are immutable once written, so the
+/// position stays valid until retention deletes that segment.
+pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<(Vec<FlowRecord>, Option<String>)> {
     let infos = ctx.flow_index.read().unwrap().clone();
     let mut out: Vec<FlowRecord> = Vec::with_capacity(q.limit.min(1024));
     let mut skipped = 0usize;
+    // While `seeking`, whole segments before the cursor's segment are
+    // skipped; inside it, rows before `cur_row` are skipped.
+    let (cur_seg, cur_row) = q.resume.clone().unwrap_or_default();
+    let mut seeking = q.resume.is_some();
+    let mut next_cursor: Option<String> = None;
+    // Cursor snapshot taken once `cursor_after` rows are collected —
+    // survives the probe row so pagination resumes at the page edge.
+    let cursor_after = if q.cursor_after > 0 {
+        q.cursor_after
+    } else {
+        usize::MAX
+    };
+    let mut pending_cursor: Option<String> = None;
     for_each_segment_info::<FlowRecord>(
         &infos,
         FlowRecord::schema(),
@@ -325,8 +354,16 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<Vec<FlowRecord>> {
         q.to_ms,
         q.newest_first,
         |scan| {
-            for i in 0..scan.rows {
-                let f = FlowRecord::from_scan(scan, i);
+            let mut start = 0usize;
+            if seeking {
+                if scan.seg != cur_seg {
+                    return ControlFlow::Continue(());
+                }
+                seeking = false;
+                start = cur_row.min(scan.rows as u64) as usize;
+            }
+            for row in start..scan.rows {
+                let f = FlowRecord::from_scan(scan, row);
                 if f.ts_ms < q.from_ms || f.ts_ms > q.to_ms {
                     continue;
                 }
@@ -338,14 +375,23 @@ pub fn flows(ctx: &Ctx, q: &FlowQuery) -> Result<Vec<FlowRecord>> {
                     continue;
                 }
                 out.push(f);
+                if out.len() == cursor_after {
+                    pending_cursor = Some(format!("{}:{}", scan.seg, row + 1));
+                }
                 if out.len() >= q.limit {
+                    next_cursor = pending_cursor
+                        .take()
+                        .or_else(|| Some(format!("{}:{}", scan.seg, row + 1)));
                     return ControlFlow::Break(());
                 }
             }
             ControlFlow::Continue(())
         },
     )?;
-    Ok(out)
+    if q.resume.is_some() && seeking {
+        anyhow::bail!("cursor expired — the segment it points into was removed");
+    }
+    Ok((out, next_cursor))
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,6 +1314,110 @@ mod tests {
         assert!(parse_ip_filter("10.0.0.0/33").is_none());
         assert!(parse_ip_filter("2001:db8::/129").is_none());
         assert!(parse_ip_filter("10.0.0.0/abc").is_none());
+    }
+
+    fn test_ctx(dir: &std::path::Path, infos: Vec<bgflow_store::SegmentInfo>) -> Ctx {
+        let empty: SegmentIndex = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        Ctx {
+            flow_index: Arc::new(RwLock::new(Arc::new(infos))),
+            rollup_index: empty.clone(),
+            hourly_index: empty,
+            orgs: Arc::new(StringTable::open(dir.join("orgs.txt")).unwrap()),
+            cities: Arc::new(StringTable::open(dir.join("cities.txt")).unwrap()),
+            rules: Arc::new(Ruleset::from_toml(&[])),
+            exporter_names: Arc::new(RwLock::new(ExporterNames::default())),
+            interface_names: Arc::new(RwLock::new(InterfaceNames::default())),
+            vlan_names: Arc::new(RwLock::new(VlanNames::default())),
+            local_asns: Arc::new(RwLock::new(Vec::new())),
+            ptr: PtrCache::new(),
+            scan_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+        }
+    }
+
+    fn flow_at(ts_ms: u64, tag: u64) -> FlowRecord {
+        let mut f = FlowRecord::default();
+        f.ts_ms = ts_ms;
+        f.src_ip = ip_to_u128(&"10.0.0.1".parse::<IpAddr>().unwrap());
+        f.dst_ip = ip_to_u128(&"10.0.0.2".parse::<IpAddr>().unwrap());
+        f.src_port = 12345;
+        f.dst_port = 443;
+        f.protocol = 6;
+        f.bytes = tag;
+        f.packets = 1;
+        f
+    }
+
+    fn resume_of(cursor: &str) -> (String, u64) {
+        let (s, r) = cursor.rsplit_once(':').unwrap();
+        (s.to_string(), r.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn flows_cursor_paginates_without_dup_or_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = bgflow_store::DatasetOpts {
+            segment_rows: 10,
+            segment_interval: std::time::Duration::from_secs(3600),
+        };
+        let mut ds = bgflow_store::Dataset::<FlowRecord>::open(dir.path(), opts).unwrap();
+        let now = crate::metrics::now_ms();
+        // 25 flows, 10 rows/segment → 3 segments.
+        for i in 0..25u64 {
+            ds.push(&flow_at(now - (25 - i) * 1000, i + 1)).unwrap();
+        }
+        ds.flush().unwrap();
+        let infos = ds.segment_snapshot();
+        assert!(infos.len() >= 2, "expected multiple segments, got {}", infos.len());
+        let ctx = test_ctx(dir.path(), infos);
+
+        let base = FlowQuery {
+            from_ms: 0,
+            to_ms: now + 60_000,
+            limit: 10,
+            newest_first: true,
+            ..Default::default()
+        };
+        let mut seen: Vec<u64> = Vec::new();
+        let mut q = base.clone();
+        for _ in 0..6 {
+            let (rows, cur) = flows(&ctx, &q).unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            seen.extend(rows.iter().map(|r| r.bytes));
+            match cur {
+                Some(c) => q.resume = Some(resume_of(&c)),
+                None => break,
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=25).collect::<Vec<_>>(), "cursor pages must cover every row exactly once");
+    }
+
+    #[tokio::test]
+    async fn flows_cursor_expired_segment_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = bgflow_store::DatasetOpts {
+            segment_rows: 10,
+            segment_interval: std::time::Duration::from_secs(3600),
+        };
+        let mut ds = bgflow_store::Dataset::<FlowRecord>::open(dir.path(), opts).unwrap();
+        let now = crate::metrics::now_ms();
+        for i in 0..5u64 {
+            ds.push(&flow_at(now - i * 1000, i + 1)).unwrap();
+        }
+        ds.flush().unwrap();
+        let ctx = test_ctx(dir.path(), ds.segment_snapshot());
+        let q = FlowQuery {
+            from_ms: 0,
+            to_ms: now + 60_000,
+            limit: 10,
+            resume: Some(("seg-does-not-exist-0-0-deadbeef.bfs".into(), 0)),
+            newest_first: true,
+            ..Default::default()
+        };
+        let err = flows(&ctx, &q).unwrap_err();
+        assert!(err.to_string().contains("cursor expired"), "got: {}", err);
     }
 }
 

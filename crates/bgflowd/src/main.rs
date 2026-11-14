@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 use enrich::{HttpEnrichers, MmdbGeo, StringTable};
 use metrics::Metrics;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use writer::WriterShared;
 
@@ -227,6 +227,44 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Scheduled backups: CRC-verified timestamped copies under
+    // [storage] backup_dir, rotating to backup_keep newest.
+    if cfg.storage.backup_interval_secs > 0 {
+        let data_dir = cfg.storage.data_dir.clone();
+        let root = cfg
+            .storage
+            .backup_dir
+            .clone()
+            .unwrap_or_else(|| cfg.storage.data_dir.join("backups"));
+        let interval = cfg.storage.backup_interval_secs;
+        let keep = cfg.storage.backup_keep;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+            tick.tick().await; // interval's first tick is immediate — skip it
+            loop {
+                tick.tick().await;
+                let name = backup::default_dest()
+                    .file_name()
+                    .map(|s| s.to_os_string())
+                    .unwrap_or_default();
+                let dest = root.join(name);
+                match backup::run_backup(&data_dir, &dest) {
+                    Ok(rep) => tracing::info!(
+                        "scheduled backup: {} → {} ({} files, {} skipped)",
+                        data_dir.display(),
+                        dest.display(),
+                        rep.files,
+                        rep.skipped
+                    ),
+                    Err(e) => tracing::warn!("scheduled backup failed: {}", e),
+                }
+                if keep > 0 {
+                    prune_backups(&root, keep);
+                }
+            }
+        });
+    }
+
     // Exporter admission policy: new senders pend for admin approval when
     // [exporters] require_approval is set; state persists in data dir.
     let exporter_policy = Arc::new(exporter_policy::ExporterPolicy::open(
@@ -279,6 +317,7 @@ async fn main() -> Result<()> {
         )));
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
+    let alert_rt = Arc::new(alerts::AlertRuntime::default());
     let snmp_store = snmp::new_store();
     // Live config cell — reload() swaps in the freshly loaded Config so
     // API/UI reads (settings view, status, CORS) see post-reload values.
@@ -323,6 +362,7 @@ async fn main() -> Result<()> {
             vlan_names: vlan_names.clone(),
             local_asns: local_asns.clone(),
             ptr: ptr.clone(),
+            scan_sem: Arc::new(tokio::sync::Semaphore::new(3)),
         },
         status: shared.status.clone(),
         metrics: metrics.clone(),
@@ -336,6 +376,8 @@ async fn main() -> Result<()> {
         asn_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         ov_cache: std::sync::Mutex::new(None),
         hot: hot.clone(),
+        alert_rt: alert_rt.clone(),
+        live_tx: shared.live_tx.clone(),
     });
 
     // Populate the hot tier from existing rollup segments so dashboard
@@ -373,7 +415,8 @@ async fn main() -> Result<()> {
     {
         let c = app_state.ctx.clone();
         let m = metrics.clone();
-        tokio::spawn(async move { alerts::run(alerts_cfg, c, m).await });
+        let rt = alert_rt.clone();
+        tokio::spawn(async move { alerts::run(alerts_cfg, c, m, rt).await });
     }
 
     // SIGHUP: same reload path as POST /api/v1/admin/reload.
@@ -636,6 +679,26 @@ fn bgflowd_query_dim(d: &str) -> Option<()> {
         "exporter", "src_country", "dst_country", "label",
     ];
     DIMS.contains(&d).then_some(())
+}
+
+/// Keep only the `keep` newest timestamped backup dirs under `root`.
+/// Names sort chronologically (`bgflow-backup-YYYYMMDD-HHMMSS`).
+fn prune_backups(root: &Path, keep: u32) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    let excess = dirs.len().saturating_sub(keep as usize);
+    for d in dirs.into_iter().take(excess) {
+        if let Err(e) = std::fs::remove_dir_all(&d) {
+            tracing::warn!("backup prune: cannot remove {}: {}", d.display(), e);
+        }
+    }
 }
 
 /// `bgflowd backup`: CRC-verified copy of the data directory.

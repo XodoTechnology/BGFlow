@@ -36,6 +36,8 @@ pub struct ScanResult {
     pub schema: &'static Schema,
     pub columns: Vec<ColumnData>,
     pub rows: usize,
+    /// Source segment file name — stable identity for keyset cursors.
+    pub seg: String,
 }
 
 impl ScanResult {
@@ -518,6 +520,11 @@ impl<R: Record> Dataset<R> {
                 schema: self.schema,
                 rows: reader.header.row_count as usize,
                 columns,
+                seg: info
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
             };
             if f(&scan).is_break() {
                 break;
@@ -727,6 +734,11 @@ pub fn for_each_segment_info<R: Record>(
             schema,
             rows: reader.header.row_count as usize,
             columns: reader.decode_all()?,
+            seg: info
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         })
     }, |scan| f(&scan))
 }

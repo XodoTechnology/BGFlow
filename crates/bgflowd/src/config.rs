@@ -202,6 +202,13 @@ pub struct StorageConfig {
     pub flows_dir: Option<PathBuf>,
     pub rollups_dir: Option<PathBuf>,
     pub hourly_dir: Option<PathBuf>,
+    /// Scheduled backup interval in seconds (0 = disabled). Each run
+    /// writes a timestamped, CRC-verified copy under `backup_dir`.
+    pub backup_interval_secs: u64,
+    /// How many timestamped backups to keep (0 = keep all).
+    pub backup_keep: u32,
+    /// Backup destination root (default: <data_dir>/backups).
+    pub backup_dir: Option<PathBuf>,
 }
 
 impl StorageConfig {
@@ -521,6 +528,9 @@ impl Default for StorageConfig {
             flows_dir: None,
             rollups_dir: None,
             hourly_dir: None,
+            backup_interval_secs: 0,
+            backup_keep: 3,
+            backup_dir: None,
         }
     }
 }

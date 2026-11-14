@@ -29,6 +29,10 @@ const MAX_FAILS: u32 = 5;
 /// Lockout grows with each failure beyond MAX_FAILS, capped at 1h.
 const LOCKOUT_BASE_SECS: u64 = 30;
 const LOCKOUT_MAX_SECS: u64 = 3600;
+/// Verified-Basic cache TTL — API clients (curl -u, scripts) would
+/// otherwise pay a 600k-iteration PBKDF2 on every single request.
+const BASIC_CACHE_MS: u64 = 60_000;
+const BASIC_CACHE_MAX: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,6 +164,16 @@ fn verify_hash(password: &str, stored: &str) -> bool {
     ct_eq(&out, &expected)
 }
 
+/// Digest key for the verified-Basic cache — sha256(user\0pass).
+fn basic_key(user: &str, pass: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(user.as_bytes());
+    h.update([0u8]);
+    h.update(pass.as_bytes());
+    h.finalize().into()
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -206,6 +220,12 @@ pub struct AuthState {
     /// Precomputed hash used to equalize timing for unknown usernames
     /// (lazy — costs one PBKDF2 on first unknown-user attempt).
     dummy_hash: std::sync::OnceLock<String>,
+    /// sha256(user\0pass) → (role, expiry_ms) for successful Basic auth.
+    /// Raw passwords are never retained — only the digest key.
+    basic_ok: Mutex<HashMap<[u8; 32], (Role, u64)>>,
+    /// Username portion of the legacy "user:pass" credential — lets
+    /// verify_token keep legacy sessions valid without a [[users]] row.
+    legacy_user: Option<String>,
 }
 
 #[derive(Default)]
@@ -239,6 +259,9 @@ impl AuthState {
         };
         AuthState {
             users: RwLock::new(users),
+            legacy_user: legacy
+                .as_ref()
+                .and_then(|l| l.split_once(':').map(|(u, _)| u.to_string())),
             legacy,
             secret,
             session_ttl: session_ttl_secs.unwrap_or(SESSION_TTL_DEFAULT).max(60),
@@ -246,6 +269,7 @@ impl AuthState {
             attempts: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashMap::new()),
             dummy_hash: std::sync::OnceLock::new(),
+            basic_ok: Mutex::new(HashMap::new()),
         }
     }
 
@@ -300,12 +324,35 @@ impl AuthState {
         }
         let n = out.len();
         *self.users.write().unwrap() = out;
+        // Password hashes may have changed — drop cached verifications.
+        self.basic_ok.lock().unwrap().clear();
         n
     }
 
     /// Verify HTTP Basic credentials → role. Checks [[users]] first, then
-    /// the legacy server.auth string (always admin).
+    /// the legacy server.auth string (always admin). Successful verifications
+    /// are cached briefly so API clients don't pay PBKDF2 per request;
+    /// failures are never cached.
     pub fn check_basic(&self, user: &str, pass: &str) -> Option<Role> {
+        let key = basic_key(user, pass);
+        let now = now_ms();
+        if let Some((r, exp)) = self.basic_ok.lock().unwrap().get(&key) {
+            if *exp > now {
+                return Some(*r);
+            }
+        }
+        let role = self.check_basic_slow(user, pass);
+        if let Some(r) = role {
+            let mut c = self.basic_ok.lock().unwrap();
+            if c.len() >= BASIC_CACHE_MAX {
+                c.clear();
+            }
+            c.insert(key, (r, now + BASIC_CACHE_MS));
+        }
+        role
+    }
+
+    fn check_basic_slow(&self, user: &str, pass: &str) -> Option<Role> {
         {
             let users = self.users.read().unwrap();
             if let Some(u) = users.iter().find(|u| u.name == user) {
@@ -322,20 +369,50 @@ impl AuthState {
         None
     }
 
+    /// Basic-auth attempt with the same per-IP throttling as `login` —
+    /// the middleware path must not bypass lockout, or an attacker could
+    /// burn a PBKDF2 per request forever.
+    pub fn check_basic_ip(&self, ip: IpAddr, user: &str, pass: &str) -> Option<Role> {
+        if self.throttle_locked(ip) {
+            return None;
+        }
+        let role = self.check_basic(user, pass);
+        self.throttle_record(ip, role.is_some());
+        role
+    }
+
+    fn throttle_locked(&self, ip: IpAddr) -> bool {
+        let now = now_ms();
+        let mut att = self.attempts.lock().unwrap();
+        // Opportunistic GC so the map can't grow unboundedly.
+        if att.len() > 10_000 {
+            att.retain(|_, a| a.locked_until_ms > now || a.fails < MAX_FAILS);
+        }
+        att.get(&ip).map(|a| a.locked_until_ms > now).unwrap_or(false)
+    }
+
+    fn throttle_record(&self, ip: IpAddr, success: bool) {
+        let now = now_ms();
+        let mut att = self.attempts.lock().unwrap();
+        let a = att.entry(ip).or_default();
+        if success {
+            a.fails = 0;
+            a.locked_until_ms = 0;
+        } else {
+            a.fails += 1;
+            if a.fails >= MAX_FAILS {
+                let over = (a.fails - MAX_FAILS).min(10);
+                let secs = (LOCKOUT_BASE_SECS << over).min(LOCKOUT_MAX_SECS);
+                a.locked_until_ms = now + secs * 1000;
+            }
+        }
+    }
+
     /// Attempt a password login for `user`. Enforces per-IP throttling.
     /// Returns the role on success, None on failure (bad creds or locked).
     pub fn login(&self, ip: IpAddr, user: &str, pass: &str) -> Option<Role> {
-        let now = now_ms();
-        {
-            let mut att = self.attempts.lock().unwrap();
-            // Opportunistic GC so the map can't grow unboundedly.
-            if att.len() > 10_000 {
-                att.retain(|_, a| a.locked_until_ms > now || a.fails < MAX_FAILS);
-            }
-            let a = att.entry(ip).or_default();
-            if a.locked_until_ms > now {
-                return None; // locked out
-            }
+        if self.throttle_locked(ip) {
+            return None; // locked out
         }
 
         let role = {
@@ -355,24 +432,8 @@ impl AuthState {
         // Legacy auth also works via the login form.
         let role = role.or_else(|| self.check_basic(user, pass));
 
-        let mut att = self.attempts.lock().unwrap();
-        let a = att.entry(ip).or_default();
-        match role {
-            Some(r) => {
-                a.fails = 0;
-                a.locked_until_ms = 0;
-                Some(r)
-            }
-            None => {
-                a.fails += 1;
-                if a.fails >= MAX_FAILS {
-                    let over = (a.fails - MAX_FAILS).min(10);
-                    let secs = (LOCKOUT_BASE_SECS << over).min(LOCKOUT_MAX_SECS);
-                    a.locked_until_ms = now + secs * 1000;
-                }
-                None
-            }
-        }
+        self.throttle_record(ip, role.is_some());
+        role
     }
 
     /// Issue a signed session token for user+role.
@@ -418,10 +479,20 @@ impl AuthState {
     }
 
     /// Verify a session token → (user, role, seconds_left).
-    /// Rejects revoked (logged-out) token ids.
+    /// Rejects revoked (logged-out) token ids and sessions whose user
+    /// was removed by a config reload — deleted accounts lose access
+    /// immediately rather than at token expiry.
     pub fn verify_token(&self, token: &str) -> Option<(String, Role, u64)> {
         let (u, r, left, jti, _) = self.parse_token(token)?;
         if !jti.is_empty() && self.revoked.lock().unwrap().contains_key(&jti) {
+            return None;
+        }
+        let known = {
+            let users = self.users.read().unwrap();
+            users.iter().any(|x| x.name == u)
+                || self.legacy_user.as_deref() == Some(u.as_str())
+        };
+        if !known {
             return None;
         }
         Some((u, r, left))
@@ -455,6 +526,7 @@ impl AuthState {
     /// Used by the middleware and /auth/me.
     pub fn identity_from_headers(
         &self,
+        ip: IpAddr,
         cookie: Option<&str>,
         authz: Option<&str>,
     ) -> Option<(String, Role)> {
@@ -469,13 +541,14 @@ impl AuthState {
                 }
             }
         }
-        // HTTP Basic for API clients.
+        // HTTP Basic for API clients — throttled per-IP like /auth/login
+        // so credential brute-force can't bypass the lockout.
         if let Some(v) = authz {
             if let Some(b64) = v.strip_prefix("Basic ") {
                 if let Some(bytes) = b64_decode(b64) {
                     if let Ok(s) = String::from_utf8(bytes) {
                         if let Some((u, p)) = s.split_once(':') {
-                            if let Some(r) = self.check_basic(u, p) {
+                            if let Some(r) = self.check_basic_ip(ip, u, p) {
                                 return Some((u.to_string(), r));
                             }
                         }
@@ -635,14 +708,55 @@ mod tests {
     #[test]
     fn session_secret_persistence() {
         // Same configured secret → tokens verify across AuthState instances.
-        let st1 = AuthState::new(vec![], None, Some("same".into()), None, false);
-        let st2 = AuthState::new(vec![], None, Some("same".into()), None, false);
-        // issue via st1 needs a user — use legacy path instead: sign check via
-        // verify on st2 with a token minted by st1's internals is awkward;
-        // instead verify deterministic sign through issue/verify on st2.
-        let _ = st1;
-        let tok = st2.issue_token("u", Role::Admin);
+        let mk = || AuthState::new(
+            vec![User::from_config(&test_user()).unwrap()],
+            None,
+            Some("same".into()),
+            None,
+            false,
+        );
+        let st1 = mk();
+        let st2 = mk();
+        let tok = st1.issue_token("alice", Role::Admin);
         assert!(st2.verify_token(&tok).is_some());
+    }
+
+    #[test]
+    fn deleted_user_session_dies() {
+        let st = state();
+        let tok = st.issue_token("alice", Role::Admin);
+        assert!(st.verify_token(&tok).is_some());
+        // Config reload dropping the user revokes access immediately —
+        // the token signature is still valid but the account is gone.
+        st.reload_users(&[]);
+        assert!(st.verify_token(&tok).is_none());
+    }
+
+    #[test]
+    fn basic_throttle_locks_ip() {
+        let st = state();
+        let ip: IpAddr = "10.0.0.20".parse().unwrap();
+        for _ in 0..5 {
+            assert_eq!(st.check_basic_ip(ip, "alice", "bad"), None);
+        }
+        // Locked out — even the right password is refused for this IP.
+        assert_eq!(st.check_basic_ip(ip, "alice", "s3cret!"), None);
+        // Other IPs unaffected.
+        let ip2: IpAddr = "10.0.0.21".parse().unwrap();
+        assert_eq!(st.check_basic_ip(ip2, "alice", "s3cret!"), Some(Role::Admin));
+    }
+
+    #[test]
+    fn basic_cred_cache_and_reload() {
+        let st = state();
+        // Repeat calls hit the verified-credential cache — same result.
+        assert_eq!(st.check_basic("alice", "s3cret!"), Some(Role::Admin));
+        assert_eq!(st.check_basic("alice", "s3cret!"), Some(Role::Admin));
+        // reload_users clears the cache; verification still succeeds.
+        st.reload_users(&[test_user()]);
+        assert_eq!(st.check_basic("alice", "s3cret!"), Some(Role::Admin));
+        // Wrong password is never cached as a success.
+        assert_eq!(st.check_basic("alice", "wrong"), None);
     }
 }
 
