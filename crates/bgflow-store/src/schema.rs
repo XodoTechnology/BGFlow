@@ -352,6 +352,45 @@ pub mod rollup_idx {
     pub const EGRESS_IF: usize = 21;
 }
 
+/// Schema id 7: geo bubble records (13 columns). One row per
+/// (minute bucket, ~1° cell) — the dataset behind /api/v1/geo.
+pub const GEO_SCHEMA: Schema = Schema {
+    id: 7,
+    name: "geo",
+    columns: &[
+        col!("bucket_ms", U64, Delta, ts),
+        col!("lat_cell", U8, Dict),
+        col!("lon_cell", U16, Dict),
+        col!("city", U32, Dict),
+        col!("src_cc", U16, Dict),
+        col!("dst_cc", U16, Dict),
+        col!("bytes", U64, Plain),
+        col!("packets", U64, Plain),
+        col!("flows", U64, Plain),
+        col!("lat_sum", U64, Plain),
+        col!("lon_sum", U64, Plain),
+        col!("dst_w", U64, Plain),
+        col!("src_w", U64, Plain),
+    ],
+};
+
+/// Column indices into GEO_SCHEMA.
+pub mod geo_idx {
+    pub const BUCKET_MS: usize = 0;
+    pub const LAT_CELL: usize = 1;
+    pub const LON_CELL: usize = 2;
+    pub const CITY: usize = 3;
+    pub const SRC_CC: usize = 4;
+    pub const DST_CC: usize = 5;
+    pub const BYTES: usize = 6;
+    pub const PACKETS: usize = 7;
+    pub const FLOWS: usize = 8;
+    pub const LAT_SUM: usize = 9;
+    pub const LON_SUM: usize = 10;
+    pub const DST_W: usize = 11;
+    pub const SRC_W: usize = 12;
+}
+
 pub fn schema_by_id(id: u16) -> Option<&'static Schema> {
     match id {
         2 => Some(&RAW_SCHEMA_V1),
@@ -359,6 +398,7 @@ pub fn schema_by_id(id: u16) -> Option<&'static Schema> {
         4 => Some(&RAW_SCHEMA),
         5 => Some(&ROLLUP_SCHEMA_V2),
         6 => Some(&ROLLUP_SCHEMA),
+        7 => Some(&GEO_SCHEMA),
         _ => None,
     }
 }

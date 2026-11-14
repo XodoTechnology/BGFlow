@@ -13,6 +13,6 @@ pub mod timeutil;
 
 pub use dataset::{for_each_segment_cols, for_each_segment_info, scan_threads, Dataset, DatasetOpts, Record, ScanResult};
 pub use encode::ColumnData;
-pub use rollup::RollupAggregator;
-pub use schema::{schema_by_id, RAW_SCHEMA, ROLLUP_SCHEMA};
+pub use rollup::{GeoAggregator, RollupAggregator};
+pub use schema::{schema_by_id, GEO_SCHEMA, RAW_SCHEMA, ROLLUP_SCHEMA};
 pub use segment::{read_header, scan_segments, verify_crc, SegmentInfo, SegmentReader};

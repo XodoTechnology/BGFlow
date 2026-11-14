@@ -81,10 +81,11 @@ sample_weighting = false
 # max_bytes = "50GiB"
 # Optional: put datasets on separate mounts — e.g. bulk raw flows on a
 # big disk, rollup stats on a smaller fast one. Each defaults to
-# <data_dir>/{flows,rollups,hourly}.
+# <data_dir>/{flows,rollups,hourly,geo}.
 # flows_dir = "/bulk/bgflow/flows"
 # rollups_dir = "/stats/bgflow/rollups"
 # hourly_dir = "/stats/bgflow/hourly"
+# geo_dir = "/stats/bgflow/geo"
 # Scheduled backups: every N seconds write a timestamped, CRC-verified
 # copy of the data dir under backup_dir, keeping the newest backup_keep.
 # 0 = disabled (the `bgflowd backup` CLI command still works ad-hoc).

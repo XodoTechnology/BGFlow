@@ -203,10 +203,11 @@ pub struct StorageConfig {
     pub max_bytes: u64,
     /// Optional per-dataset directory overrides — e.g. point bulk raw
     /// flows at one mount and rollup stats at another. Each defaults
-    /// to <data_dir>/{flows,rollups,hourly}.
+    /// to <data_dir>/{flows,rollups,hourly,geo}.
     pub flows_dir: Option<PathBuf>,
     pub rollups_dir: Option<PathBuf>,
     pub hourly_dir: Option<PathBuf>,
+    pub geo_dir: Option<PathBuf>,
     /// Scheduled backup interval in seconds (0 = disabled). Each run
     /// writes a timestamped, CRC-verified copy under `backup_dir`.
     pub backup_interval_secs: u64,
@@ -534,6 +535,7 @@ impl Default for StorageConfig {
             flows_dir: None,
             rollups_dir: None,
             hourly_dir: None,
+            geo_dir: None,
             backup_interval_secs: 0,
             backup_keep: 3,
             backup_dir: None,

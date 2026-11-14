@@ -7,7 +7,7 @@
 //! Finished minute buckets are drained into the rollup dataset.
 
 use crate::timeutil::{hour_floor, minute_floor};
-use bgflow_types::{ip_to_u128, u128_to_ip, FlowRecord, RollupRecord};
+use bgflow_types::{ip_to_u128, u128_to_ip, FlowRecord, GeoRecord, RollupRecord};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -227,6 +227,163 @@ impl RollupAggregator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Geo aggregation — one row per (minute bucket, ~1° cell)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GeoKey {
+    bucket_ms: u64,
+    /// Rounded cell latitude + 90 (0..=180).
+    lat_cell: u8,
+    /// Rounded cell longitude + 180 (0..=360).
+    lon_cell: u16,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct GeoAccum {
+    bytes: u64,
+    packets: u64,
+    flows: u64,
+    lat_sum: u64,
+    lon_sum: u64,
+    dst_w: u64,
+    src_w: u64,
+    dst_cc: u16,
+    src_cc: u16,
+    city: u32,
+}
+
+/// Aggregates flows into geo bubbles for /api/v1/geo. Endpoint choice
+/// mirrors the raw-scan path: dst geo when present, else src; each flow's
+/// bytes weight exactly one side. Country/city keep first-nonzero-wins
+/// semantics per cell.
+#[derive(Debug)]
+pub struct GeoAggregator {
+    map: HashMap<GeoKey, GeoAccum>,
+    weight_samples: bool,
+}
+
+impl GeoAggregator {
+    pub fn new() -> Self {
+        GeoAggregator { map: HashMap::new(), weight_samples: false }
+    }
+
+    /// See RollupAggregator::with_sampling.
+    pub fn with_sampling(mut self, on: bool) -> Self {
+        self.weight_samples = on;
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn add(&mut self, f: &FlowRecord) {
+        // dst endpoint wins when it carries any geo, else src — same rule
+        // as the /geo raw-scan path.
+        let (lat, lon, city, cc, is_dst) = if f.dst_lat != 0 || f.dst_lon != 0 || f.dst_city != 0 {
+            (f.dst_lat, f.dst_lon, f.dst_city, f.dst_country, true)
+        } else {
+            (f.src_lat, f.src_lon, f.src_city, f.src_country, false)
+        };
+        if lat == 0 && lon == 0 {
+            return;
+        }
+        // ~1° cells, identical rounding to the raw-scan path.
+        let la = (lat as f64 / 100_000.0 - 90.0).round() as i32;
+        let lo = (lon as f64 / 100_000.0 - 180.0).round() as i32;
+        let key = GeoKey {
+            bucket_ms: minute_floor(f.ts_ms),
+            lat_cell: (la + 90) as u8,
+            lon_cell: (lo + 180) as u16,
+        };
+        let e = self.map.entry(key).or_default();
+        let w = if self.weight_samples && f.sampler_interval > 1 {
+            f.sampler_interval as u64
+        } else {
+            1
+        };
+        e.bytes += f.bytes.saturating_mul(w);
+        e.packets += f.packets.saturating_mul(w);
+        e.flows += 1;
+        e.lat_sum += lat as u64;
+        e.lon_sum += lon as u64;
+        if is_dst {
+            e.dst_w += f.bytes.saturating_mul(w);
+            if e.dst_cc == 0 {
+                e.dst_cc = cc;
+            }
+        } else {
+            e.src_w += f.bytes.saturating_mul(w);
+            if e.src_cc == 0 {
+                e.src_cc = cc;
+            }
+        }
+        if e.city == 0 {
+            e.city = city;
+        }
+    }
+
+    fn to_record(k: &GeoKey, v: &GeoAccum) -> GeoRecord {
+        GeoRecord {
+            bucket_ms: k.bucket_ms,
+            lat_cell: k.lat_cell,
+            lon_cell: k.lon_cell,
+            city: v.city,
+            src_cc: v.src_cc,
+            dst_cc: v.dst_cc,
+            bytes: v.bytes,
+            packets: v.packets,
+            flows: v.flows,
+            lat_sum: v.lat_sum,
+            lon_sum: v.lon_sum,
+            dst_w: v.dst_w,
+            src_w: v.src_w,
+        }
+    }
+
+    /// Drain buckets strictly before `now_ms`'s minute.
+    pub fn drain_finished(&mut self, now_ms: u64) -> Vec<GeoRecord> {
+        let current = minute_floor(now_ms);
+        let mut out = Vec::new();
+        self.map.retain(|k, v| {
+            if k.bucket_ms < current {
+                out.push(Self::to_record(k, v));
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
+    /// Cardinality bound — same contract as RollupAggregator::drain_over.
+    pub fn drain_over(&mut self, cap: usize) -> Vec<GeoRecord> {
+        if self.map.len() <= cap {
+            return Vec::new();
+        }
+        let target = cap.saturating_mul(3) / 4;
+        let n = self.map.len() - target;
+        let keys: Vec<GeoKey> = self.map.keys().take(n).copied().collect();
+        let mut out = Vec::with_capacity(n);
+        for k in keys {
+            if let Some(v) = self.map.remove(&k) {
+                out.push(Self::to_record(&k, &v));
+            }
+        }
+        out
+    }
+
+    pub fn drain_all(&mut self) -> Vec<GeoRecord> {
+        let mut out = Vec::with_capacity(self.map.len());
+        for (k, v) in self.map.drain() {
+            out.push(Self::to_record(&k, &v));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +419,62 @@ mod tests {
         assert_eq!(same24.src_ip, ip_to_u128(&"10.1.2.0".parse().unwrap()));
         // bucket is hour-aligned
         assert_eq!(same24.bucket_ms % 3_600_000, 0);
+    }
+
+    fn mkgeo(ts: u64, dst_geo: bool) -> FlowRecord {
+        FlowRecord {
+            ts_ms: ts,
+            bytes: 500,
+            packets: 5,
+            // stored-scaled coords: (deg+90)*1e5 / (deg+180)*1e5
+            src_lat: ((40.0f64 + 90.0) * 100000.0) as u32, // 40°N-ish cell
+            src_lon: ((-74.0f64 + 180.0) * 100000.0) as u32,
+            src_city: 7,
+            src_country: 840, // US
+            dst_lat: if dst_geo { ((51.5f64 + 90.0) * 100000.0) as u32 } else { 0 },
+            dst_lon: if dst_geo { ((-0.12f64 + 180.0) * 100000.0) as u32 } else { 0 },
+            dst_city: if dst_geo { 9 } else { 0 },
+            dst_country: if dst_geo { 826 } else { 0 }, // GB
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn geo_aggregates_cells_and_sides() {
+        let mut agg = GeoAggregator::new();
+        let t0 = 1_700_000_000_000u64;
+        // dst has geo -> dst endpoint wins, dst side weighted
+        agg.add(&mkgeo(t0, true));
+        agg.add(&mkgeo(t0 + 1000, true));
+        // dst lacks geo -> src endpoint wins
+        agg.add(&mkgeo(t0 + 2000, false));
+        let recs = agg.drain_all();
+        assert_eq!(recs.len(), 2, "two distinct cells");
+        let london = recs.iter().find(|r| r.dst_w > 0).unwrap();
+        assert_eq!(london.flows, 2);
+        assert_eq!(london.bytes, 1000);
+        assert_eq!(london.dst_cc, 826);
+        assert_eq!(london.src_w, 0);
+        assert_eq!(london.city, 9);
+        // cell coords: lon -0.12 -> cell ~0 (+180 bias); lat 51.5 -> ~52 (+90)
+        assert_eq!(london.lon_cell, 180);
+        let ny = recs.iter().find(|r| r.src_w > 0).unwrap();
+        assert_eq!(ny.flows, 1);
+        assert_eq!(ny.src_cc, 840);
+        assert_eq!(ny.city, 7);
+        // lat_sum/lon_sum reconstruct a centroid near the source coords
+        let lat_deg = ny.lat_sum as f64 / ny.flows as f64 / 100000.0 - 90.0;
+        assert!((lat_deg - 40.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn geo_skips_geo_less_flows() {
+        let mut agg = GeoAggregator::new();
+        let mut f = mkgeo(1_700_000_000_000, false);
+        f.src_lat = 0;
+        f.src_lon = 0;
+        f.src_city = 0;
+        agg.add(&f);
+        assert!(agg.drain_all().is_empty());
     }
 }

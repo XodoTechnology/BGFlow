@@ -354,6 +354,7 @@ async fn main() -> Result<()> {
             flow_index: shared.flow_index.clone(),
             rollup_index: shared.rollup_index.clone(),
             hourly_index: shared.hourly_index.clone(),
+            geo_index: shared.geo_index.clone(),
             orgs: orgs.clone(),
             cities: cities.clone(),
             rules: rules.clone(),

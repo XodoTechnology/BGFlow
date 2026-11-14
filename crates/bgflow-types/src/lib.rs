@@ -105,6 +105,41 @@ pub struct RollupRecord {
     pub max_ts_ms: u64,
 }
 
+/// Pre-aggregated geo bubble: one row per (minute bucket, ~1° lat/lon
+/// cell). Written by the geo rollup aggregator so `/api/v1/geo` reads a
+/// tiny dataset instead of scanning raw flows. Endpoint choice and
+/// country/side weighting mirror the raw-scan semantics: each flow
+/// contributes its bytes to exactly one endpoint side — dst when it has
+/// geo data, else src.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GeoRecord {
+    /// Minute-aligned unix ms timestamp.
+    pub bucket_ms: u64,
+    /// Cell latitude + 90 (0..=180).
+    pub lat_cell: u8,
+    /// Cell longitude + 180 (0..=360).
+    pub lon_cell: u16,
+    /// Interned city id of the chosen endpoint (0 = unknown).
+    pub city: u32,
+    /// First non-zero country code seen on src-chosen flows (0 = none).
+    pub src_cc: u16,
+    /// First non-zero country code seen on dst-chosen flows (0 = none).
+    pub dst_cc: u16,
+    pub bytes: u64,
+    pub packets: u64,
+    /// Observed flow count (not sampler-weighted).
+    pub flows: u64,
+    /// Sum of stored-scaled latitudes ((deg+90)*1e5) over flows — divide
+    /// by `flows` for the cell centroid.
+    pub lat_sum: u64,
+    /// Sum of stored-scaled longitudes ((deg+180)*1e5).
+    pub lon_sum: u64,
+    /// Byte weight of flows whose geo came from the dst endpoint.
+    pub dst_w: u64,
+    /// Byte weight of flows whose geo came from the src endpoint.
+    pub src_w: u64,
+}
+
 // ---------------------------------------------------------------------------
 // IP helpers
 // ---------------------------------------------------------------------------

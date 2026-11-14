@@ -220,6 +220,53 @@ impl Record for RollupRecord {
     }
 }
 
+impl Record for bgflow_types::GeoRecord {
+    fn schema() -> &'static Schema {
+        &crate::schema::GEO_SCHEMA
+    }
+
+    fn ts_ms(&self) -> u64 {
+        self.bucket_ms
+    }
+
+    fn append_le(&self, cols: &mut [Vec<u8>]) {
+        use crate::schema::geo_idx as ix;
+        cols[ix::BUCKET_MS].extend_from_slice(&self.bucket_ms.to_le_bytes());
+        cols[ix::LAT_CELL].push(self.lat_cell);
+        cols[ix::LON_CELL].extend_from_slice(&self.lon_cell.to_le_bytes());
+        cols[ix::CITY].extend_from_slice(&self.city.to_le_bytes());
+        cols[ix::SRC_CC].extend_from_slice(&self.src_cc.to_le_bytes());
+        cols[ix::DST_CC].extend_from_slice(&self.dst_cc.to_le_bytes());
+        cols[ix::BYTES].extend_from_slice(&self.bytes.to_le_bytes());
+        cols[ix::PACKETS].extend_from_slice(&self.packets.to_le_bytes());
+        cols[ix::FLOWS].extend_from_slice(&self.flows.to_le_bytes());
+        cols[ix::LAT_SUM].extend_from_slice(&self.lat_sum.to_le_bytes());
+        cols[ix::LON_SUM].extend_from_slice(&self.lon_sum.to_le_bytes());
+        cols[ix::DST_W].extend_from_slice(&self.dst_w.to_le_bytes());
+        cols[ix::SRC_W].extend_from_slice(&self.src_w.to_le_bytes());
+    }
+
+    fn from_scan(scan: &ScanResult, i: usize) -> Self {
+        use crate::schema::geo_idx as ix;
+        let c = &scan.columns;
+        bgflow_types::GeoRecord {
+            bucket_ms: c[ix::BUCKET_MS].value_at(i) as u64,
+            lat_cell: c[ix::LAT_CELL].value_at(i) as u8,
+            lon_cell: c[ix::LON_CELL].value_at(i) as u16,
+            city: c[ix::CITY].value_at(i) as u32,
+            src_cc: c[ix::SRC_CC].value_at(i) as u16,
+            dst_cc: c[ix::DST_CC].value_at(i) as u16,
+            bytes: c[ix::BYTES].value_at(i) as u64,
+            packets: c[ix::PACKETS].value_at(i) as u64,
+            flows: c[ix::FLOWS].value_at(i) as u64,
+            lat_sum: c[ix::LAT_SUM].value_at(i) as u64,
+            lon_sum: c[ix::LON_SUM].value_at(i) as u64,
+            dst_w: c[ix::DST_W].value_at(i) as u64,
+            src_w: c[ix::SRC_W].value_at(i) as u64,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Columnar write buffer
 // ---------------------------------------------------------------------------

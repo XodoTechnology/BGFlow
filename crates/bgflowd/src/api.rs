@@ -664,141 +664,249 @@ async fn flows(
     .into_response())
 }
 
-/// GET /api/v1/geo — aggregate recent raw flows into lat/lon bubbles for
-/// the geo map view. Raw flows only carry geo on schema ≥4 segments and
-/// have short retention, so this is a "recent hotspots" view.
+/// One ~1° geo bubble accumulator — shared by the geo-rollup fast path
+/// and the raw-flow fallback scan.
+#[derive(Default)]
+struct GeoCell {
+    bytes: u64,
+    packets: u64,
+    flows: u64,
+    lat_sum: f64,
+    lon_sum: f64,
+    city: u32,
+    // country code + byte weight per endpoint side, so a bubble can be
+    // tied back to a src_country/dst_country filter.
+    dst_cc: u16,
+    dst_w: u64,
+    src_cc: u16,
+    src_w: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn geo_cell_add(
+    cells: &mut std::collections::HashMap<(i32, i32), GeoCell>,
+    la: i32,
+    lo: i32,
+    bytes: u64,
+    packets: u64,
+    flows: u64,
+    lat_sum: f64,
+    lon_sum: f64,
+    city: u32,
+    dst_cc: u16,
+    src_cc: u16,
+    dst_w: u64,
+    src_w: u64,
+) {
+    let c = cells.entry((la, lo)).or_default();
+    c.bytes += bytes;
+    c.packets += packets;
+    c.flows += flows;
+    c.lat_sum += lat_sum;
+    c.lon_sum += lon_sum;
+    if c.city == 0 {
+        c.city = city;
+    }
+    if c.dst_cc == 0 {
+        c.dst_cc = dst_cc;
+    }
+    if c.src_cc == 0 {
+        c.src_cc = src_cc;
+    }
+    c.dst_w += dst_w;
+    c.src_w += src_w;
+}
+
+/// GET /api/v1/geo — aggregate flows into lat/lon bubbles for the geo
+/// map view. Reads the minute-bucketed geo rollup dataset for covered
+/// ranges (fast); falls back to scanning raw flows for history that
+/// predates the geo dataset (raw flows only carry geo on schema ≥4 and
+/// have short retention, so this is a "recent hotspots" view).
 async fn geo(
     State(st): State<Arc<AppState>>,
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(300).min(1000);
-    // ~1° grid buckets keyed by (lat_i32, lon_i32).
-    #[derive(Default)]
-    struct Cell {
-        bytes: u64,
-        packets: u64,
-        flows: u64,
-        lat_sum: f64,
-        lon_sum: f64,
-        city: u32,
-        // country code + byte weight per endpoint side, so a bubble can be
-        // tied back to a src_country/dst_country filter.
-        dst_cc: u16,
-        dst_w: u64,
-        src_cc: u16,
-        src_w: u64,
-    }
-    let mut cells: std::collections::HashMap<(i32, i32), Cell> = std::collections::HashMap::new();
-    let infos = st.ctx.flow_index.read().unwrap().clone();
+    let mut cells: std::collections::HashMap<(i32, i32), GeoCell> = std::collections::HashMap::new();
     let _scan = scan_permit(&st.ctx).await;
     let deadline = query::scan_deadline(&st.ctx);
     let mut timed_out = false;
-    // Column-subset decode: geo needs 11 of 40 columns — ~3-4x less
-    // decompression work than decode_all. Segments written under older
-    // schemas simply lack the geo columns (read as 0).
-    use bgflow_store::schema::raw_idx as ix;
-    const GEO_COLS: &[usize] = &[
-        ix::TS_MS,
-        ix::BYTES,
-        ix::PACKETS,
-        ix::SRC_COUNTRY,
-        ix::DST_COUNTRY,
-        ix::SRC_CITY,
-        ix::DST_CITY,
-        ix::SRC_LAT,
-        ix::DST_LAT,
-        ix::SRC_LON,
-        ix::DST_LON,
-    ];
-    bgflow_store::for_each_segment_cols(
-        &infos,
-        bgflow_types::FlowRecord::schema(),
-        GEO_COLS,
-        from,
-        to,
-        false,
-        |columns, rows| {
-            let mut arr: Vec<Option<&bgflow_store::ColumnData>> =
-                vec![None; bgflow_types::FlowRecord::schema().columns.len()];
-            for (ci, data) in columns {
-                arr[*ci] = Some(data);
+    let deadline_hit = |i: usize, timed_out: &mut bool| -> bool {
+        if let Some(d) = deadline {
+            if i & 0x3FFF == 0 && std::time::Instant::now() > d {
+                *timed_out = true;
+                return true;
             }
-            let get = |ci: usize, i: usize| -> u128 {
-                arr.get(ci)
-                    .and_then(|o| *o)
-                    .map(|c| c.value_at(i))
-                    .unwrap_or(0)
-            };
-            for i in 0..rows {
-                if let Some(d) = deadline {
-                    if i & 0x3FFF == 0 && std::time::Instant::now() > d {
-                        timed_out = true;
-                        return std::ops::ControlFlow::Break(());
+        }
+        false
+    };
+
+    // Geo rollup fast path. geo_min is the earliest surviving geo bucket
+    // — itself minute-aligned, so it partitions time cleanly: flows with
+    // ts >= geo_min are in the geo dataset, older ones only in raw.
+    let geo_infos = st.ctx.geo_index.read().unwrap().clone();
+    let geo_min = geo_infos.iter().map(|s| s.header.min_ts_ms).min();
+    let mut used_geo = false;
+    let mut used_raw = false;
+    if let Some(g0) = geo_min {
+        if g0 <= to {
+            used_geo = true;
+            let g_from = from.max(g0);
+            bgflow_store::for_each_segment_info::<bgflow_types::GeoRecord>(
+                &geo_infos,
+                bgflow_types::GeoRecord::schema(),
+                g_from,
+                to,
+                false,
+                |scan| {
+                    for i in 0..scan.rows {
+                        if deadline_hit(i, &mut timed_out) {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        let r = bgflow_types::GeoRecord::from_scan(scan, i);
+                        if r.bucket_ms < g_from || r.bucket_ms > to {
+                            continue;
+                        }
+                        let fl = r.flows.max(1) as f64;
+                        geo_cell_add(
+                            &mut cells,
+                            r.lat_cell as i32 - 90,
+                            r.lon_cell as i32 - 180,
+                            r.bytes,
+                            r.packets,
+                            r.flows,
+                            r.lat_sum as f64 / 100_000.0 - 90.0 * fl,
+                            r.lon_sum as f64 / 100_000.0 - 180.0 * fl,
+                            r.city,
+                            r.dst_cc,
+                            r.src_cc,
+                            r.dst_w,
+                            r.src_w,
+                        );
                     }
-                }
-                let ts = get(ix::TS_MS, i) as u64;
-                if ts < from || ts > to {
-                    continue;
-                }
-                let bytes = get(ix::BYTES, i) as u64;
-                let packets = get(ix::PACKETS, i) as u64;
-                // Weight each endpoint's geo by its share — simpler: count
-                // dst geo for outbound-ish and src for the rest? Use dst
-                // when present else src (matches "where traffic goes").
-                let dst_lat = get(ix::DST_LAT, i) as u32;
-                let dst_lon = get(ix::DST_LON, i) as u32;
-                let dst_city = get(ix::DST_CITY, i) as u32;
-                let (lat, lon, city, cc, is_dst) = if dst_lat != 0 || dst_lon != 0 || dst_city != 0 {
-                    (
-                        dst_lat,
-                        dst_lon,
-                        dst_city,
-                        get(ix::DST_COUNTRY, i) as u16,
-                        true,
-                    )
-                } else {
-                    (
-                        get(ix::SRC_LAT, i) as u32,
-                        get(ix::SRC_LON, i) as u32,
-                        get(ix::SRC_CITY, i) as u32,
-                        get(ix::SRC_COUNTRY, i) as u16,
-                        false,
-                    )
-                };
-                if lat == 0 && lon == 0 {
-                    continue;
-                }
-                let la = (lat as f64 / 100000.0 - 90.0).round() as i32;
-                let lo = (lon as f64 / 100000.0 - 180.0).round() as i32;
-                let c = cells.entry((la, lo)).or_default();
-                c.bytes += bytes;
-                c.packets += packets;
-                c.flows += 1;
-                c.lat_sum += lat as f64 / 100000.0 - 90.0;
-                c.lon_sum += lon as f64 / 100000.0 - 180.0;
-                if c.city == 0 {
-                    c.city = city;
-                }
-                if is_dst {
-                    if c.dst_cc == 0 {
-                        c.dst_cc = cc;
-                    }
-                    c.dst_w += bytes;
-                } else {
-                    if c.src_cc == 0 {
-                        c.src_cc = cc;
-                    }
-                    c.src_w += bytes;
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        },
-    )
-    .map_err(|e| err(e.to_string()))?;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .map_err(|e| err(e.to_string()))?;
+        }
+    }
     if timed_out {
         return Err(err("query exceeded scan timeout"));
     }
+
+    // Raw-flow fallback: everything before the geo dataset starts (or the
+    // whole range when no geo data exists yet).
+    let raw_to = match geo_min {
+        Some(g0) if g0 <= to => to.min(g0.saturating_sub(1)),
+        _ => to,
+    };
+    if from <= raw_to {
+        used_raw = true;
+        let infos = st.ctx.flow_index.read().unwrap().clone();
+        // Column-subset decode: geo needs 11 of 40 columns — ~3-4x less
+        // decompression work than decode_all. Segments written under older
+        // schemas simply lack the geo columns (read as 0).
+        use bgflow_store::schema::raw_idx as ix;
+        const GEO_COLS: &[usize] = &[
+            ix::TS_MS,
+            ix::BYTES,
+            ix::PACKETS,
+            ix::SRC_COUNTRY,
+            ix::DST_COUNTRY,
+            ix::SRC_CITY,
+            ix::DST_CITY,
+            ix::SRC_LAT,
+            ix::DST_LAT,
+            ix::SRC_LON,
+            ix::DST_LON,
+        ];
+        bgflow_store::for_each_segment_cols(
+            &infos,
+            bgflow_types::FlowRecord::schema(),
+            GEO_COLS,
+            from,
+            raw_to,
+            false,
+            |columns, rows| {
+                let mut arr: Vec<Option<&bgflow_store::ColumnData>> =
+                    vec![None; bgflow_types::FlowRecord::schema().columns.len()];
+                for (ci, data) in columns {
+                    arr[*ci] = Some(data);
+                }
+                let get = |ci: usize, i: usize| -> u128 {
+                    arr.get(ci)
+                        .and_then(|o| *o)
+                        .map(|c| c.value_at(i))
+                        .unwrap_or(0)
+                };
+                for i in 0..rows {
+                    if deadline_hit(i, &mut timed_out) {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    let ts = get(ix::TS_MS, i) as u64;
+                    if ts < from || ts > raw_to {
+                        continue;
+                    }
+                    let bytes = get(ix::BYTES, i) as u64;
+                    let packets = get(ix::PACKETS, i) as u64;
+                    // Weight each endpoint's geo by its share — simpler: count
+                    // dst geo for outbound-ish and src for the rest? Use dst
+                    // when present else src (matches "where traffic goes").
+                    let dst_lat = get(ix::DST_LAT, i) as u32;
+                    let dst_lon = get(ix::DST_LON, i) as u32;
+                    let dst_city = get(ix::DST_CITY, i) as u32;
+                    let (lat, lon, city, cc, is_dst) = if dst_lat != 0 || dst_lon != 0 || dst_city != 0 {
+                        (
+                            dst_lat,
+                            dst_lon,
+                            dst_city,
+                            get(ix::DST_COUNTRY, i) as u16,
+                            true,
+                        )
+                    } else {
+                        (
+                            get(ix::SRC_LAT, i) as u32,
+                            get(ix::SRC_LON, i) as u32,
+                            get(ix::SRC_CITY, i) as u32,
+                            get(ix::SRC_COUNTRY, i) as u16,
+                            false,
+                        )
+                    };
+                    if lat == 0 && lon == 0 {
+                        continue;
+                    }
+                    let la = (lat as f64 / 100000.0 - 90.0).round() as i32;
+                    let lo = (lon as f64 / 100000.0 - 180.0).round() as i32;
+                    geo_cell_add(
+                        &mut cells,
+                        la,
+                        lo,
+                        bytes,
+                        packets,
+                        1,
+                        lat as f64 / 100000.0 - 90.0,
+                        lon as f64 / 100000.0 - 180.0,
+                        city,
+                        if is_dst { cc } else { 0 },
+                        if is_dst { 0 } else { cc },
+                        if is_dst { bytes } else { 0 },
+                        if is_dst { 0 } else { bytes },
+                    );
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        )
+        .map_err(|e| err(e.to_string()))?;
+    }
+    if timed_out {
+        return Err(err("query exceeded scan timeout"));
+    }
+    let set = match (used_geo, used_raw) {
+        (true, true) => "geo+flows",
+        (true, false) => "geo",
+        _ => "flows",
+    };
 
     let mut pts: Vec<_> = cells
         .into_iter()
@@ -816,8 +924,8 @@ async fn geo(
                 (c.dst_cc, "dst")
             };
             serde_json::json!({
-                "lat": c.lat_sum / c.flows as f64,
-                "lon": c.lon_sum / c.flows as f64,
+                "lat": c.lat_sum / c.flows.max(1) as f64,
+                "lon": c.lon_sum / c.flows.max(1) as f64,
                 "bytes": c.bytes,
                 "packets": c.packets,
                 "flows": c.flows,
@@ -833,7 +941,7 @@ async fn geo(
         "points": pts,
         "from": from,
         "to": to,
-        "set": "flows",
+        "set": set,
     })))
 }
 
@@ -2462,7 +2570,7 @@ fn openapi_spec() -> serde_json::Value {
             "/api/v1/labels": {"get": {"summary": "Configured label rules"}},
             "/api/v1/vlans": {"get": {"summary": "Configured VLAN names ([vlan_names])"}},
             "/api/v1/enrichers": {"get": {"summary": "Enricher status"}},
-            "/api/v1/geo": {"get": {"summary": "Geo bubbles: lat/lon aggregates of recent raw flows (needs city MMDB + schema ≥4)", "parameters": [
+            "/api/v1/geo": {"get": {"summary": "Geo bubbles: lat/lon aggregates from the geo rollup (raw-flow fallback for pre-rollup history; needs city MMDB)", "parameters": [
                 {"name": "from", "in": "query"}, {"name": "to", "in": "query"},
                 {"name": "limit", "in": "query", "description": "max bubbles (default 300)"},
             ]}},

@@ -129,6 +129,8 @@ pub struct Ctx {
     pub rollup_index: SegmentIndex,
     /// Coarse hourly rollups (/24·/48-masked IPs, long retention).
     pub hourly_index: SegmentIndex,
+    /// Geo-bubble rollup — backs /api/v1/geo for covered ranges.
+    pub geo_index: SegmentIndex,
     pub orgs: Arc<StringTable>,
     /// City-name string table for geo_city ids.
     pub cities: Arc<StringTable>,
@@ -1369,7 +1371,8 @@ mod tests {
         Ctx {
             flow_index: Arc::new(RwLock::new(Arc::new(infos))),
             rollup_index: empty.clone(),
-            hourly_index: empty,
+            hourly_index: empty.clone(),
+            geo_index: empty,
             orgs: Arc::new(StringTable::open(dir.join("orgs.txt")).unwrap()),
             cities: Arc::new(StringTable::open(dir.join("cities.txt")).unwrap()),
             rules: Arc::new(Ruleset::from_toml(&[])),
