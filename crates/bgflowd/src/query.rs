@@ -900,6 +900,16 @@ where
 
     let nth = bgflow_store::scan_threads().min(idx.len().max(1));
     let shards = shards.max(1);
+    // Hard bound on distinct keys across all shards: high-cardinality
+    // extractions (conversation tuples on minute data) can otherwise
+    // grow maps without limit and OOM the daemon. ~3M keys × ~150B
+    // ≈ 450MB worst case. Overflow keys are dropped — heavy keys that
+    // are already present keep aggregating, so results degrade to an
+    // approximation rather than failing.
+    const MAX_SHARD_KEYS: usize = 3_000_000;
+    let shard_cap = MAX_SHARD_KEYS.div_ceil(shards).max(1);
+    let capped = std::sync::atomic::AtomicBool::new(false);
+    let capped_ref = &capped;
     let chunk_size = idx.len().div_ceil(nth).max(1);
     let ncols = RollupRecord::schema().columns.len();
     let maps: Vec<std::sync::Mutex<ShardMap<K, V>>> = (0..shards)
@@ -918,6 +928,7 @@ where
             let add = &add;
             let bounded_init = &bounded_init;
             let bounded_add = &bounded_add;
+            let capped = capped_ref;
             handles.push(s.spawn(move || -> Result<B> {
                 // Per-shard buffers: flushed into the shared maps in
                 // batches so lock hold time stays tiny.
@@ -932,13 +943,18 @@ where
                             continue;
                         }
                         let mut g = maps[si].lock().unwrap();
+                        let shard_full = g.len() >= shard_cap;
                         for (k, v) in buf.drain(..) {
                             match g.entry(k) {
                                 std::collections::hash_map::Entry::Occupied(mut e) => {
                                     add(e.get_mut(), v);
                                 }
                                 std::collections::hash_map::Entry::Vacant(e) => {
-                                    e.insert(v);
+                                    if shard_full {
+                                        capped.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        e.insert(v);
+                                    }
                                 }
                             }
                         }
@@ -991,6 +1007,12 @@ where
         Ok(bstate)
     });
     let bstate = scan_res?;
+    if capped.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "rollup scan hit shard key cap ({MAX_SHARD_KEYS}); \
+             results are truncated to the heaviest keys"
+        );
+    }
 
     Ok((
         maps.into_iter()

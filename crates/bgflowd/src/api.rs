@@ -75,12 +75,12 @@ fn rollup_set(q: &Q) -> RollupSet {
     }
 }
 
-/// Dataset choice for aggregate-only endpoints (overview/timeseries/
-/// summary): past ~2h, minute rollups mean decoding tens of millions of
-/// rows and building huge top-dim maps, so promote to the hourly
-/// dataset whose IPs are already /24·/48-masked. Dimension-detail
-/// endpoints (/top, /conversations, /countries, /matrix) keep honoring
-/// the caller's explicit granularity.
+/// Dataset choice for aggregate endpoints: past ~2h, minute rollups mean
+/// decoding tens of millions of rows and building huge top-dim maps, so
+/// promote to the hourly dataset whose IPs are already /24·/48-masked.
+/// The UI always sends granularity=minute as its default detail level, so
+/// promotion applies even when the param is present — `hourly` is still
+/// honored (never demoted).
 fn auto_rollup_set(q: &Q, from: u64, to: u64) -> RollupSet {
     let set = rollup_set(q);
     if set == RollupSet::Minute && to.saturating_sub(from) > 7_200_000 {
@@ -1188,7 +1188,7 @@ async fn matrix(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
     // NB: params are src_dim/dst_dim — bare `src`/`dst` are flow-filter aliases.
     let sd = q.get("src_dim").map(|s| s.as_str()).unwrap_or("src_country");
@@ -1341,7 +1341,14 @@ async fn top(
         return Err(err(format!("unknown dimension '{}'; valid: {}", by, TOP_DIMS.join(", "))));
     }
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    // Hot-tracked dims keep the caller's granularity (the hot tier serves
+    // both minute and hour views, preserving full-IP fidelity); untracked
+    // dims get auto-promotion so long ranges scan the smaller hourly set.
+    let set = if crate::hot::hot_dim_idx(by).is_some() {
+        rollup_set(&q)
+    } else {
+        auto_rollup_set(&q, from, to)
+    };
     let f = rollup_filter(&q, &st.ctx)?;
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(1000);
 
@@ -1425,7 +1432,7 @@ async fn conversations(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20).min(500);
     // Conversation keys are near-unique per flow — millions of entries.
@@ -1854,7 +1861,7 @@ async fn anomalies(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
     let by = q.get("by").map(|s| s.as_str()).unwrap_or("src_ip");
     if !TOP_DIMS.contains(&by) {
@@ -1982,7 +1989,7 @@ async fn label_stats(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let set = rollup_set(&q);
+    let set = auto_rollup_set(&q, from, to);
     let f = rollup_filter(&q, &st.ctx)?;
     let needed = query::rollup_needed(&f, &["label"]);
     // Label count is bounded by the ruleset — small state, parallel-safe.
