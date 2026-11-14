@@ -2800,7 +2800,10 @@ async fn auth_me(
     let authz = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    match st.auth.identity_from_headers(peer.ip(), cookie, authz) {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok());
+    match st.auth.identity_from_headers(peer.ip(), cookie, authz, api_key) {
         Some((user, role)) => Json(serde_json::json!({
             "user": user, "role": role.as_str(), "auth": true,
         }))
@@ -3096,9 +3099,17 @@ async fn auth_mw(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let ident = st
-        .auth
-        .identity_from_headers(peer.ip(), cookie.as_deref(), authz.as_deref());
+    let api_key = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let ident = st.auth.identity_from_headers(
+        peer.ip(),
+        cookie.as_deref(),
+        authz.as_deref(),
+        api_key.as_deref(),
+    );
 
     let Some((_user, role)) = ident else {
         // No WWW-Authenticate header: advertising Basic here makes browsers

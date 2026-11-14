@@ -62,6 +62,12 @@ pub struct UserConfig {
     pub password_hash: String,
     #[serde(default = "default_role")]
     pub role: Role,
+    /// API keys for programmatic access (`Authorization: Bearer <key>`
+    /// or `X-Api-Key: <key>`). Keys inherit this user's role — an admin
+    /// key is full admin. Accepts plaintext (hashed at load) or
+    /// `sha256:<hex>` of the key. Generate with `openssl rand -hex 32`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
 
 fn default_role() -> Role {
@@ -73,6 +79,28 @@ pub struct User {
     pub name: String,
     pub pass_hash: String,
     pub role: Role,
+    /// SHA-256 digests of configured API keys (never the keys themselves).
+    pub api_key_hashes: Vec<[u8; 32]>,
+}
+
+/// Parse one configured API key into its SHA-256 digest. Accepts
+/// `sha256:<64-hex>` (pre-hashed) or any other string (hashed as-is).
+fn api_key_digest(raw: &str) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    if let Some(hex) = raw.strip_prefix("sha256:") {
+        if hex.len() == 64 {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+            }
+            return Some(out);
+        }
+        return None;
+    }
+    if raw.is_empty() {
+        return None;
+    }
+    Some(Sha256::digest(raw.as_bytes()).into())
 }
 
 impl User {
@@ -90,10 +118,18 @@ impl User {
         }
         parse_hash(&u.password_hash)
             .ok_or_else(|| format!("user '{}': bad password_hash format", u.name))?;
+        let mut api_key_hashes = Vec::with_capacity(u.api_keys.len());
+        for k in &u.api_keys {
+            api_key_hashes.push(
+                api_key_digest(k)
+                    .ok_or_else(|| format!("user '{}': invalid api_keys entry", u.name))?,
+            );
+        }
         Ok(User {
             name: u.name.clone(),
             pass_hash: u.password_hash.clone(),
             role: u.role,
+            api_key_hashes,
         })
     }
 }
@@ -522,13 +558,38 @@ impl AuthState {
         b64url_e(&mac.finalize().into_bytes())
     }
 
-    /// Extract identity from a request's Cookie or Authorization header.
-    /// Used by the middleware and /auth/me.
+    /// Resolve an API key (`X-Api-Key` value or Bearer token) to an
+    /// identity. Keys are SHA-256'd then compared against stored digests
+    /// in constant time; a miss costs one hash + a small scan — no
+    /// throttle needed (256-bit keys aren't guessable).
+    pub fn identity_from_api_key(&self, key: &str) -> Option<(String, Role)> {
+        use sha2::Digest;
+        if key.is_empty() {
+            return None;
+        }
+        let digest = Sha256::digest(key.as_bytes());
+        for u in self.users.read().unwrap().iter() {
+            for h in &u.api_key_hashes {
+                let mut diff = 0u8;
+                for (a, b) in digest.iter().zip(h.iter()) {
+                    diff |= a ^ b;
+                }
+                if diff == 0 {
+                    return Some((u.name.clone(), u.role));
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract identity from a request's Cookie, Authorization or
+    /// X-Api-Key header. Used by the middleware and /auth/me.
     pub fn identity_from_headers(
         &self,
         ip: IpAddr,
         cookie: Option<&str>,
         authz: Option<&str>,
+        api_key: Option<&str>,
     ) -> Option<(String, Role)> {
         // Session cookie first.
         if let Some(c) = cookie {
@@ -539,6 +600,13 @@ impl AuthState {
                         return Some((u, r));
                     }
                 }
+            }
+        }
+        // API key: X-Api-Key header or Authorization: Bearer <key>.
+        let bearer = authz.and_then(|v| v.strip_prefix("Bearer "));
+        if let Some(k) = api_key.or(bearer) {
+            if let Some(id) = self.identity_from_api_key(k.trim()) {
+                return Some(id);
             }
         }
         // HTTP Basic for API clients — throttled per-IP like /auth/login
@@ -602,6 +670,7 @@ mod tests {
             name: "alice".into(),
             password_hash: hash_password_iters("s3cret!", TEST_ITERS),
             role: Role::Admin,
+            api_keys: vec![],
         }
     }
 
@@ -640,6 +709,55 @@ mod tests {
         // Basic auth path.
         assert_eq!(st.check_basic("alice", "s3cret!"), Some(Role::Admin));
         assert_eq!(st.check_basic("alice", "no"), None);
+    }
+
+    #[test]
+    fn api_keys() {
+        // Pre-hashed form: sha256:<hex of sha256(key)>.
+        let key2 = "s3cr3t-api-key";
+        let d = api_key_digest(key2).unwrap();
+        let hexed: String = d.iter().map(|b| format!("{:02x}", b)).collect();
+        let mut u = test_user();
+        u.api_keys = vec![
+            "deadbeef".repeat(8),          // plaintext, hashed at load
+            format!("sha256:{}", hexed),   // pre-hashed form
+        ];
+        let st = AuthState::new(
+            vec![User::from_config(&u).unwrap()],
+            None,
+            Some("test-secret".into()),
+            None,
+            false,
+        );
+        // plaintext key resolves
+        assert_eq!(
+            st.identity_from_api_key(&"deadbeef".repeat(8)),
+            Some(("alice".into(), Role::Admin))
+        );
+        // sha256:<hex> form resolves via the raw key
+        assert_eq!(
+            st.identity_from_api_key(key2),
+            Some(("alice".into(), Role::Admin))
+        );
+        // wrong / empty keys fail
+        assert_eq!(st.identity_from_api_key("nope"), None);
+        assert_eq!(st.identity_from_api_key(""), None);
+        // Bearer path through identity_from_headers
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let authz = format!("Bearer {}", "deadbeef".repeat(8));
+        assert_eq!(
+            st.identity_from_headers(ip, None, Some(&authz), None),
+            Some(("alice".into(), Role::Admin))
+        );
+        // X-Api-Key path
+        assert_eq!(
+            st.identity_from_headers(ip, None, None, Some(key2)),
+            Some(("alice".into(), Role::Admin))
+        );
+        // invalid api_keys config entry rejected at load
+        let mut bad = test_user();
+        bad.api_keys = vec!["sha256:zz".into()];
+        assert!(User::from_config(&bad).is_err());
     }
 
     #[test]

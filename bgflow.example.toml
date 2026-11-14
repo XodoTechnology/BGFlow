@@ -190,7 +190,8 @@ cache_ttl_secs = 86400
 asn = "$.asn"
 org = "$.org"
 country = "$.country"
-# Any extra fields are queryable via /api/v1/lookup?ip=
+# Extra fields are lookup-time only (returned by /api/v1/lookup?ip=,
+# not stored on flow records — FlowRecord has fixed columns).
 # handle = "$.handle"
 # irr_as_set = "$.as_set"
 # Optional auth/API-key headers for private backends:
@@ -307,6 +308,13 @@ port = 53
 # name = "noc-viewer"
 # password_hash = "pbkdf2-sha256$600000$<salt_b64>$<hash_b64>"
 # role = "viewer"
+#
+# API keys for scripts/monitoring: send as `Authorization: Bearer <key>`
+# or `X-Api-Key: <key>`. Keys inherit the user's role — an admin key is
+# full admin. Plaintext is hashed (SHA-256) at load; `sha256:<hex>`
+# stores a pre-computed digest instead (key itself never hits disk).
+# Generate: openssl rand -hex 32
+# api_keys = ["<64-hex-chars>"]
 
 # --- Demo traffic -------------------------------------------------------------
 # Send synthetic NetFlow v5 + IPFIX(IPv6) to the first input — handy for
