@@ -1312,6 +1312,27 @@ const chk=(p,label)=>`<label class="chk" style="display:flex;gap:8px;align-items
 const ssetMap=(p,v)=>{const o={};for(const line of v.split('\n')){const m=line.match(/^\s*([^=]+?)\s*=\s*(.+?)\s*$/);if(m)o[m[1].trim()]=m[2].trim()}sset(p,o)};
 const mapArea=(p,title,ph)=>{const o=sv(p)||{};const body=Object.entries(o).map(([k,v])=>`${k} = ${v}`).join('\n');
   return `<div class="fld" style="grid-column:1/-1"><label>${title}${rst(p)}</label><textarea rows="5" style="width:100%;font-family:var(--mono);font-size:11.5px" placeholder="${ph}" oninput="ssetMap('${p}',this.value)">${esc(body)}</textarea></div>`};
+// Array-of-strings editor (one entry per line) — used by `naming`.
+const ssetLines=(p,v)=>sset(p,v.split('\n').map(x=>x.trim()).filter(Boolean));
+const linesArea=(p,title,ph,hint)=>{const body=(sv(p)||[]).join('\n');
+  return `<div class="fld" style="grid-column:1/-1"><label>${title}${rst(p)}</label>
+   ${hint?`<div class="hint" style="font-size:10.5px;margin-bottom:4px">${hint}</div>`:''}
+   <textarea rows="6" style="width:100%;font-family:var(--mono);font-size:11.5px" placeholder="${ph}" oninput="ssetLines('${p}',this.value);namingCount()">${esc(body)}</textarea>
+   <div class="hint" id="naming-count" style="font-size:10.5px;margin-top:2px"></div></div>`};
+// Live validation for `naming` lines — mirrors NamingBook::build:
+// ip|name?|ifindex-name?|vlanid-name? — pairs are "<num>-<name>".
+function namingCount(){
+  const el=document.getElementById('naming-count');if(!el)return;
+  const lines=sv('naming')||[];const bad=[];
+  const pairOk=s=>{if(s==null||!s.trim())return true;return /^\d+-.+$/.test(s.trim())};
+  lines.forEach((l,i)=>{
+    const f=l.split('|');
+    const ipok=/^[0-9a-fA-F.:]+$/.test((f[0]||'').trim());
+    if(!ipok||!pairOk(f[2])||!pairOk(f[3]))bad.push(i+1);
+  });
+  el.textContent=bad.length?`invalid line${bad.length>1?'s':''}: ${bad.join(', ')} — skipped on load`:`${lines.length} entr${lines.length===1?'y':'ies'} — applies per exporter, reload-safe`;
+  el.style.color=bad.length?'#e5534b':'';
+}
 
 async function vSettings(){
   if(!ME||ME.role!=='admin'){content.innerHTML='<div class="err">Admin role required for settings</div>';return}
@@ -1359,9 +1380,10 @@ function renderSettings(){
      ${num('alerts.cooldown_secs','Alert cooldown (s)')}
     </div></div>
    <div class="panel"><h3>Names</h3><div class="flds">
-     ${mapArea('exporter_names','Exporter names','10.0.0.1 = core-rtr-01')}
-     ${mapArea('interface_names','Interface names','2 = ae0')}
-     ${mapArea('vlan_names','VLAN names','250 = Cogent')}
+     ${linesArea('naming','Per-exporter names <span class="muted" style="font-size:10px">(recommended — ifIndex/VLAN ids are device-local)</span>','10.0.0.1|core-rtr-01|2-ae0|250-cogent','One per line: <b>exporter-ip | name | ifindex-ifname | vlanid-vlanname</b> — leave fields empty to skip. Same ifIndex/VLAN can differ per exporter; nothing is guessed globally.')}
+     ${mapArea('exporter_names','Exporter names — global fallback','10.0.0.1 = core-rtr-01')}
+     ${mapArea('interface_names','Interface names — GLOBAL fallback only','2 = ae0')}
+     ${mapArea('vlan_names','VLAN names — GLOBAL fallback only','250 = Cogent')}
     </div></div>
    <div class="panel"><h3>Users</h3>
     <table><thead><tr><th>Name</th><th>Role</th><th>Password</th><th></th><th></th></tr></thead><tbody id="utable">${users||'<tr><td colspan=5 class=muted>No users — auth disabled</td></tr>'}</tbody></table>
@@ -1384,6 +1406,7 @@ function renderSettings(){
   <div style="position:sticky;bottom:0;background:var(--bg);padding:12px 0;display:flex;gap:12px;align-items:center">
    <button class="btn" style="padding:7px 22px" onclick="saveSettings()">Save settings</button>
    <span id="setmsg" class="muted"></span></div>`;
+  namingCount();
 }
 function renderUsers(){
   const tb=document.querySelector('#utable');if(!tb)return;
