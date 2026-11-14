@@ -85,7 +85,7 @@ sample_weighting = false
 # evicts its own oldest segments until it recovers. Set percent of the
 # filesystem, an absolute floor, or both — whichever demands more free
 # space wins. 0 = off. Checked on the retention sweep interval.
-# min_free_pct = 10          # keep 10% of the fs free
+# min_free_pct = 20          # keep 20% free → evict past ~80% disk use
 # min_free_bytes = "5GiB"    # ...or keep 5 GiB free
 # Optional: put datasets on separate mounts — e.g. bulk raw flows on a
 # big disk, rollup stats on a smaller fast one. Each defaults to
