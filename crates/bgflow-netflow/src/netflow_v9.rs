@@ -39,7 +39,11 @@ pub fn parse(
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    debug_assert_eq!(version, 9);
+    // Hint-forced dispatch (ProtoHint::NetFlow9) bypasses auto-detect —
+    // validate the version here since the payload is untrusted.
+    if version != 9 {
+        return Vec::new();
+    }
     let count = match cur.u16() {
         Ok(v) => v as usize,
         Err(_) => return Vec::new(),

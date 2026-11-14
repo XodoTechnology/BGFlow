@@ -63,7 +63,11 @@ pub fn parse(
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    debug_assert_eq!(version, 10);
+    // Hint-forced dispatch (ProtoHint::Ipfix) bypasses auto-detect —
+    // validate the version here since the payload is untrusted.
+    if version != 10 {
+        return Vec::new();
+    }
     let msg_len = match cur.u16() {
         Ok(v) => v as usize,
         Err(_) => return Vec::new(),
