@@ -56,7 +56,12 @@ pub fn resolve(cfgs: &[ExportTargetConfig], boot_ms: i64) -> Vec<ExportTarget> {
         out.push(ExportTarget {
             name,
             addr,
-            exporter: FlowExporter::new(proto, h | 1, boot_ms),
+            exporter: FlowExporter::new(
+                proto,
+                h | 1,
+                boot_ms,
+                c.template_refresh_secs.saturating_mul(1000),
+            ),
             max_datagram: c.max_datagram.clamp(256, 65535),
         });
     }
@@ -140,6 +145,7 @@ mod tests {
                 protocol: "ipfix".into(),
                 name: Some("collector".into()),
                 max_datagram: 9000,
+                template_refresh_secs: 60,
             },
             ExportTargetConfig {
                 address: "not-an-addr".into(),

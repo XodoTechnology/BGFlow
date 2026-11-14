@@ -12,7 +12,7 @@ mod sflow;
 mod stream;
 mod template;
 
-pub use export::{ExportProto, FlowExporter};
+pub use export::{ExportProto, FlowExporter, DEFAULT_TEMPLATE_REFRESH_MS};
 pub use ipfix::BootEstimator;
 pub use netflow_v9::{DomainTemplates, TemplateKey};
 pub use stream::IpfixTcpDecoder;

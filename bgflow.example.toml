@@ -178,10 +178,12 @@ protocol = "auto"
 # metrics), it never affects ingestion or storage.
 #
 # [[export]]
-# address = "10.0.0.5:2055"        # UDP destination
+# address = "10.0.0.5:2055"        # UDP destination (v4 or v6)
 # protocol = "netflow9"            # netflow9 (default) | ipfix
 # name = "upstream-collector"      # optional label for logs/status
 # max_datagram = 1400              # UDP payload cap per datagram
+# template_refresh_secs = 3600     # re-send templates this often; lower
+                                  # values speed collector recovery
 
 # --- HTTP enrichment backends ------------------------------------------------
 # Query external whois/RDAP/IRR services for prefixes/IPs not covered by MMDB.

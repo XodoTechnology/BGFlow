@@ -75,12 +75,17 @@ const IE_VLAN: u16 = 58;
 const IE_FLOW_END_REASON: u16 = 136;
 const IE_IP_TTL: u16 = 192;
 const IE_IP_VERSION: u16 = 60;
+/// IPFIX absolute-time IEs (epoch milliseconds, u64) — IPFIX collectors
+/// expect wall-clock fields; sysUpTime alone leaves first/last unset.
+const IE_START_EPOCH_MS: u16 = 152;
+const IE_END_EPOCH_MS: u16 = 153;
 
 const TEMPLATE_ID_V4: u16 = 256;
 const TEMPLATE_ID_V6: u16 = 257;
-/// Re-send templates at least this often (RFC 3954 recommends periodic
-/// refresh; receivers also re-learn on restart).
-const TEMPLATE_REFRESH_MS: u64 = 3_600_000;
+/// Re-send templates at least this often by default (RFC 3954 recommends
+/// periodic refresh; receivers also re-learn on restart). Per-target
+/// override via FlowExporter::new's refresh_ms argument.
+pub const DEFAULT_TEMPLATE_REFRESH_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy)]
 struct ExField {
@@ -91,7 +96,7 @@ struct ExField {
 /// Ordered template fields for one address family.
 fn fields(proto: ExportProto, v6: bool) -> Vec<ExField> {
     let f = |ie: u16, len: u16| ExField { ie, len };
-    vec![
+    let mut v = vec![
         f(if v6 { IE_SRC_V6 } else { IE_SRC_V4 }, if v6 { 16 } else { 4 }),
         f(if v6 { IE_DST_V6 } else { IE_DST_V4 }, if v6 { 16 } else { 4 }),
         f(IE_SRC_PORT, 2),
@@ -114,7 +119,14 @@ fn fields(proto: ExportProto, v6: bool) -> Vec<ExField> {
         f(IE_FLOW_END_REASON, 1),
         f(IE_IP_TTL, 1),
         f(IE_IP_VERSION, 1),
-    ]
+    ];
+    if proto == ExportProto::Ipfix {
+        // Absolute epoch-ms timestamps — IPFIX receivers (nfcapd et al.)
+        // don't reconstruct time from sysUpTime alone.
+        v.push(f(IE_START_EPOCH_MS, 8));
+        v.push(f(IE_END_EPOCH_MS, 8));
+    }
+    v
 }
 
 /// 16-byte wire form of a stored IP (v4 as IPv4-mapped IPv6).
@@ -134,6 +146,7 @@ pub struct FlowExporter {
     seq: u32,
     last_template_ms: u64,
     templates_sent: bool,
+    template_refresh_ms: u64,
     fields_v4: Vec<ExField>,
     fields_v6: Vec<ExField>,
     /// Cached encoded template flowsets (with set headers).
@@ -144,7 +157,15 @@ pub struct FlowExporter {
 }
 
 impl FlowExporter {
-    pub fn new(proto: ExportProto, source_id: u32, boot_ms: i64) -> Self {
+    /// `template_refresh_ms` controls how often template flowsets are
+    /// re-sent (pass DEFAULT_TEMPLATE_REFRESH_MS for the RFC-style hour,
+    /// or a smaller value for receivers that need faster re-sync).
+    pub fn new(
+        proto: ExportProto,
+        source_id: u32,
+        boot_ms: i64,
+        template_refresh_ms: u64,
+    ) -> Self {
         let fields_v4 = fields(proto, false);
         let fields_v6 = fields(proto, true);
         let rec_len_v4: usize = fields_v4.iter().map(|f| f.len as usize).sum();
@@ -158,6 +179,7 @@ impl FlowExporter {
             seq: 0,
             last_template_ms: 0,
             templates_sent: false,
+            template_refresh_ms: template_refresh_ms.max(1000),
             fields_v4,
             fields_v6,
             tmpl_v4,
@@ -189,7 +211,8 @@ impl FlowExporter {
 
     /// Whether template flowsets should be prepended to the next datagram.
     fn templates_due(&self, now_ms: u64) -> bool {
-        !self.templates_sent || now_ms.saturating_sub(self.last_template_ms) >= TEMPLATE_REFRESH_MS
+        !self.templates_sent
+            || now_ms.saturating_sub(self.last_template_ms) >= self.template_refresh_ms
     }
 
     /// Family decision: genuine IPv6 endpoints use the v6 template;
@@ -257,6 +280,10 @@ impl FlowExporter {
                 IE_FLOW_END_REASON => out.push(f.flow_end_reason),
                 IE_IP_TTL => out.push(f.ip_ttl),
                 IE_IP_VERSION => out.push(if v6 { 6 } else { 4 }),
+                IE_START_EPOCH_MS => out.extend_from_slice(
+                    &f.ts_ms.saturating_sub(f.duration_ms as u64).to_be_bytes(),
+                ),
+                IE_END_EPOCH_MS => out.extend_from_slice(&f.ts_ms.to_be_bytes()),
                 _ => {}
             }
         }
@@ -271,7 +298,7 @@ impl FlowExporter {
         let want_templates = self.templates_due(now_ms);
         let mut templates_pending = want_templates;
         let tmpl_bytes = if want_templates { self.tmpl_v4.len() + self.tmpl_v6.len() } else { 0 };
-        let hdr_len = if self.proto == ExportProto::NetFlow9 { 24 } else { 16 };
+        let hdr_len = if self.proto == ExportProto::NetFlow9 { 20 } else { 16 };
         let mut out: Vec<Vec<u8>> = Vec::new();
         // Greedy pack: v4 and v6 records go into separate data flowsets
         // within each datagram. `body_used` tracks bytes committed to all
@@ -350,7 +377,8 @@ impl FlowExporter {
                 dgram.extend_from_slice(&uptime.to_be_bytes());
                 let unix_s = (now_ms / 1000).min(u32::MAX as u64) as u32;
                 dgram.extend_from_slice(&unix_s.to_be_bytes());
-                dgram.extend_from_slice(&0u32.to_be_bytes()); // nsecs
+                // RFC 3954 v9 header is 20 bytes: no sub-second field
+                // (unixNsecs exists only in the NetFlow v5 header).
                 self.seq = self.seq.wrapping_add(1);
                 dgram.extend_from_slice(&self.seq.to_be_bytes());
                 dgram.extend_from_slice(&self.source_id.to_be_bytes());

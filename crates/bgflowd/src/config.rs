@@ -63,6 +63,10 @@ pub struct ExportTargetConfig {
     /// Max UDP payload bytes per datagram (default 1400, min 256).
     #[serde(default = "default_export_dgram")]
     pub max_datagram: usize,
+    /// Re-send IPFIX/NetFlow templates every N seconds (default 3600;
+    /// lower values help collectors that re-sync frequently).
+    #[serde(default = "default_export_tmpl_refresh")]
+    pub template_refresh_secs: u64,
 }
 
 fn default_export_proto() -> String {
@@ -70,6 +74,9 @@ fn default_export_proto() -> String {
 }
 fn default_export_dgram() -> usize {
     1400
+}
+fn default_export_tmpl_refresh() -> u64 {
+    3600
 }
 
 impl Default for ExportTargetConfig {
@@ -79,6 +86,7 @@ impl Default for ExportTargetConfig {
             protocol: default_export_proto(),
             name: None,
             max_datagram: default_export_dgram(),
+            template_refresh_secs: default_export_tmpl_refresh(),
         }
     }
 }

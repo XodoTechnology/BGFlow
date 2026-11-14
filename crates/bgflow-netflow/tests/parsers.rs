@@ -131,8 +131,7 @@ fn nfv9_header(count: u16, sysup: u32, unix: u32, domain: u32) -> Vec<u8> {
     p.extend_from_slice(&count.to_be_bytes());
     p.extend_from_slice(&sysup.to_be_bytes());
     p.extend_from_slice(&unix.to_be_bytes());
-    p.extend_from_slice(&0u32.to_be_bytes()); // unixNsecs (RFC 3954)
-    p.extend_from_slice(&1u32.to_be_bytes()); // flowSequence
+    p.extend_from_slice(&1u32.to_be_bytes()); // sequence number (RFC 3954)
     p.extend_from_slice(&domain.to_be_bytes()); // source id
     p
 }

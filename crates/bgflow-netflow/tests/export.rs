@@ -2,7 +2,9 @@
 //! own NetFlow v9 / IPFIX decoders — the strongest available check that
 //! templates, field layouts and headers are wire-correct.
 
-use bgflow_netflow::{parse_datagram, ExportProto, FlowExporter, ProtoHint, SessionState};
+use bgflow_netflow::{
+    parse_datagram, ExportProto, FlowExporter, ProtoHint, SessionState, DEFAULT_TEMPLATE_REFRESH_MS,
+};
 use bgflow_types::{ip_to_u128, ip_string, FlowRecord};
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -49,7 +51,7 @@ fn sample_flows() -> Vec<FlowRecord> {
 }
 
 fn roundtrip(proto: ExportProto, hint: ProtoHint) -> Vec<FlowRecord> {
-    let mut ex = FlowExporter::new(proto, 1, BOOT_MS);
+    let mut ex = FlowExporter::new(proto, 1, BOOT_MS, DEFAULT_TEMPLATE_REFRESH_MS);
     let datagrams = ex.encode(&sample_flows(), NOW_MS, 1400);
     assert!(!datagrams.is_empty());
     let mut st = SessionState::default();
@@ -108,31 +110,31 @@ fn ipfix_roundtrip() {
 
 #[test]
 fn templates_refresh_and_packing() {
-    let mut ex = FlowExporter::new(ExportProto::NetFlow9, 7, BOOT_MS);
+    let mut ex = FlowExporter::new(ExportProto::NetFlow9, 7, BOOT_MS, 3_600_000);
     let flows = sample_flows();
     // First datagram carries template flowsets (set id 0).
     let d1 = ex.encode(&flows, NOW_MS, 1400);
     assert!(!d1.is_empty());
     let first = &d1[0];
-    // header: ver(2) count(2) ... then first set id at offset 20
-    assert_eq!(u16::from_be_bytes([first[24], first[25]]), 0, "template set first");
+    // RFC 3954 v9 header is 20 bytes — first set id sits at offset 20.
+    assert_eq!(u16::from_be_bytes([first[20], first[21]]), 0, "template set first");
     // Same timestamp again -> no templates.
     let d2 = ex.encode(&flows, NOW_MS + 60_000, 1400);
     let has_template = d2.iter().any(|d| {
-        d.len() > 26 && u16::from_be_bytes([d[24], d[25]]) == 0
+        d.len() > 22 && u16::from_be_bytes([d[20], d[21]]) == 0
     });
     assert!(!has_template, "no template resend within refresh window");
     // Past refresh window -> templates again.
     let d3 = ex.encode(&flows, NOW_MS + 3_700_000, 1400);
     let has_template = d3.iter().any(|d| {
-        d.len() > 26 && u16::from_be_bytes([d[24], d[25]]) == 0
+        d.len() > 22 && u16::from_be_bytes([d[20], d[21]]) == 0
     });
     assert!(has_template, "template resent after refresh window");
 }
 
 #[test]
 fn empty_and_small_datagrams() {
-    let mut ex = FlowExporter::new(ExportProto::NetFlow9, 1, BOOT_MS);
+    let mut ex = FlowExporter::new(ExportProto::NetFlow9, 1, BOOT_MS, 3_600_000);
     assert!(ex.encode(&[], NOW_MS, 1400).is_empty());
     // Small-ish cap forces multiple datagrams (templates alone ~192B) —
     // every one must fit and decode.
