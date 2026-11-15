@@ -66,45 +66,53 @@ sudo systemctl enable --now bgflowd    # unless you passed --start
 
 ## Option 2: Docker
 
+Prebuilt multi-arch images are published to GHCR on every release —
+no build step needed:
+
+```bash
+docker run -d --name bgflowd --restart unless-stopped \
+  -p 8080:8080 -p 2055:2055/udp -p 4739:4739 \
+  -v bgflow-data:/var/lib/bgflow \
+  -e BGFLOW_ADMIN_PASSWORD='choose-a-password' \
+  ghcr.io/xodotechnology/bgflow:latest
+# UI → http://localhost:8080 — log in as admin / your password
+```
+
+Or with compose (builds from source, or pulls the published image):
+
 ```bash
 git clone https://github.com/XodoTechnology/BGFlow.git
 cd BGFlow
-docker compose up -d --build
+BGFLOW_ADMIN_PASSWORD='choose-a-password' docker compose up -d --build
 ```
 
-Or with an explicit compose file / image:
+**Auth**: the stock example config has no users — the UI/API is open.
+Set `BGFLOW_ADMIN_PASSWORD` (and optionally `BGFLOW_ADMIN_USER`) to
+create an admin user on first boot; it persists in the `bgflow-data`
+volume and is managed via **Settings → Users** afterwards. For full
+control, mount your own config instead:
 
 ```bash
-docker build -t bgflow .
-docker run -d --name bgflow \
-  -p 8080:8080 -p 2055:2055/udp \
-  -v bgflow-data:/var/lib/bgflow \
-  -v /path/to/bgflow.toml:/etc/bgflow/bgflow.toml:ro \
-  bgflow
-```
-
-The container listens on UDP 2055 + TCP 4739 (flow inputs) and TCP 8080
-(UI/API) by default. **Auth is OFF with the stock example config** —
-`docker compose` mounts `bgflow.example.toml`, which has no users. For
-anything beyond a throwaway test, create your own config with a
-`[[users]]` entry (see "Securing a public deployment" below) and point
-at it:
-
-```bash
-cp bgflow.example.toml bgflow.toml   # then add a [[users]] block
 BGFLOW_CONFIG=./bgflow.toml docker compose up -d
 ```
 
-Or with `docker run`, mount your config the same way. TLS inside the
-container works via `server.tls_cert`/`tls_key` in your config — for
-production, terminating TLS at a reverse proxy in front of the
-container is equally fine.
+The container listens on UDP 2055 + TCP 4739 (flow inputs) and TCP 8080
+(UI/API) by default, runs as a non-root user, and has a built-in
+healthcheck on `/api/v1/health`. TLS inside the container works via
+`server.tls_cert`/`tls_key` in your config — for production, terminating
+TLS at a reverse proxy in front of the container is equally fine.
 
 Environment overrides (applied after the config file, env wins):
 
 - `BGFLOW_HTTP_LISTEN` — e.g. `0.0.0.0:8080`
 - `BGFLOW_DATA_DIR` — e.g. `/var/lib/bgflow`
+- `BGFLOW_ADMIN_USER` / `BGFLOW_ADMIN_PASSWORD` — first-boot admin user
 - `RUST_LOG` — log filter (e.g. `info`, `bgflowd=debug`)
+
+**Updating**: `sh update.sh [version]` from the repo root — pulls the
+new image and recreates the compose deployment, then waits for the
+healthcheck. **Removing**: `docker compose down` (`-v` also deletes the
+data volume).
 
 ## Option 3: from source
 

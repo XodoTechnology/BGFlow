@@ -100,6 +100,35 @@ Verify stored segment integrity at any time:
 bgflowd doctor    # CRC-checks every .bfs segment under data_dir
 ```
 
+### Docker
+
+Prebuilt multi-arch images are published to GHCR on every release:
+
+```bash
+docker run -d --name bgflowd --restart unless-stopped \
+  -p 8080:8080 -p 2055:2055/udp -p 4739:4739 \
+  -v bgflow-data:/var/lib/bgflow \
+  -e BGFLOW_ADMIN_PASSWORD='choose-a-password' \
+  ghcr.io/xodotechnology/bgflow:latest
+```
+
+Or with compose (clone the repo, edit `.env` or export the vars):
+
+```bash
+git clone https://github.com/XodoTechnology/BGFlow.git && cd BGFlow
+BGFLOW_ADMIN_PASSWORD='choose-a-password' docker compose up -d
+```
+
+- **Auth**: the stock config has no users (open). Setting
+  `BGFLOW_ADMIN_PASSWORD` creates an `admin` user on first boot —
+  persisted in the data volume, managed via UI → Settings afterwards.
+  `BGFLOW_ADMIN_USER` renames it (default `admin`).
+- **Update**: `sh update.sh [version]` — pulls the new image and
+  recreates via compose, waits for the healthcheck.
+- **Teardown**: `docker compose down` (add `-v` to also wipe flow data).
+- Env overrides: `BGFLOW_HTTP_LISTEN`, `BGFLOW_DATA_DIR`, `RUST_LOG`,
+  `BGFLOW_CONFIG` (custom config mount in compose).
+
 ### Authentication & users
 
 Protect the UI/API with `[[users]]` — PBKDF2-SHA256 password hashes and

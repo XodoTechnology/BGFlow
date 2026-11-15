@@ -1,22 +1,32 @@
 services:
   bgflowd:
+    # Published image (updated by update.sh / `docker compose pull`).
+    # `build: .` stays so `docker compose up --build` works from source.
+    image: ${BGFLOW_IMAGE:-ghcr.io/xodotechnology/bgflow}:${BGFLOW_TAG:-latest}
     build: .
-    image: bgflow:latest
     container_name: bgflowd
     restart: unless-stopped
     ports:
       - "8080:8080"        # UI + API
       - "2055:2055/udp"    # flow input: NFv5/v9, IPFIX, sFlow (auto)
       - "4739:4739"        # flow input: IPFIX over TCP
+      # - "6343:6343/udp"  # uncomment + enable sFlow in your config
     volumes:
       - bgflow-data:/var/lib/bgflow
       # WARNING: bgflow.example.toml ships with NO users — auth is OFF
-      # and the UI/API is wide open. Copy it, add a [[users]] entry
-      # (see INSTALL.md), and point BGFLOW_CONFIG at your copy:
+      # and the UI/API is wide open. For anything beyond a throwaway
+      # test, set BGFLOW_ADMIN_PASSWORD below (creates an admin user on
+      # first boot) or mount your own config with [[users]]:
       #   - ${BGFLOW_CONFIG:-./bgflow.local.toml}:/etc/bgflow/bgflow.toml:ro
       - ${BGFLOW_CONFIG:-./bgflow.example.toml}:/etc/bgflow/bgflow.toml:ro
     environment:
       - RUST_LOG=info
+      # First-boot admin bootstrap (only when the data volume is empty).
+      # Leave unset for an open dev instance; set for anything real.
+      - BGFLOW_ADMIN_USER=${BGFLOW_ADMIN_USER:-}
+      - BGFLOW_ADMIN_PASSWORD=${BGFLOW_ADMIN_PASSWORD:-}
+      # - BGFLOW_HTTP_LISTEN=0.0.0.0:8080
+      # - BGFLOW_DATA_DIR=/var/lib/bgflow
 
 volumes:
   bgflow-data:
