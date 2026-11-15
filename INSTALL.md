@@ -116,18 +116,39 @@ data volume).
 
 ## Option 3: from source
 
+Prerequisite: Rust 1.88+ (`curl https://sh.rustup.rs -sSf | sh`).
+The UI is a single self-contained `index.html` embedded at build time —
+no Node/frontend toolchain needed.
+
 ```bash
 git clone https://github.com/XodoTechnology/BGFlow.git
 cd BGFlow
 cargo build --release -p bgflowd
+
 sudo install -m755 target/release/bgflowd /usr/local/bin/
+sudo useradd --system --home /var/lib/bgflow --shell /usr/sbin/nologin bgflow
 sudo mkdir -p /etc/bgflow /var/lib/bgflow
+sudo chown -R bgflow:bgflow /var/lib/bgflow
 sudo cp bgflow.example.toml /etc/bgflow/bgflow.toml
-sudo nano /etc/bgflow/bgflow.toml
+sudo nano /etc/bgflow/bgflow.toml    # set [[users]] + storage before first start
 ```
 
-Then install the systemd unit (see `deploy/bgflowd.service`) or run
-`bgflowd --config /etc/bgflow/bgflow.toml` directly.
+Validate the config before starting: `bgflowd config-check --config
+/etc/bgflow/bgflow.toml`. Create a user password hash with
+`bgflowd hash-password` (see "Securing a public deployment" below).
+
+systemd:
+
+```bash
+sudo cp deploy/bgflowd.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bgflowd
+```
+
+`systemctl reload bgflowd` (SIGHUP) applies config changes without
+dropping ingest. Or skip systemd and run
+`bgflowd --config /etc/bgflow/bgflow.toml` directly — handy for
+development (`cargo run -p bgflowd`).
 
 ## Pointing exporters at it
 

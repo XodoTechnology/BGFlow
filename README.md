@@ -204,7 +204,8 @@ cargo build --release -p bgflowd
 # binary: target/release/bgflowd
 ```
 
-Requires Rust 1.88+ (developed on 1.99).
+Requires Rust 1.88+ (developed on 1.99). See [INSTALL.md](INSTALL.md)
+for full setup — systemd unit, config, and user creation.
 
 ## Configuration
 
