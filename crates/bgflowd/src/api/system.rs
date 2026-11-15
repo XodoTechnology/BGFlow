@@ -74,6 +74,7 @@ pub(super) fn status_payload(st: &AppState) -> serde_json::Value {
         "orgs": st.ctx.orgs.len(),
         "rules": st.ctx.rules.len(),
         "inputs": cfg.inputs.iter().map(|i| i.listen.to_string()).collect::<Vec<_>>(),
+        "input_status": st.metrics.input_states(),
         "auth": {
             "enabled": !st.auth.is_open(),
             "users": st.auth.user_count(),

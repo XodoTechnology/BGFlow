@@ -41,9 +41,15 @@ pub fn spawn_all(
             let tx = tx.clone();
             let sh = shared.clone_sh();
             let c = cfg.clone();
+            let key = input_key("udp", c.listen);
+            shared.metrics.set_input_state(&key, "starting");
             handles.push(tokio::spawn(async move {
-                if let Err(e) = run_udp(c, tx, sh).await {
-                    tracing::error!("udp ingest failed: {}", e);
+                match run_udp(c, tx, sh.clone_sh()).await {
+                    Ok(()) => sh.metrics.set_input_state(&key, "stopped"),
+                    Err(e) => {
+                        sh.metrics.set_input_state(&key, &format!("failed: {}", e));
+                        tracing::error!("udp ingest failed: {}", e);
+                    }
                 }
             }));
         }
@@ -55,14 +61,23 @@ pub fn spawn_all(
                     "input {}: tcp transport only supports ipfix/auto, skipping tcp listener",
                     cfg.listen
                 );
+                shared
+                    .metrics
+                    .set_input_state(&input_key("tcp", cfg.listen), "skipped");
                 continue;
             }
             let tx = tx.clone();
             let sh = shared.clone_sh();
             let c = cfg.clone();
+            let key = input_key("tcp", c.listen);
+            shared.metrics.set_input_state(&key, "starting");
             handles.push(tokio::spawn(async move {
-                if let Err(e) = run_tcp(c, tx, sh).await {
-                    tracing::error!("tcp ingest failed: {}", e);
+                match run_tcp(c, tx, sh.clone_sh()).await {
+                    Ok(()) => sh.metrics.set_input_state(&key, "stopped"),
+                    Err(e) => {
+                        sh.metrics.set_input_state(&key, &format!("failed: {}", e));
+                        tracing::error!("tcp ingest failed: {}", e);
+                    }
                 }
             }));
         }
@@ -81,6 +96,10 @@ impl IngestShared {
             policy: self.policy.clone(),
         }
     }
+}
+
+fn input_key(proto: &str, listen: std::net::SocketAddr) -> String {
+    format!("{}/{}", proto, listen)
 }
 
 /// Admission check: drop datagrams from exporters the policy rejects.
@@ -146,6 +165,9 @@ async fn run_udp(
         cfg.protocol,
         if cfg.udp_buffer_bytes > 0 { cfg.udp_buffer_bytes } else { 0 }
     );
+    shared
+        .metrics
+        .set_input_state(&input_key("udp", cfg.listen), "up");
 
     let mut buf = vec![0u8; 65535];
     let mut state = SessionState::default();
@@ -193,6 +215,9 @@ async fn run_tcp(
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     tracing::info!("ingest: tcp listening on {} (ipfix)", cfg.listen);
+    shared
+        .metrics
+        .set_input_state(&input_key("tcp", cfg.listen), "up");
     let allowed: Vec<IpAddr> = cfg.allowed_exporters.clone();
     // Bound concurrent connections so a hostile/buggy peer can't exhaust
     // tasks+memory. 0 = unlimited.

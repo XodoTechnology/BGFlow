@@ -1,6 +1,6 @@
 //! Prometheus metrics + internal counters.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -61,6 +61,10 @@ pub struct Metrics {
     /// Per-path HTTP stats: count, total handler ms, 5xx count.
     pub http: Mutex<HashMap<String, HttpStat>>,
     pub exporters: Mutex<HashMap<IpAddr, ExporterStat>>,
+    /// Flow-input listener state, keyed "proto/listen" (e.g.
+    /// "udp/0.0.0.0:2055"): starting → up, or "failed: <err>" /
+    /// "skipped". Written by ingest tasks, read by /status + /metrics.
+    pub input_state: Mutex<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +91,17 @@ impl Metrics {
         e.records += records as u64;
         e.bytes_in += payload_len as u64;
         e.last_seen_ms = now_ms();
+    }
+
+    pub fn set_input_state(&self, key: &str, state: &str) {
+        self.input_state
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), state.to_string());
+    }
+
+    pub fn input_states(&self) -> BTreeMap<String, String> {
+        self.input_state.lock().unwrap().clone()
     }
 
     pub fn render(&self) -> String {
@@ -162,6 +177,18 @@ impl Metrics {
         s.push_str(&format!("bgflow_retention_freed_bytes_total {}\n", g(&self.bytes_freed)));
         s.push_str("# HELP bgflow_disk_free_bytes Free bytes on the data filesystem\n# TYPE bgflow_disk_free_bytes gauge\n");
         s.push_str(&format!("bgflow_disk_free_bytes {}\n", g(&self.disk_free_bytes)));
+        {
+            let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+            let inputs = self.input_state.lock().unwrap();
+            s.push_str("# HELP bgflow_ingest_input_up 1 when the flow-input listener is bound and reading\n# TYPE bgflow_ingest_input_up gauge\n");
+            for (k, v) in inputs.iter() {
+                s.push_str(&format!(
+                    "bgflow_ingest_input_up{{input=\"{}\"}} {}\n",
+                    esc(k),
+                    if v == "up" { 1 } else { 0 }
+                ));
+            }
+        }
 
         let map = self.exporters.lock().unwrap();
         s.push_str("# HELP bgflow_exporter_datagrams_total Datagrams per exporter\n# TYPE bgflow_exporter_datagrams_total counter\n");
