@@ -6,9 +6,14 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"        # UI + API
-      - "2055:2055/udp"    # flow input (add more as needed)
+      - "2055:2055/udp"    # flow input: NFv5/v9, IPFIX, sFlow (auto)
+      - "4739:4739"        # flow input: IPFIX over TCP
     volumes:
       - bgflow-data:/var/lib/bgflow
+      # WARNING: bgflow.example.toml ships with NO users — auth is OFF
+      # and the UI/API is wide open. Copy it, add a [[users]] entry
+      # (see INSTALL.md), and point BGFLOW_CONFIG at your copy:
+      #   - ${BGFLOW_CONFIG:-./bgflow.local.toml}:/etc/bgflow/bgflow.toml:ro
       - ${BGFLOW_CONFIG:-./bgflow.example.toml}:/etc/bgflow/bgflow.toml:ro
     environment:
       - RUST_LOG=info

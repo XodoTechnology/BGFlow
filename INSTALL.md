@@ -21,6 +21,8 @@ sh install.sh --admin-user netops     # admin username (default: admin)
 sh install.sh --demo                  # enable the built-in traffic demo
 sh install.sh --version v0.1.0        # pin a version
 sh install.sh --prefix /opt/bgflow    # install prefix
+sh install.sh --tls-selfsigned        # HTTPS with a self-signed cert
+sh install.sh --tls-cert crt --tls-key key   # HTTPS with your own cert
 ```
 
 Or via environment: `BGFLOW_VERSION`, `BGFLOW_INSTALL_DIR`.
@@ -51,13 +53,22 @@ docker run -d --name bgflow \
   bgflow
 ```
 
-The container listens on UDP 2055 (flow input) and TCP 8080 (UI/API) by
-default. `docker compose` mounts `bgflow.example.toml` read-only — create
-your own `bgflow.toml` and point at it instead:
+The container listens on UDP 2055 + TCP 4739 (flow inputs) and TCP 8080
+(UI/API) by default. **Auth is OFF with the stock example config** —
+`docker compose` mounts `bgflow.example.toml`, which has no users. For
+anything beyond a throwaway test, create your own config with a
+`[[users]]` entry (see "Securing a public deployment" below) and point
+at it:
 
 ```bash
+cp bgflow.example.toml bgflow.toml   # then add a [[users]] block
 BGFLOW_CONFIG=./bgflow.toml docker compose up -d
 ```
+
+Or with `docker run`, mount your config the same way. TLS inside the
+container works via `server.tls_cert`/`tls_key` in your config — for
+production, terminating TLS at a reverse proxy in front of the
+container is equally fine.
 
 Environment overrides (applied after the config file, env wins):
 

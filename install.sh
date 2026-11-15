@@ -4,6 +4,8 @@
 # Usage: curl -fsSL .../install.sh | sudo sh
 #        sh install.sh [--version vX.Y.Z] [--prefix /usr/local]
 #                       [--http 0.0.0.0:8080] [--admin-user admin] [--demo] [--start]
+#                       [--tls-cert /path/tls.crt --tls-key /path/tls.key]
+#                       [--tls-selfsigned]
 set -eu
 
 REPO="XodoTechnology/BGFlow"
@@ -13,6 +15,9 @@ HTTP_ADDR="0.0.0.0:8080"
 DEMO=0
 START=0
 ADMIN_USER="admin"
+TLS_CERT=""
+TLS_KEY=""
+TLS_SELFSIGNED=0
 
 # --- args --------------------------------------------------------------------
 while [ $# -gt 0 ]; do
@@ -25,12 +30,20 @@ while [ $# -gt 0 ]; do
     --http=*)  HTTP_ADDR="${1#*=}"; shift ;;
     --admin-user) ADMIN_USER="$2"; shift 2 ;;
     --admin-user=*) ADMIN_USER="${1#*=}"; shift ;;
+    --tls-cert) TLS_CERT="$2"; shift 2 ;;
+    --tls-cert=*) TLS_CERT="${1#*=}"; shift ;;
+    --tls-key) TLS_KEY="$2"; shift 2 ;;
+    --tls-key=*) TLS_KEY="${1#*=}"; shift ;;
+    --tls-selfsigned) TLS_SELFSIGNED=1; shift ;;
     --demo)    DEMO=1; shift ;;
     --start)   START=1; shift ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Values land inside a TOML file — reject anything that could break
 # out of the string literal.
@@ -42,13 +55,22 @@ case "$HTTP_ADDR" in
 esac
 HTTP_PORT="${HTTP_ADDR##*:}"
 
+# TLS option sanity — fail before downloading anything.
+if [ "$TLS_SELFSIGNED" = "1" ] && { [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; }; then
+  die "--tls-selfsigned cannot be combined with --tls-cert/--tls-key"
+fi
+if [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
+  if [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; then
+    die "--tls-cert and --tls-key must be given together"
+  fi
+  [ -f "$TLS_CERT" ] || die "tls cert not found: $TLS_CERT"
+  [ -f "$TLS_KEY" ]  || die "tls key not found: $TLS_KEY"
+fi
+
 BINDIR="$PREFIX/bin"
 SYSCONFDIR="/etc/bgflow"
 DATADIR="/var/lib/bgflow"
 USER_NAME="bgflow"
-
-info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (or with sudo)"
 
@@ -117,18 +139,58 @@ if [ ! -f "$SYSCONFDIR/bgflow.toml" ]; then
   HASH="$(printf '%s' "$ADMIN_PASS" | "$BINDIR/bgflowd" hash-password | head -1)"
   [ -n "$HASH" ] || die "could not generate password hash"
 
+  # TLS material: user-supplied pair, or a self-signed cert for
+  # homelab use (browsers will still warn — real certs belong behind
+  # a reverse proxy or from a proper CA).
+  TLS_LINES=""
+  SCHEME="http"
+  if [ "$TLS_SELFSIGNED" = "1" ]; then
+    command -v openssl >/dev/null 2>&1 || \
+      die "--tls-selfsigned needs openssl — install it or pass --tls-cert/--tls-key"
+    TLS_DIR="$SYSCONFDIR/tls"
+    mkdir -p "$TLS_DIR"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout "$TLS_DIR/tls.key" -out "$TLS_DIR/tls.crt" -days 3650 \
+      -subj "/CN=bgflow" \
+      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 \
+      || die "openssl cert generation failed"
+    chown -R "$USER_NAME:$USER_NAME" "$TLS_DIR" 2>/dev/null || true
+    chmod 0640 "$TLS_DIR/tls.key"; chmod 0644 "$TLS_DIR/tls.crt"
+    TLS_CERT="$TLS_DIR/tls.crt"; TLS_KEY="$TLS_DIR/tls.key"
+    info "generated self-signed cert in $TLS_DIR (valid 10y, browsers will warn)"
+  fi
+  if [ -n "$TLS_CERT" ]; then
+    TLS_LINES="tls_cert = \"$TLS_CERT\"
+tls_key = \"$TLS_KEY\""
+    SCHEME="https"
+  fi
+
   cat > "$SYSCONFDIR/bgflow.toml" <<EOF
 [server]
 http_listen = "$HTTP_ADDR"
+$TLS_LINES
 
 [storage]
 data_dir = "$DATADIR"
 raw_retention_days = 7
 rollup_retention_days = 90
+# Evict oldest segments when the data filesystem exceeds ~80% used
+# (keeps 20% free). Also capped by max_bytes below if set.
+min_free_pct = 20
 
+# NetFlow v5/v9, IPFIX and sFlow over UDP — the common exporter target.
 [[inputs]]
 listen = "0.0.0.0:2055"
 protocol = "auto"
+udp_buffer_bytes = 4194304
+# For IPv6 exporters use "[::]:2055" INSTEAD of the v4 socket above —
+# do not bind both or v4 datagrams arrive twice.
+
+# IPFIX over TCP — the standard port most routers/switches export to.
+[[inputs]]
+listen = "0.0.0.0:4739"
+protocol = "ipfix"
+transport = "tcp"
 
 [[users]]
 name = "$ADMIN_USER"
@@ -144,8 +206,9 @@ EOF
   fi
   cat >> "$SYSCONFDIR/bgflow.toml" <<EOF
 
-# Everything else (retention, disk cap, SNMP, names, rules, users) is
-# editable live in the UI under Settings — no restart needed for most.
+# Everything else (retention, disk cap, SNMP, GeoIP, names, rules,
+# users) is editable live in the UI under Settings — no restart needed
+# for most. See bgflow.example.toml for every option.
 EOF
   chmod 0640 "$SYSCONFDIR/bgflow.toml"
   chown root:"$USER_NAME" "$SYSCONFDIR/bgflow.toml" 2>/dev/null || true
@@ -154,6 +217,9 @@ else
   info "keeping existing $SYSCONFDIR/bgflow.toml"
   ADMIN_PASS=""
 fi
+# Scheme for health check + summary — detect from the effective config
+# so re-runs on a TLS-enabled install still report correctly.
+if grep -q '^tls_cert' "$SYSCONFDIR/bgflow.toml" 2>/dev/null; then SCHEME="https"; fi
 
 # --- systemd -----------------------------------------------------------------
 if [ -d /etc/systemd/system ]; then
@@ -193,9 +259,11 @@ if [ "$START" = "1" ] && [ -d /etc/systemd/system ]; then
   systemctl enable bgflowd >/dev/null 2>&1 || true
   systemctl restart bgflowd
   # Wait for the health endpoint (unauthenticated) — up to ~15s.
+  HCURL="http://127.0.0.1:$HTTP_PORT/api/v1/health"
+  [ "$SCHEME" = "https" ] && HCURL="https://127.0.0.1:$HTTP_PORT/api/v1/health"
   i=0
   while [ $i -lt 30 ]; do
-    if curl -fsS --max-time 2 "http://127.0.0.1:$HTTP_PORT/api/v1/health" >/dev/null 2>&1; then
+    if curl -fsSk --max-time 2 "$HCURL" >/dev/null 2>&1; then
       info "bgflowd is up — health check passed"
       break
     fi
@@ -218,21 +286,31 @@ cat <<EOF
 ┌──────────────────────────────────────────────────────────────┐
 │  BGFlow $VERSION installed                                    │
 ├──────────────────────────────────────────────────────────────┤
-│  UI:        http://<this-host>:$HTTP_PORT                      │
+│  UI:        $SCHEME://<this-host>:$HTTP_PORT                    │
 │  Login:     $ADMIN_USER / ${ADMIN_PASS:-<existing password>}                │
 │  Config:    $SYSCONFDIR/bgflow.toml                             │
 │  Data:      $DATADIR                                            │
 │  Service:   systemctl enable --now bgflowd                     │
 ├──────────────────────────────────────────────────────────────┤
 │  Flow ingest:  UDP 2055 (auto: NFv5/v9, IPFIX, sFlow)          │
-│                TCP 4739 (IPFIX) — add [[inputs]] as needed     │
+│                TCP 4739 (IPFIX)                                │
 │                                                              │
 │  Most settings are editable live in the UI → Settings.        │
-│  Firewall: open UDP 2055 (+ TCP 4739) from your exporters,    │
+│  Firewall: open UDP 2055 + TCP 4739 from your exporters,      │
 │  and $HTTP_PORT for the UI if remote.                           │
-│                                                              │
-│  Auth is on but TLS is off — put it behind a TLS reverse      │
-│  proxy or set server.tls_cert/tls_key before exposing it.     │
+EOF
+if [ "$SCHEME" = "https" ]; then
+cat <<EOF
+│  TLS:        enabled ($([ "$TLS_SELFSIGNED" = "1" ] && echo "self-signed — browsers will warn" || echo "provided cert")) │
+EOF
+else
+cat <<EOF
+│  TLS:        OFF — auth passwords cross the wire in cleartext. │
+│              Re-run with --tls-selfsigned or --tls-cert/--tls-key│
+│              or put bgflowd behind a TLS reverse proxy.         │
+EOF
+fi
+cat <<EOF
 └──────────────────────────────────────────────────────────────┘
 EOF
 if [ -n "$ADMIN_PASS" ]; then
