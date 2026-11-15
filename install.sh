@@ -6,6 +6,7 @@
 #                       [--http 0.0.0.0:8080] [--admin-user admin] [--demo] [--start]
 #                       [--tls-cert /path/tls.crt --tls-key /path/tls.key]
 #                       [--tls-selfsigned]
+#                       [--domain flows.example.com]   (Caddy + Let's Encrypt)
 set -eu
 
 REPO="XodoTechnology/BGFlow"
@@ -18,6 +19,9 @@ ADMIN_USER="admin"
 TLS_CERT=""
 TLS_KEY=""
 TLS_SELFSIGNED=0
+DOMAIN=""
+HTTP_SET=0
+SCHEME="http"
 
 # --- args --------------------------------------------------------------------
 while [ $# -gt 0 ]; do
@@ -26,8 +30,8 @@ while [ $# -gt 0 ]; do
     --version=*) VERSION="${1#*=}"; shift ;;
     --prefix)  PREFIX="$2";  shift 2 ;;
     --prefix=*) PREFIX="${1#*=}"; shift ;;
-    --http)    HTTP_ADDR="$2"; shift 2 ;;
-    --http=*)  HTTP_ADDR="${1#*=}"; shift ;;
+    --http)    HTTP_ADDR="$2"; HTTP_SET=1; shift 2 ;;
+    --http=*)  HTTP_ADDR="${1#*=}"; HTTP_SET=1; shift ;;
     --admin-user) ADMIN_USER="$2"; shift 2 ;;
     --admin-user=*) ADMIN_USER="${1#*=}"; shift ;;
     --tls-cert) TLS_CERT="$2"; shift 2 ;;
@@ -35,6 +39,8 @@ while [ $# -gt 0 ]; do
     --tls-key) TLS_KEY="$2"; shift 2 ;;
     --tls-key=*) TLS_KEY="${1#*=}"; shift ;;
     --tls-selfsigned) TLS_SELFSIGNED=1; shift ;;
+    --domain)   DOMAIN="$2"; shift 2 ;;
+    --domain=*) DOMAIN="${1#*=}"; shift ;;
     --demo)    DEMO=1; shift ;;
     --start)   START=1; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
@@ -65,6 +71,23 @@ if [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
   fi
   [ -f "$TLS_CERT" ] || die "tls cert not found: $TLS_CERT"
   [ -f "$TLS_KEY" ]  || die "tls key not found: $TLS_KEY"
+fi
+
+# --domain puts Caddy in front with automatic Let's Encrypt certs.
+# bgflowd then speaks plain HTTP on loopback only — Caddy owns :80/:443.
+if [ -n "$DOMAIN" ]; then
+  case "$DOMAIN" in
+    *[!A-Za-z0-9.-]*|.*|*..*|*.) \
+      die "--domain must be a plain hostname (e.g. flows.example.com)" ;;
+  esac
+  if [ "$TLS_SELFSIGNED" = "1" ] || [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
+    die "--domain cannot be combined with --tls-* options (Caddy terminates TLS)"
+  fi
+  HTTP_PORT="${HTTP_ADDR##*:}"
+  if [ "$HTTP_SET" = "1" ] && [ "${HTTP_ADDR%%:*}" != "127.0.0.1" ]; then
+    info "note: --domain proxies via 127.0.0.1 — binding bgflowd to loopback, not $HTTP_ADDR"
+  fi
+  HTTP_ADDR="127.0.0.1:$HTTP_PORT"
 fi
 
 BINDIR="$PREFIX/bin"
@@ -143,7 +166,6 @@ if [ ! -f "$SYSCONFDIR/bgflow.toml" ]; then
   # homelab use (browsers will still warn — real certs belong behind
   # a reverse proxy or from a proper CA).
   TLS_LINES=""
-  SCHEME="http"
   if [ "$TLS_SELFSIGNED" = "1" ]; then
     command -v openssl >/dev/null 2>&1 || \
       die "--tls-selfsigned needs openssl — install it or pass --tls-cert/--tls-key"
@@ -221,6 +243,86 @@ fi
 # so re-runs on a TLS-enabled install still report correctly.
 if grep -q '^tls_cert' "$SYSCONFDIR/bgflow.toml" 2>/dev/null; then SCHEME="https"; fi
 
+# --- caddy reverse proxy (--domain) -------------------------------------------
+# Caddy obtains and renews the Let's Encrypt cert itself; bgflowd stays
+# plain HTTP on loopback. Requires DNS for $DOMAIN pointing here and
+# TCP 80+443 reachable — noted again in the final summary.
+install_caddy() {
+  command -v caddy >/dev/null 2>&1 && { info "caddy already installed"; return 0; }
+  if command -v apt-get >/dev/null 2>&1; then
+    info "installing caddy via apt"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https >/dev/null 2>&1 || true
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+      || die "could not fetch caddy apt key"
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+      > /etc/apt/sources.list.d/caddy-stable.list \
+      || die "could not fetch caddy apt repo"
+    apt-get update -qq >/dev/null
+    # Non-fatal: apt can fail on unrelated broken packages even when
+    # caddy itself installed fine — the command -v check below decides.
+    apt-get install -y -qq caddy >/dev/null 2>&1 \
+      || info "warn: apt install returned an error — verifying caddy anyway"
+  elif command -v dnf >/dev/null 2>&1; then
+    info "installing caddy via dnf"
+    dnf install -y -q caddy >/dev/null 2>&1 \
+      || { dnf install -y -q 'dnf-command(copr)' >/dev/null 2>&1 \
+           && copr enable -y @caddy/caddy >/dev/null 2>&1 \
+           && dnf install -y -q caddy >/dev/null 2>&1; } \
+      || die "could not install caddy — see caddyserver.com/docs/install"
+  elif command -v yum >/dev/null 2>&1; then
+    info "installing caddy via yum"
+    yum install -y -q caddy >/dev/null 2>&1 \
+      || die "could not install caddy — see caddyserver.com/docs/install"
+  elif command -v apk >/dev/null 2>&1; then
+    info "installing caddy via apk"
+    apk add --no-cache caddy >/dev/null 2>&1 \
+      || die "could not install caddy — see caddyserver.com/docs/install"
+  else
+    die "--domain needs caddy — install it yourself, write /etc/caddy/Caddyfile, and re-run without --domain"
+  fi
+  command -v caddy >/dev/null 2>&1 || die "caddy install failed"
+}
+
+if [ -n "$DOMAIN" ]; then
+  # Caddy needs :80 (ACME HTTP-01 + redirects) and :443 (HTTPS). Warn
+  # early if something already owns them — the install would otherwise
+  # succeed while caddy silently fails to bind.
+  for p in 80 443; do
+    if curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$p/" 2>/dev/null \
+       || curl -sk --max-time 1 -o /dev/null "https://127.0.0.1:$p/" 2>/dev/null; then
+      info "warn: something is already listening on port $p — caddy needs it for Let's Encrypt. Resolve the conflict or caddy will not start."
+    fi
+  done
+  install_caddy
+  CADDYFILE="/etc/caddy/Caddyfile"
+  BLOCK="$(printf '%s {\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:%s\n}' \
+    "$DOMAIN" "$HTTP_PORT")"
+  # Match a site-address line, not just the hostname anywhere — the
+  # stock Caddyfile mentions "localhost:8080" in a comment.
+  DOMAIN_ESC="$(printf '%s' "$DOMAIN" | sed 's/\./\\./g')"
+  if [ -f "$CADDYFILE" ] && grep -qiE "^${DOMAIN_ESC}([[:space:]]|\{)" "$CADDYFILE"; then
+    info "keeping existing $CADDYFILE (already serves $DOMAIN)"
+  elif [ -f "$CADDYFILE" ] && ! grep -q '/usr/share/caddy' "$CADDYFILE"; then
+    # Real user config — append our site block, don't clobber it.
+    printf '\n%s\n' "$BLOCK" >> "$CADDYFILE"
+    info "appended $DOMAIN site to $CADDYFILE"
+  else
+    # Absent, or the untouched package placeholder (stock file serves
+    # /usr/share/caddy on :80) — safe to write fresh.
+    mkdir -p /etc/caddy
+    printf '# BGFlow — automatic HTTPS via Let'"'"'s Encrypt (caddy renews itself).\n# Needs DNS for %s -> this host and TCP 80+443 reachable.\n%s\n' \
+      "$DOMAIN" "$BLOCK" > "$CADDYFILE"
+    info "wrote $CADDYFILE"
+  fi
+  # Pick up the new config if caddy is already running (package
+  # postinst may have started it with a placeholder file).
+  if [ -d /run/systemd/system ] || [ -d /etc/systemd/system ]; then
+    systemctl reload-or-try-restart caddy >/dev/null 2>&1 || true
+  fi
+fi
+
 # --- systemd -----------------------------------------------------------------
 if [ -d /etc/systemd/system ]; then
   cat > /etc/systemd/system/bgflowd.service <<EOF
@@ -257,7 +359,13 @@ fi
 # --- optional first start -----------------------------------------------------
 if [ "$START" = "1" ] && [ -d /etc/systemd/system ]; then
   systemctl enable bgflowd >/dev/null 2>&1 || true
+  if [ -n "$DOMAIN" ]; then
+    systemctl enable caddy >/dev/null 2>&1 || true
+  fi
   systemctl restart bgflowd
+  if [ -n "$DOMAIN" ]; then
+    systemctl restart caddy || true
+  fi
   # Wait for the health endpoint (unauthenticated) — up to ~15s.
   HCURL="http://127.0.0.1:$HTTP_PORT/api/v1/health"
   [ "$SCHEME" = "https" ] && HCURL="https://127.0.0.1:$HTTP_PORT/api/v1/health"
@@ -286,6 +394,27 @@ cat <<EOF
 ┌──────────────────────────────────────────────────────────────┐
 │  BGFlow $VERSION installed                                    │
 ├──────────────────────────────────────────────────────────────┤
+EOF
+if [ -n "$DOMAIN" ]; then
+cat <<EOF
+│  UI:        https://$DOMAIN  (Caddy → 127.0.0.1:$HTTP_PORT)      │
+│  Login:     $ADMIN_USER / ${ADMIN_PASS:-<existing password>}                │
+│  Config:    $SYSCONFDIR/bgflow.toml                             │
+│  Caddyfile: /etc/caddy/Caddyfile                                │
+│  Data:      $DATADIR                                            │
+│  Services:  systemctl enable --now bgflowd caddy               │
+├──────────────────────────────────────────────────────────────┤
+│  Flow ingest:  UDP 2055 (auto: NFv5/v9, IPFIX, sFlow)          │
+│                TCP 4739 (IPFIX)                                │
+│                                                              │
+│  TLS:        Caddy + Let's Encrypt — auto-issued & renewed.   │
+│              PREREQUISITES: DNS for $DOMAIN must point here,    │
+│              and TCP 80+443 must be reachable from the internet│
+│              (first cert issuance can take a few minutes).     │
+│  Firewall: open TCP 80+443 (Caddy) + UDP 2055 + TCP 4739.      │
+EOF
+else
+cat <<EOF
 │  UI:        $SCHEME://<this-host>:$HTTP_PORT                    │
 │  Login:     $ADMIN_USER / ${ADMIN_PASS:-<existing password>}                │
 │  Config:    $SYSCONFDIR/bgflow.toml                             │
@@ -299,20 +428,13 @@ cat <<EOF
 │  Firewall: open UDP 2055 + TCP 4739 from your exporters,      │
 │  and $HTTP_PORT for the UI if remote.                           │
 EOF
-if [ "$SCHEME" = "https" ]; then
-cat <<EOF
-│  TLS:        enabled ($([ "$TLS_SELFSIGNED" = "1" ] && echo "self-signed — browsers will warn" || echo "provided cert")) │
-EOF
-else
-cat <<EOF
-│  TLS:        OFF — auth passwords cross the wire in cleartext. │
-│              Re-run with --tls-selfsigned or --tls-cert/--tls-key│
-│              or put bgflowd behind a TLS reverse proxy.         │
-EOF
 fi
 cat <<EOF
 └──────────────────────────────────────────────────────────────┘
 EOF
+if [ -n "$DOMAIN" ]; then
+  info "first https visit may take a moment while caddy issues the cert — check: journalctl -u caddy -n 50"
+fi
 if [ -n "$ADMIN_PASS" ]; then
   info "save the admin password somewhere safe — it is not stored anywhere"
 fi

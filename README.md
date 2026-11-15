@@ -29,6 +29,15 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
   for filtering and classification; hot-reloadable via SIGHUP.
 - **Exporter names** — `[exporter_names]` maps exporter IPs to friendly
   names shown across the UI/API; filters accept IPs or names.
+- **Exporter-scoped interface/VLAN naming** — `naming = ["ip|name|ifidx-iface|vlanid-vlan", ...]`
+  lines map ifIndex/VLAN IDs *per exporter*, so conflicting identifiers
+  across routers never collide. Editable live in Settings → Names.
+- **NetFlow/IPFIX export** — `[[export]]` targets re-emit stored flows
+  as NetFlow v9 or IPFIX (templates, per-family, UDP), for feeding
+  downstream collectors.
+- **Disk-usage guard** — `storage.min_free_pct`/`min_free_bytes` evict
+  oldest segments when the data filesystem drops below a free-space
+  floor (e.g. `20` ≈ keep usage under ~80%), independent of `max_bytes`.
 - **Exporter admission control** — `[exporters] require_approval = true`
   makes unknown senders start as `pending`: their datagrams are dropped
   (and counted) until an admin approves them in the Exporters view or via
@@ -40,7 +49,8 @@ embedded web UI. Inspired by Elastiflow and Akvorado, designed to be leaner:
 - **Analytics** — top-N by 15 dimensions (IP, ASN, org, port, protocol,
   country, label, IP version, exporter), per-label stats, z-score anomaly
   detection, country heat view, CSV export, OpenAPI spec.
-- **Prometheus metrics** at `/metrics` (incl. per-exporter stats).
+- **Prometheus metrics** at `/metrics` (incl. per-exporter stats and
+  `bgflow_ingest_input_up` listener health).
 - **Multi-user auth** — `[[users]]` with PBKDF2 password hashes, `admin`/
   `viewer` roles, session-cookie login UI, HTTP Basic for API clients,
   per-IP login throttling, security headers. Legacy `server.auth` basic
@@ -122,10 +132,21 @@ role = "admin"               # admin | viewer
 - `/api/v1/health` and `/metrics` stay unauthenticated for scrapers —
   keep them off the public internet or front them with your proxy.
 
-**Public deployments:** set `server.tls_cert`/`tls_key` (or terminate TLS
-at a reverse proxy) — without TLS, passwords and session cookies cross the
-network in plaintext. `bgflowd` logs a loud warning when auth is enabled
-on a non-loopback address without TLS.
+**Public deployments:** the easiest path is a domain + the installer's
+Caddy proxy — `install.sh --domain flows.example.com` installs Caddy,
+which obtains and auto-renews a Let's Encrypt cert and proxies to
+bgflowd on loopback:
+
+```bash
+sh install.sh --domain flows.example.com --start
+# needs: DNS A/AAAA record -> this host, TCP 80+443 reachable
+```
+
+Alternatives: `server.tls_cert`/`tls_key` for native TLS (static cert
+files, loaded once at startup), `--tls-selfsigned` for a quick self-signed
+cert, or terminate TLS at your own reverse proxy. Without TLS, passwords
+and session cookies cross the network in plaintext — `bgflowd` logs a
+loud warning when auth is enabled on a non-loopback address without TLS.
 
 ### Backups & administration
 
@@ -182,6 +203,8 @@ segment_rows = 100000           # flush raw segment at N rows
 segment_interval_secs = 60      # ...or after N seconds
 raw_retention_days = 7          # raw flow retention
 rollup_retention_days = 90      # rollup retention (long-range queries)
+min_free_pct = 20               # evict oldest segments below this % fs free
+min_free_bytes = "5GiB"         # ...or absolute floor (whichever is larger)
 
 [geoip]
 asn_db = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"      # optional — any MaxMind MMDB
@@ -202,6 +225,19 @@ protocol = "auto"               # auto|netflow5|netflow9|ipfix|sflow
 # listen = "0.0.0.0:4739"
 # protocol = "ipfix"
 # transport = "tcp"
+
+# Export stored flows onward as NetFlow v9 / IPFIX:
+# [[export]]
+# address = "10.0.0.9:2055"
+# protocol = "netflow9"         # netflow9 | ipfix
+# name = "upstream-collector"
+
+# Exporter-scoped interface/VLAN names (ifIndex/VLAN IDs only make
+# sense per exporter — conflicts across routers can't collide):
+# naming = [
+#   "10.0.0.1|core-rtr-01|2-ae0|250-cogent",
+#   "10.0.0.2|core-rtr-02|2-eth0|250-ixp1",
+# ]
 
 # --- HTTP enrichment backends (whois/RDAP/IRR, e.g. irrd3.net) ---
 [[enrichers]]
@@ -253,7 +289,7 @@ Rule match fields (all ANDed): `proto`, `src_port`, `dst_port`, `src_ip`,
 | `GET /api/v1/lookup?ip=` | Cached enrichment detail for an IP |
 | `GET /api/v1/config` | Effective config (secrets redacted, admin only) |
 | `GET /api/v1/openapi.json` | OpenAPI 3.0 spec |
-| `GET /api/v1/status` | Daemon/storage status + version + host CPU/RAM/disk |
+| `GET /api/v1/status` | Daemon/storage status + version + host CPU/RAM/disk + per-input listener state |
 | `GET /api/v1/health` | Deep health: writer liveness, buffers, flush age (unauthenticated) |
 | `POST /api/v1/auth/login` | Login → session cookie (throttled per IP) |
 | `POST /api/v1/auth/logout` | Clear session cookie |

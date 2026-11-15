@@ -23,9 +23,39 @@ sh install.sh --version v0.1.0        # pin a version
 sh install.sh --prefix /opt/bgflow    # install prefix
 sh install.sh --tls-selfsigned        # HTTPS with a self-signed cert
 sh install.sh --tls-cert crt --tls-key key   # HTTPS with your own cert
+sh install.sh --domain flows.example.com     # Caddy + Let's Encrypt
 ```
 
 Or via environment: `BGFLOW_VERSION`, `BGFLOW_INSTALL_DIR`.
+
+### Automatic HTTPS with a domain (`--domain`)
+
+For a real public deployment, the simplest path to a trusted cert is a
+domain + Caddy — no ACME code in bgflowd itself:
+
+```bash
+sh install.sh --domain flows.example.com --start
+```
+
+This installs [Caddy](https://caddyserver.com), writes
+`/etc/caddy/Caddyfile` with a `reverse_proxy` to bgflowd on loopback,
+and binds bgflowd to `127.0.0.1` only. Caddy obtains the Let's Encrypt
+cert on first start and renews it automatically (~60 days before the
+90-day expiry) — nothing else to maintain.
+
+**Prerequisites:**
+
+- A DNS `A`/`AAAA` record for the domain pointing at this host
+- TCP **80** and **443** reachable from the internet (80 is required
+  for the ACME challenge *and* the HTTP→HTTPS redirect — the installer
+  warns if something already owns them)
+- UDP 2055 + TCP 4739 open for your flow exporters (unchanged)
+
+First cert issuance happens when Caddy first serves the domain — allow
+a few minutes and check `journalctl -u caddy` if the first visit hangs.
+`--domain` cannot be combined with `--tls-*` (Caddy terminates TLS).
+If you already run Caddy for other sites, the installer appends a site
+block to your existing Caddyfile instead of overwriting it.
 
 Then:
 
@@ -215,9 +245,11 @@ sudo nano /etc/bgflow/bgflow.toml
 sudo systemctl reload bgflowd     # or: sudo kill -HUP $(pidof bgflowd)
 ```
 
-Then terminate TLS — either directly (`server.tls_cert`/`tls_key`) or at
-your reverse proxy (Caddy/nginx/Traefik). Without TLS, passwords and
-session cookies are plaintext on the wire.
+Then terminate TLS — easiest is reinstalling/re-running with
+`--domain <your-domain>` (Caddy + automatic Let's Encrypt), or directly
+via `server.tls_cert`/`tls_key`, or at your own reverse proxy
+(Caddy/nginx/Traefik). Without TLS, passwords and session cookies are
+plaintext on the wire.
 
 ## Backups
 
@@ -240,4 +272,7 @@ rebuild step needed.
 sudo systemctl disable --now bgflowd
 sudo rm /etc/systemd/system/bgflowd.service /usr/local/bin/bgflowd
 sudo rm -rf /etc/bgflow          # config (data kept in /var/lib/bgflow)
+# If you installed with --domain, also remove the proxy:
+sudo systemctl disable --now caddy && sudo apt remove caddy
+sudo rm -f /etc/caddy/Caddyfile /etc/apt/sources.list.d/caddy-stable.list
 ```
