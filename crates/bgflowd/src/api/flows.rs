@@ -101,7 +101,10 @@ pub(super) async fn flows(
         fq.egress_if = Some(s.parse().map_err(|_| err("bad egress_if"))?);
     }
     // City filters accept a string-table id or an exact city name.
-    for (param, slot) in [("src_city", &mut fq.src_city), ("dst_city", &mut fq.dst_city)] {
+    for (param, slot) in [
+        ("src_city", &mut fq.src_city),
+        ("dst_city", &mut fq.dst_city),
+    ] {
         if let Some(s) = q.get(param) {
             let v = s
                 .parse::<u32>()
@@ -127,11 +130,7 @@ pub(super) async fn flows(
         // raw=1 → a real text/csv body for downloads/scripts; default
         // stays JSON {"csv": ...} for the UI's fetch+blob path.
         if q.get("raw").map(|s| s.as_str()) == Some("1") {
-            return Ok((
-                [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
-                s,
-            )
-                .into_response());
+            return Ok(([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], s).into_response());
         }
         return Ok(Json(serde_json::json!({"count": recs.len(), "csv": s})).into_response());
     }
@@ -209,8 +208,13 @@ pub(super) async fn geo(
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let (from, to) = range(&q);
-    let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(300).min(1000);
-    let mut cells: std::collections::HashMap<(i32, i32), GeoCell> = std::collections::HashMap::new();
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+        .min(1000);
+    let mut cells: std::collections::HashMap<(i32, i32), GeoCell> =
+        std::collections::HashMap::new();
     let _scan = scan_permit(&st.ctx).await;
     let deadline = query::scan_deadline(&st.ctx);
     let mut timed_out = false;
@@ -338,23 +342,24 @@ pub(super) async fn geo(
                     let dst_lat = get(ix::DST_LAT, i) as u32;
                     let dst_lon = get(ix::DST_LON, i) as u32;
                     let dst_city = get(ix::DST_CITY, i) as u32;
-                    let (lat, lon, city, cc, is_dst) = if dst_lat != 0 || dst_lon != 0 || dst_city != 0 {
-                        (
-                            dst_lat,
-                            dst_lon,
-                            dst_city,
-                            get(ix::DST_COUNTRY, i) as u16,
-                            true,
-                        )
-                    } else {
-                        (
-                            get(ix::SRC_LAT, i) as u32,
-                            get(ix::SRC_LON, i) as u32,
-                            get(ix::SRC_CITY, i) as u32,
-                            get(ix::SRC_COUNTRY, i) as u16,
-                            false,
-                        )
-                    };
+                    let (lat, lon, city, cc, is_dst) =
+                        if dst_lat != 0 || dst_lon != 0 || dst_city != 0 {
+                            (
+                                dst_lat,
+                                dst_lon,
+                                dst_city,
+                                get(ix::DST_COUNTRY, i) as u16,
+                                true,
+                            )
+                        } else {
+                            (
+                                get(ix::SRC_LAT, i) as u32,
+                                get(ix::SRC_LON, i) as u32,
+                                get(ix::SRC_CITY, i) as u32,
+                                get(ix::SRC_COUNTRY, i) as u16,
+                                false,
+                            )
+                        };
                     if lat == 0 && lon == 0 {
                         continue;
                     }
@@ -428,7 +433,21 @@ pub(super) async fn geo(
 }
 
 pub(super) fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
+    // Spreadsheet formula injection: a cell opening with =, +, -, @ (or
+    // whitespace controls) executes when the CSV is opened in Excel/Sheets.
+    // Prefix with ' — the standard neutralizer.
+    let owned;
+    let s = if s
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        owned = format!("'{}", s);
+        owned.as_str()
+    } else {
+        s
+    };
+    if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -441,7 +460,11 @@ pub(super) fn csv_string(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) ->
     );
     for f in recs {
         let coord = |v: u32, bias: f64| {
-            if v == 0 { String::new() } else { format!("{:.5}", v as f64 / 100000.0 - bias) }
+            if v == 0 {
+                String::new()
+            } else {
+                format!("{:.5}", v as f64 / 100000.0 - bias)
+            }
         };
         s.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
@@ -469,4 +492,3 @@ pub(super) fn csv_string(ctx: &query::Ctx, recs: &[bgflow_types::FlowRecord]) ->
     }
     s
 }
-

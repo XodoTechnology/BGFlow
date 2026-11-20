@@ -6,8 +6,8 @@
 
 use crate::cursor::Cursor;
 use crate::template::{
-    decode_record, parse_template_fields, record_is_meaningful, ip_u128, FlowBuilder,
-    Template, TimeCtx,
+    decode_record, ip_u128, parse_template_fields, record_is_meaningful, FlowBuilder, Template,
+    TimeCtx,
 };
 use bgflow_types::FlowRecord;
 use std::collections::HashMap;
@@ -23,6 +23,13 @@ pub type DomainTemplates = HashMap<u16, Template>;
 
 /// Key for the template cache: (exporter ip, domain id, protocol version).
 pub type TemplateKey = (u128, u32, u8);
+
+/// Hard caps on template-cache growth. Datagrams are unauthenticated
+/// UDP input — without these, a hostile or buggy exporter could grow
+/// the maps until the process OOMs. Real routers use a handful of
+/// domains/templates; these are generous ceilings, not targets.
+pub const MAX_TEMPLATE_DOMAINS: usize = 1024;
+pub const MAX_TEMPLATES_PER_DOMAIN: usize = 512;
 
 pub fn templates_key(exporter: &IpAddr, domain: u32) -> TemplateKey {
     (ip_u128(exporter), domain, 9)
@@ -69,7 +76,13 @@ pub fn parse(
     };
 
     let key = templates_key(&exporter, source_id);
-    let domain = templates.entry(key).or_default();
+    if !templates.contains_key(&key) {
+        if templates.len() >= MAX_TEMPLATE_DOMAINS {
+            return Vec::new();
+        }
+        templates.insert(key, DomainTemplates::new());
+    }
+    let domain = templates.get_mut(&key).expect("domain inserted above");
 
     // boot epoch estimate from header: unix time minus uptime
     let export_ms = unix_secs * 1000;
@@ -144,7 +157,9 @@ fn parse_template_set(body: &[u8], domain: &mut DomainTemplates) {
         };
         match parse_template_fields(&mut cur, field_count, false) {
             Ok(fields) => {
-                domain.insert(template_id, Template { fields });
+                if domain.len() < MAX_TEMPLATES_PER_DOMAIN || domain.contains_key(&template_id) {
+                    domain.insert(template_id, Template { fields });
+                }
             }
             Err(_) => return, // malformed — stop this set
         }
@@ -153,12 +168,7 @@ fn parse_template_set(body: &[u8], domain: &mut DomainTemplates) {
 
 /// Parse a Data FlowSet body into FlowBuilders.
 /// NetFlow v9 has no variable-length fields, so records are fixed-size.
-fn parse_data_set(
-    body: &[u8],
-    tpl: &Template,
-    sysup_max: &mut u64,
-    out: &mut Vec<FlowBuilder>,
-) {
+fn parse_data_set(body: &[u8], tpl: &Template, sysup_max: &mut u64, out: &mut Vec<FlowBuilder>) {
     let rec_len = tpl.fixed_len();
     if rec_len == 0 || body.len() < rec_len {
         return;

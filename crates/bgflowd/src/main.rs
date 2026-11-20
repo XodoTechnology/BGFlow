@@ -97,8 +97,7 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -135,14 +134,22 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::default());
     let orgs = Arc::new(StringTable::open(cfg.storage.data_dir.join("orgs.txt"))?);
     let cities = Arc::new(StringTable::open(cfg.storage.data_dir.join("cities.txt"))?);
-    let geo = Arc::new(MmdbGeo::open(&cfg.geoip, orgs.clone(), cities.clone(), metrics.clone()));
+    let geo = Arc::new(MmdbGeo::open(
+        &cfg.geoip,
+        orgs.clone(),
+        cities.clone(),
+        metrics.clone(),
+    ));
     let http_enrich = Arc::new(HttpEnrichers::new(
         &cfg.enrichers,
         metrics.clone(),
         orgs.clone(),
     )?);
     if http_enrich.enabled() {
-        tracing::info!("{} enricher backend(s) configured", http_enrich.backend_count());
+        tracing::info!(
+            "{} enricher backend(s) configured",
+            http_enrich.backend_count()
+        );
         let h = http_enrich.clone();
         tokio::spawn(async move { h.run().await });
     }
@@ -172,9 +179,7 @@ async fn main() -> Result<()> {
         .clone()
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            auth::AuthState::load_or_create_secret(
-                &cfg.storage.data_dir.join("session.secret"),
-            )
+            auth::AuthState::load_or_create_secret(&cfg.storage.data_dir.join("session.secret"))
         });
     let auth = Arc::new(AuthState::new(
         users,
@@ -200,9 +205,8 @@ async fn main() -> Result<()> {
     }
 
     // --- Writer + ingest channel ---
-    let (tx, rx) = tokio::sync::mpsc::channel::<bgflow_types::FlowRecord>(
-        cfg.storage.channel_capacity,
-    );
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<bgflow_types::FlowRecord>(cfg.storage.channel_capacity);
     let shared = WriterShared::new();
     // "Our" ASNs for direction analytics + the hot aggregate tier the
     // writer feeds as rollup buckets drain (created early — the writer
@@ -221,19 +225,23 @@ async fn main() -> Result<()> {
     let export_targets = netexp::resolve(&cfg.export, metrics::now_ms() as i64);
     let (export_tx, export_rx) = tokio::sync::mpsc::channel::<Vec<bgflow_types::FlowRecord>>(4);
     let export_tap = (!export_targets.is_empty()).then(|| writer::ExportTap::new(export_tx));
-    {
+    // Shutdown broadcast: SIGTERM/SIGINT flips the watch; the writer
+    // flushes, HTTP drains gracefully, and main waits for the writer.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let writer_handle = {
         let cfg_s = storage_cfg.clone();
         let sh = shared.clone();
         let m = metrics.clone();
         let h = hot.clone();
         let la = local_asns.clone();
         let ex = export_tap;
+        let sd = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = writer::run(cfg_s, sh, m, rx, h, la, ex).await {
+            if let Err(e) = writer::run(cfg_s, sh, m, rx, h, la, ex, sd).await {
                 tracing::error!("writer failed: {}", e);
             }
-        });
-    }
+        })
+    };
     if !export_targets.is_empty() {
         let m = metrics.clone();
         tokio::spawn(async move {
@@ -293,7 +301,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    ingest::spawn_all(
+    let ingest_handles = ingest::spawn_all(
         cfg.inputs.clone(),
         tx.clone(),
         ingest::IngestShared {
@@ -306,11 +314,25 @@ async fn main() -> Result<()> {
         },
     );
 
+    // OS shutdown (SIGTERM from systemd/docker, SIGINT from ctrl-c):
+    // stop ingest immediately so no new records arrive during the
+    // flush, then flip the watch — writer + HTTP key off it.
+    {
+        let sig_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            for h in ingest_handles {
+                h.abort();
+            }
+            let _ = sig_tx.send(true);
+            tracing::info!("shutdown signal received — draining");
+        });
+    }
+
     // Exporter/interface names + alert rules are reloadable shared state.
-    let exporter_names =
-        Arc::new(RwLock::new(query::ExporterNames::build(
-            &cfg.exporter_names,
-        )));
+    let exporter_names = Arc::new(RwLock::new(query::ExporterNames::build(
+        &cfg.exporter_names,
+    )));
     // Overlay UI-set names persisted in the exporter policy — they win
     // over [exporter_names] config until cleared.
     {
@@ -321,16 +343,11 @@ async fn main() -> Result<()> {
             }
         }
     }
-    let interface_names =
-        Arc::new(RwLock::new(query::InterfaceNames::build(
-            &cfg.interface_names,
-        )));
-    let vlan_names =
-        Arc::new(RwLock::new(query::VlanNames::build(
-            &cfg.vlan_names,
-        )));
-    let naming =
-        Arc::new(RwLock::new(query::NamingBook::build(&cfg.naming)));
+    let interface_names = Arc::new(RwLock::new(query::InterfaceNames::build(
+        &cfg.interface_names,
+    )));
+    let vlan_names = Arc::new(RwLock::new(query::VlanNames::build(&cfg.vlan_names)));
+    let naming = Arc::new(RwLock::new(query::NamingBook::build(&cfg.naming)));
     let ptr = enrich::PtrCache::new();
     let alerts_cfg = Arc::new(RwLock::new(cfg.alerts.clone()));
     let alert_rt = Arc::new(alerts::AlertRuntime::default());
@@ -416,21 +433,20 @@ async fn main() -> Result<()> {
         });
     }
 
-    // SNMP enrichment loop (optional — [snmp] enabled = true).
-    if cfg.snmp.enabled {
-        if cfg.snmp.community.is_empty() {
-            tracing::warn!("[snmp] enabled but community is empty — SNMP disabled");
-        } else {
-            tracing::info!(
-                "snmp: polling approved/pending exporters every {}s (community auth, port {})",
-                cfg.snmp.interval_secs, cfg.snmp.port
-            );
-            tokio::spawn(snmp::run(
-                snmp_store,
-                exporter_policy.clone(),
-                cfg.snmp.clone(),
-            ));
-        }
+    // SNMP enrichment loop — always spawned; it re-reads the live config
+    // each cycle so [snmp] edits apply without restart (and enabling it
+    // later via settings works too).
+    {
+        tracing::info!(
+            "snmp: poll loop started (interval {}s, port {}) — active when [snmp] enabled",
+            cfg.snmp.interval_secs,
+            cfg.snmp.port
+        );
+        tokio::spawn(snmp::run(
+            snmp_store,
+            exporter_policy.clone(),
+            app_state.config.clone(),
+        ));
     }
 
     // Alert evaluation loop (reloadable; no-op scan when no rules configured).
@@ -444,13 +460,14 @@ async fn main() -> Result<()> {
     // SIGHUP: same reload path as POST /api/v1/admin/reload.
     {
         tokio::spawn(async move {
-            let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("SIGHUP handler unavailable: {}", e);
-                    return;
-                }
-            };
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("SIGHUP handler unavailable: {}", e);
+                        return;
+                    }
+                };
             loop {
                 sig.recv().await;
                 let rep = admin.reload();
@@ -465,25 +482,50 @@ async fn main() -> Result<()> {
     let _ = sys::sample(&cfg.storage.data_dir);
 
     let app = api::router(app_state);
-    if let (Some(cert), Some(key)) = (&cfg.server.tls_cert, &cfg.server.tls_key) {
-        // rustls 0.23 panics without a process-level CryptoProvider when
-        // multiple providers are compiled in — install aws-lc-rs explicitly.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        tracing::info!("https: listening on {} (TLS)", cfg.server.http_listen);
-        let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-            .await
-            .map_err(|e| anyhow::anyhow!("TLS config failed: {}", e))?;
-        axum_server::bind_rustls(cfg.server.http_listen, rustls)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await?;
-        return Ok(());
-    }
-    let listener = tokio::net::TcpListener::bind(cfg.server.http_listen).await?;
-    tracing::info!("http: listening on {}", cfg.server.http_listen);
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    );
+    // HTTP runs as a task so shutdown can bound the drain: SSE streams
+    // and long polls must not stall the data flush.
+    let mut serve_task =
+        if let (Some(cert), Some(key)) = (&cfg.server.tls_cert, &cfg.server.tls_key) {
+            // rustls 0.23 panics without a process-level CryptoProvider when
+            // multiple providers are compiled in — install aws-lc-rs explicitly.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            tracing::info!("https: listening on {} (TLS)", cfg.server.http_listen);
+            let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .map_err(|e| anyhow::anyhow!("TLS config failed: {}", e))?;
+            let handle = axum_server::Handle::new();
+            let server =
+                axum_server::bind_rustls(cfg.server.http_listen, rustls).handle(handle.clone());
+            {
+                let mut rx = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let _ = rx.wait_for(|s| *s).await;
+                    handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+                });
+            }
+            tokio::spawn(async move {
+                server
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        } else {
+            let listener = tokio::net::TcpListener::bind(cfg.server.http_listen).await?;
+            tracing::info!("http: listening on {}", cfg.server.http_listen);
+            let mut rx = shutdown_rx.clone();
+            let graceful = async move {
+                let _ = rx.wait_for(|s| *s).await;
+            };
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(graceful)
+                .await
+                .map_err(|e| e.to_string())
+            })
+        };
 
     // Return freed heap to the OS periodically: parallel query scans
     // allocate hundreds of MB transiently and glibc otherwise retains
@@ -506,10 +548,26 @@ async fn main() -> Result<()> {
         })
     });
     if let Some(target) = demo_target {
-        let pps = if args.demo.is_some() { args.demo_pps } else { cfg.demo.pps };
-        let flows = if args.demo.is_some() { args.demo_flows } else { cfg.demo.flows_per_pkt };
-        let secs = if args.demo.is_some() { args.demo_secs } else { cfg.demo.duration_secs };
-        let exporters = if args.demo.is_some() { 3 } else { cfg.demo.exporters };
+        let pps = if args.demo.is_some() {
+            args.demo_pps
+        } else {
+            cfg.demo.pps
+        };
+        let flows = if args.demo.is_some() {
+            args.demo_flows
+        } else {
+            cfg.demo.flows_per_pkt
+        };
+        let secs = if args.demo.is_some() {
+            args.demo_secs
+        } else {
+            cfg.demo.duration_secs
+        };
+        let exporters = if args.demo.is_some() {
+            3
+        } else {
+            cfg.demo.exporters
+        };
         tokio::spawn(async move {
             let dur = if secs == 0 { None } else { Some(secs) };
             tracing::info!("demo: sending traffic to {}", target);
@@ -519,8 +577,63 @@ async fn main() -> Result<()> {
         });
     }
 
-    serve.await?;
-    Ok(())
+    tokio::select! {
+        res = &mut serve_task => match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("http server error: {}", e),
+            Err(e) => tracing::error!("http server task failed: {}", e),
+        },
+        _ = {
+            let mut rx = shutdown_rx.clone();
+            async move {
+                let _ = rx.wait_for(|s| *s).await;
+            }
+        } => {
+            // Bound the HTTP drain — SSE/long-polls must not stall the
+            // data flush; after 10s the listener is dropped.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), &mut serve_task).await;
+            serve_task.abort();
+        }
+    }
+
+    // Final drain: flip the shutdown watch (the writer flushes pending
+    // flows + open rollup buckets, then exits), drop our sender, and
+    // wait — bounded so a stuck flush can't hang process exit forever.
+    let _ = shutdown_tx.send(true);
+    drop(tx);
+    match tokio::time::timeout(std::time::Duration::from_secs(60), writer_handle).await {
+        Ok(Ok(())) => tracing::info!("shutdown: writer flushed and exited"),
+        Ok(Err(e)) => tracing::error!("writer task failed: {}", e),
+        Err(_) => tracing::warn!("shutdown: writer flush timed out after 60s"),
+    }
+    // Data is flushed; exit now rather than wait out the runtime drop,
+    // which blocks on uncancellable spawn_blocking tasks (segment scans,
+    // hot-tier rebuild) and can linger for minutes on large datasets.
+    std::process::exit(0);
+}
+
+/// Resolves on SIGINT (ctrl-c) or SIGTERM (systemd/docker stop).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    {
+        let term = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term => {}
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 /// `bgflowd hash-password`: PBKDF2 hash for [[users]] config.
@@ -574,7 +687,10 @@ fn config_check(cfg: &config::Config) -> Result<()> {
         }
     }
     if cfg.users.is_empty() && cfg.server.auth.is_none() {
-        warn("no auth configured — UI/API will be world-readable if http_listen is not loopback".into());
+        warn(
+            "no auth configured — UI/API will be world-readable if http_listen is not loopback"
+                .into(),
+        );
     }
 
     // Inputs: protocol + transport sanity.
@@ -588,13 +704,13 @@ fn config_check(cfg: &config::Config) -> Result<()> {
         }
         let tr = inp.transport.to_ascii_lowercase();
         if !matches!(tr.as_str(), "udp" | "tcp" | "both") {
-            err(format!("input {}: unknown transport '{}'", i, inp.transport));
+            err(format!(
+                "input {}: unknown transport '{}'",
+                i, inp.transport
+            ));
         }
         if (tr == "tcp" || tr == "both")
-            && !matches!(
-                inp.protocol.to_ascii_lowercase().as_str(),
-                "auto" | "ipfix"
-            )
+            && !matches!(inp.protocol.to_ascii_lowercase().as_str(), "auto" | "ipfix")
         {
             err(format!(
                 "input {}: tcp transport requires protocol ipfix/auto (got '{}')",
@@ -623,7 +739,11 @@ fn config_check(cfg: &config::Config) -> Result<()> {
 
     // Storage: data dir should be creatable.
     if let Err(e) = std::fs::create_dir_all(&cfg.storage.data_dir) {
-        err(format!("cannot create data dir {}: {}", cfg.storage.data_dir.display(), e));
+        err(format!(
+            "cannot create data dir {}: {}",
+            cfg.storage.data_dir.display(),
+            e
+        ));
     }
 
     // Enrichers: http needs a URL; table needs a path.
@@ -652,7 +772,10 @@ fn config_check(cfg: &config::Config) -> Result<()> {
     ] {
         for path in p.paths() {
             if !path.is_empty() && !std::path::Path::new(path).exists() {
-                warn(format!("{} not found: {} (geo enrichment for this DB disabled)", name, path));
+                warn(format!(
+                    "{} not found: {} (geo enrichment for this DB disabled)",
+                    name, path
+                ));
             }
         }
     }
@@ -696,9 +819,21 @@ fn config_check(cfg: &config::Config) -> Result<()> {
 /// Known rollup dims for alert group_by validation (mirrors query.rs).
 fn bgflowd_query_dim(d: &str) -> Option<()> {
     const DIMS: &[&str] = &[
-        "src_ip", "dst_ip", "src_ipver", "dst_ipver", "src_asn", "dst_asn",
-        "src_org", "dst_org", "src_port", "dst_port", "proto",
-        "exporter", "src_country", "dst_country", "label",
+        "src_ip",
+        "dst_ip",
+        "src_ipver",
+        "dst_ipver",
+        "src_asn",
+        "dst_asn",
+        "src_org",
+        "dst_org",
+        "src_port",
+        "dst_port",
+        "proto",
+        "exporter",
+        "src_country",
+        "dst_country",
+        "label",
     ];
     DIMS.contains(&d).then_some(())
 }
@@ -726,7 +861,11 @@ fn prune_backups(root: &Path, keep: u32) {
 /// `bgflowd backup`: CRC-verified copy of the data directory.
 fn backup_cmd(cfg: &config::Config, dest: Option<PathBuf>) -> Result<()> {
     let dest = dest.unwrap_or_else(|| backup::default_dest());
-    println!("backing up {} → {}", cfg.storage.data_dir.display(), dest.display());
+    println!(
+        "backing up {} → {}",
+        cfg.storage.data_dir.display(),
+        dest.display()
+    );
     let rep = backup::run_backup(&cfg.storage.data_dir, &dest)?;
     println!(
         "done: {} → {}: {} file(s), {:.1} MiB, {} segment(s) CRC-verified{}, {} skipped",
@@ -743,7 +882,10 @@ fn backup_cmd(cfg: &config::Config, dest: Option<PathBuf>) -> Result<()> {
         rep.skipped,
     );
     if rep.skipped > 0 {
-        anyhow::bail!("{} segment(s) failed verification — backup may be incomplete", rep.skipped);
+        anyhow::bail!(
+            "{} segment(s) failed verification — backup may be incomplete",
+            rep.skipped
+        );
     }
     Ok(())
 }

@@ -18,10 +18,10 @@ use axum::{
 use bgflow_store::Record;
 use bgflow_types::{country_str, ip_string, ip_to_u128, u128_to_ip};
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 mod adminapi;
 mod agg;
@@ -97,7 +97,11 @@ fn range(q: &Q) -> (u64, u64) {
 /// Which rollup dataset a stats query reads: `granularity=hourly` selects
 /// the coarse long-retention dataset (masked /24·/48 IPs, hour buckets).
 fn rollup_set(q: &Q) -> RollupSet {
-    match q.get("granularity").or_else(|| q.get("dataset")).map(|s| s.as_str()) {
+    match q
+        .get("granularity")
+        .or_else(|| q.get("dataset"))
+        .map(|s| s.as_str())
+    {
         Some("hourly") | Some("hour") | Some("coarse") | Some("1h") => RollupSet::Hourly,
         _ => RollupSet::Minute,
     }
@@ -161,7 +165,10 @@ fn hot_view(
 ) -> Option<(crate::hot::HotView, u64)> {
     // ?hot=0|off|false forces the segment-scan path — escape hatch for
     // debugging and correctness comparisons.
-    if matches!(q.get("hot").map(|s| s.as_str()), Some("0") | Some("off") | Some("false")) {
+    if matches!(
+        q.get("hot").map(|s| s.as_str()),
+        Some("0") | Some("off") | Some("false")
+    ) {
         return None;
     }
     if !f.is_empty() {
@@ -232,10 +239,7 @@ fn resolve_label(ctx: &Ctx, s: &str) -> Option<u32> {
         .map(|(id, _)| id)
 }
 
-fn rollup_filter(
-    q: &Q,
-    ctx: &Ctx,
-) -> Result<RollupFilter, (StatusCode, Json<serde_json::Value>)> {
+fn rollup_filter(q: &Q, ctx: &Ctx) -> Result<RollupFilter, (StatusCode, Json<serde_json::Value>)> {
     let mut f = RollupFilter::default();
     if let Some(s) = q.get("exporter") {
         // Comma-separated allowlist: IPs or configured exporter names.
@@ -316,7 +320,6 @@ fn parse_proto(s: &str) -> Result<u8, (StatusCode, Json<serde_json::Value>)> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
@@ -327,7 +330,10 @@ fn parse_proto(s: &str) -> Result<u8, (StatusCode, Json<serde_json::Value>)> {
 fn auth_exempt(path: &str) -> bool {
     matches!(
         path,
-        "/" | "/api/v1/health" | "/metrics" | "/api/v1/auth/login" | "/api/v1/auth/logout"
+        "/" | "/api/v1/health"
+            | "/metrics"
+            | "/api/v1/auth/login"
+            | "/api/v1/auth/logout"
             | "/api/v1/auth/me"
     )
 }
@@ -402,7 +408,36 @@ async fn auth_mw(
     // this catches same-site subdomain tricks and non-browser clients that
     // replay a stolen cookie).
     if method != "GET" && method != "HEAD" && method != "OPTIONS" {
-        if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        // Sec-Fetch-Site is sent by all modern browsers on every request;
+        // an explicit cross-site marker on a mutating request is rejected
+        // even when Origin is absent or malformed.
+        if let Some(sfs) = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+        {
+            if sfs.trim().eq_ignore_ascii_case("cross-site") {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "cross-origin request rejected"})),
+                )
+                    .into_response();
+            }
+        }
+        if let Some(origin) = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        {
+            // "null" (sandboxed iframe, data: URL) and unparseable origins
+            // have no trustworthy host — reject rather than skip the check.
+            if origin.trim().eq_ignore_ascii_case("null") {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "cross-origin request rejected"})),
+                )
+                    .into_response();
+            }
             let host = req
                 .headers()
                 .get(header::HOST)
@@ -418,7 +453,7 @@ async fn auth_mw(
                 .split(':')
                 .next()
                 .unwrap_or("");
-            if !origin_host.is_empty() && !origin_host.eq_ignore_ascii_case(host_only) {
+            if origin_host.is_empty() || !origin_host.eq_ignore_ascii_case(host_only) {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(serde_json::json!({"error": "cross-origin request rejected"})),
@@ -546,7 +581,10 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/exporters", get(meta::exporters))
         .route("/api/v1/exporters/:ip/name", post(meta::exporter_rename))
         .route("/api/v1/exporters/:ip/vlans", post(meta::exporter_vlans))
-        .route("/api/v1/exporters/:ip/interfaces", post(meta::exporter_interfaces))
+        .route(
+            "/api/v1/exporters/:ip/interfaces",
+            post(meta::exporter_interfaces),
+        )
         .route("/api/v1/exporters/:ip/snmp", post(meta::exporter_snmp))
         .route("/api/v1/exporters/:ip/:action", post(meta::exporter_action))
         .route("/api/v1/interfaces", get(meta::interfaces))
@@ -562,7 +600,10 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/auth/logout", post(adminapi::auth_logout))
         .route("/api/v1/auth/me", get(adminapi::auth_me))
         .route("/api/v1/admin/reload", post(adminapi::admin_reload))
-    .route("/api/v1/admin/settings", get(adminapi::admin_settings_get).put(adminapi::admin_settings_put))
+        .route(
+            "/api/v1/admin/settings",
+            get(adminapi::admin_settings_get).put(adminapi::admin_settings_put),
+        )
         .route("/metrics", get(system::metrics_handler));
 
     // CORS is baked into the router at startup — snapshot once. Changes
@@ -595,12 +636,7 @@ pub fn router(st: Arc<AppState>) -> Router {
             app.layer(
                 tower_http::cors::CorsLayer::new()
                     .allow_origin(origins)
-                    .allow_methods([
-                        Method::GET,
-                        Method::POST,
-                        Method::OPTIONS,
-                        Method::HEAD,
-                    ])
+                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::HEAD])
                     .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
                     .allow_credentials(true),
             )

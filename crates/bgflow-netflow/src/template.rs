@@ -7,7 +7,7 @@
 //! All multi-byte integers are big-endian.
 
 use crate::cursor::Cursor;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bgflow_types::FlowRecord;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -125,12 +125,14 @@ impl FlowBuilder {
     /// did not provide a boot estimate.
     pub fn finish(mut self, ctx: &TimeCtx, boot_ms: i64, exporter: IpAddr) -> FlowRecord {
         // sysUpTime -> epoch using boot estimate
-        let end_epoch = self
-            .end_epoch_ms
-            .or_else(|| self.end_sysup_ms.map(|s| (boot_ms + s as i64).max(0) as u64));
-        let start_epoch = self
-            .start_epoch_ms
-            .or_else(|| self.start_sysup_ms.map(|s| (boot_ms + s as i64).max(0) as u64));
+        let end_epoch = self.end_epoch_ms.or_else(|| {
+            self.end_sysup_ms
+                .map(|s| (boot_ms + s as i64).max(0) as u64)
+        });
+        let start_epoch = self.start_epoch_ms.or_else(|| {
+            self.start_sysup_ms
+                .map(|s| (boot_ms + s as i64).max(0) as u64)
+        });
 
         if let Some(e) = end_epoch {
             self.ts_ms = e;
@@ -260,11 +262,7 @@ pub fn decode_record(
         let vlen = if f.len == 0xffff {
             // Variable-length (IPFIX): 1-byte length, or 0xff + u16 length.
             let l = cur.u8()? as usize;
-            let len = if l == 0xff {
-                cur.u16()? as usize
-            } else {
-                l
-            };
+            let len = if l == 0xff { cur.u16()? as usize } else { l };
             len
         } else {
             f.len as usize
@@ -479,6 +477,10 @@ pub fn decode_record(
     Ok((b, cur.position()))
 }
 
+/// Sanity cap on declared template fields — a u16 count can claim 65535
+/// fields (~1MB of FieldSpec per template); real templates use <64.
+const MAX_TEMPLATE_FIELDS: usize = 256;
+
 /// Parse a NetFlow v9 / IPFIX template field list.
 /// `ipfix` = true enables the enterprise bit and 0xffff variable length.
 pub fn parse_template_fields(
@@ -486,7 +488,14 @@ pub fn parse_template_fields(
     field_count: usize,
     ipfix: bool,
 ) -> Result<Vec<FieldSpec>> {
-    let mut fields = Vec::with_capacity(field_count.min(256));
+    if field_count > MAX_TEMPLATE_FIELDS {
+        bail!(
+            "template field_count {} exceeds cap {}",
+            field_count,
+            MAX_TEMPLATE_FIELDS
+        );
+    }
+    let mut fields = Vec::with_capacity(field_count);
     for _ in 0..field_count {
         let raw_type = cur.u16()?;
         let len = cur.u16()?;
@@ -497,7 +506,11 @@ pub fn parse_template_fields(
             (raw_type, false, false)
         };
         let _ = has_pen;
-        fields.push(FieldSpec { ie, len, enterprise });
+        fields.push(FieldSpec {
+            ie,
+            len,
+            enterprise,
+        });
     }
     Ok(fields)
 }

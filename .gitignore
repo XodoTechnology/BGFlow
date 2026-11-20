@@ -2,3 +2,5 @@ target/
 *.log
 .bgflow/
 bgflow.toml
+REPORT.md
+REVIEW*.md

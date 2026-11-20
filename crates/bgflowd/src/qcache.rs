@@ -16,11 +16,11 @@ use axum::{
     response::Response,
 };
 use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
 /// Serve a cached entry without refresh while younger than this.
@@ -161,8 +161,7 @@ impl QueryCache {
         if let Some(old) = m.map.remove(key) {
             bytes = bytes.saturating_sub(old.body.len());
         }
-        while (m.map.len() + usize::from(is_new)) > m.max_entries
-            || bytes + incoming > m.max_bytes
+        while (m.map.len() + usize::from(is_new)) > m.max_entries || bytes + incoming > m.max_bytes
         {
             let Some(oldest) = m
                 .map
@@ -206,18 +205,20 @@ fn cacheable(uri: &Uri) -> bool {
         return false;
     }
     // CSV exports are large one-off downloads — never cache.
-    !uri
-        .query()
+    !uri.query()
         .map(|q| q.contains("format=csv"))
         .unwrap_or(false)
 }
 
 fn clone_request(req: &Request<Body>) -> Request<Body> {
-    let mut b = Request::builder().method(Method::GET).uri(req.uri().clone());
+    let mut b = Request::builder()
+        .method(Method::GET)
+        .uri(req.uri().clone());
     if let Some(h) = b.headers_mut() {
         *h = req.headers().clone();
     }
-    b.body(Body::empty()).unwrap_or_else(|_| Request::new(Body::empty()))
+    b.body(Body::empty())
+        .unwrap_or_else(|_| Request::new(Body::empty()))
 }
 
 /// Buffer a fresh response, store it if cacheable, and return it.
@@ -326,7 +327,14 @@ where
             if req.method() != Method::GET || !cacheable(req.uri()) {
                 return inner.call(req).await;
             }
-            let key = req.uri().to_string();
+            // Fold the config generation into the key: reloads and
+            // naming/policy mutations bump it, instantly retiring every
+            // cached response computed under the old config.
+            let key = format!(
+                "{}#g{}",
+                req.uri(),
+                cache.metrics.config_gen.load(Ordering::Relaxed)
+            );
             match cache.lookup(&key) {
                 Lookup::Miss => {
                     cache.metrics.qcache_miss.fetch_add(1, Ordering::Relaxed);

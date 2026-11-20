@@ -168,6 +168,7 @@ pub async fn run(
     hot: Arc<RwLock<HotStats>>,
     local_asns: Arc<RwLock<Vec<u32>>>,
     mut export: Option<ExportTap>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Open-time settings snapshot — dataset dirs/segment sizing are
     // fixed for the process lifetime. Retention knobs are re-read from
@@ -189,15 +190,24 @@ pub async fn run(
         Dataset::<RollupRecord>::open(cfg0.dataset_dir("hourly", &cfg0.hourly_dir), opts.clone())?;
     // Geo dataset: minute-bucketed lat/lon bubbles — backs /api/v1/geo
     // without scanning raw flows.
-    let mut geos =
-        Dataset::<GeoRecord>::open(cfg0.dataset_dir("geo", &cfg0.geo_dir), opts)?;
+    let mut geos = Dataset::<GeoRecord>::open(cfg0.dataset_dir("geo", &cfg0.geo_dir), opts)?;
     let mut agg = RollupAggregator::new().with_sampling(cfg0.sample_weighting);
     let mut coarse_agg = RollupAggregator::coarse().with_sampling(cfg0.sample_weighting);
     let mut geo_agg = GeoAggregator::new().with_sampling(cfg0.sample_weighting);
     let coarse_on = cfg0.coarse_rollup;
 
     // Publish initial indexes (picks up segments from previous runs).
-    publish(&shared, &flows, &rollups, &hourly, &geos, &agg, &coarse_agg, &geo_agg, now_ms());
+    publish(
+        &shared,
+        &flows,
+        &rollups,
+        &hourly,
+        &geos,
+        &agg,
+        &coarse_agg,
+        &geo_agg,
+        now_ms(),
+    );
 
     let started = now_ms();
     let mut pending: Vec<FlowRecord> = Vec::with_capacity(BATCH);
@@ -224,25 +234,12 @@ pub async fn run(
                             ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics, &mut export);
                         }
                     }
-                    None => {
-                        // All senders gone: flush everything and exit.
-                        ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics, &mut export);
-                        // drain_all: keep the still-open buckets too — their
-                        // raw flows exist, so rollups shouldn't lose them.
-                        let recs = agg.drain_all();
-                        feed_hot(&hot, &local_asns, &recs);
-                        push_all(&mut rollups, recs.into_iter(), &metrics, "rollups");
-                        push_all(&mut hourly, coarse_agg.drain_all().into_iter(), &metrics, "hourly");
-                        push_all(&mut geos, geo_agg.drain_all().into_iter(), &metrics, "geo");
-                        flows.flush()?;
-                        rollups.flush()?;
-                        hourly.flush()?;
-                        geos.flush()?;
-                        publish(&shared, &flows, &rollups, &hourly, &geos, &agg, &coarse_agg, &geo_agg, started);
-                        return Ok(());
-                    }
+                    None => break,
                 }
             }
+            // SIGTERM/SIGINT shutdown: same flush path as channel close —
+            // previously unreachable because the process died on signal.
+            _ = shutdown.wait_for(|s| *s) => break,
             _ = tick.tick() => {
                 ingest_batch(&mut pending, &mut flows, &mut agg, &mut coarse_agg, &mut geo_agg, coarse_on, &metrics, &mut export);
                 // Cardinality circuit-breaker: drain a subset of live
@@ -341,6 +338,46 @@ pub async fn run(
             }
         }
     }
+
+    // Channel closed or shutdown requested: flush everything and exit.
+    ingest_batch(
+        &mut pending,
+        &mut flows,
+        &mut agg,
+        &mut coarse_agg,
+        &mut geo_agg,
+        coarse_on,
+        &metrics,
+        &mut export,
+    );
+    // drain_all: keep the still-open buckets too — their
+    // raw flows exist, so rollups shouldn't lose them.
+    let recs = agg.drain_all();
+    feed_hot(&hot, &local_asns, &recs);
+    push_all(&mut rollups, recs.into_iter(), &metrics, "rollups");
+    push_all(
+        &mut hourly,
+        coarse_agg.drain_all().into_iter(),
+        &metrics,
+        "hourly",
+    );
+    push_all(&mut geos, geo_agg.drain_all().into_iter(), &metrics, "geo");
+    flows.flush()?;
+    rollups.flush()?;
+    hourly.flush()?;
+    geos.flush()?;
+    publish(
+        &shared,
+        &flows,
+        &rollups,
+        &hourly,
+        &geos,
+        &agg,
+        &coarse_agg,
+        &geo_agg,
+        started,
+    );
+    Ok(())
 }
 
 /// Push a batch of flow records. Storage errors are counted and logged
@@ -387,12 +424,16 @@ fn ingest_batch(
             }
         }
     }
-    metrics.rows_stored.fetch_add(stored, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .rows_stored
+        .fetch_add(stored, std::sync::atomic::Ordering::Relaxed);
     if let Some(tap) = export.as_mut() {
         tap.flush(metrics);
     }
     if errs > 0 {
-        metrics.write_errors.fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .write_errors
+            .fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             "writer: {} flow record(s) failed to store ({} stored); first error: {}",
             errs,
@@ -416,14 +457,18 @@ fn push_all<R: bgflow_store::Record>(
         }
     }
     if errs > 0 {
-        metrics.write_errors.fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .write_errors
+            .fetch_add(errs, std::sync::atomic::Ordering::Relaxed);
         tracing::error!("writer: {} {} record(s) failed to store", errs, what);
     }
 }
 
 /// Count + log a storage error without killing the writer.
 fn write_err(metrics: &Metrics, what: &str, e: &anyhow::Error) {
-    metrics.write_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .write_errors
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tracing::error!("writer: {} failed: {:#}", what, e);
 }
 
@@ -439,7 +484,9 @@ fn retention(
     if cfg.raw_retention_days > 0 {
         let cutoff = now.saturating_sub(cfg.raw_retention_days as u64 * 86_400_000);
         let freed = flows.retain(cutoff)?;
-        metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .bytes_freed
+            .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
         if freed > 0 {
             tracing::info!("retention: freed {} bytes of raw flows", freed);
         }
@@ -447,7 +494,9 @@ fn retention(
     if cfg.rollup_retention_days > 0 {
         let cutoff = now.saturating_sub(cfg.rollup_retention_days as u64 * 86_400_000);
         let freed = rollups.retain(cutoff)?;
-        metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .bytes_freed
+            .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
         if freed > 0 {
             tracing::info!("retention: freed {} bytes of rollups", freed);
         }
@@ -455,7 +504,9 @@ fn retention(
     if cfg.coarse_retention_days > 0 {
         let cutoff = now.saturating_sub(cfg.coarse_retention_days as u64 * 86_400_000);
         let freed = hourly.retain(cutoff)?;
-        metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .bytes_freed
+            .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
         if freed > 0 {
             tracing::info!("retention: freed {} bytes of hourly rollups", freed);
         }
@@ -464,14 +515,18 @@ fn retention(
     if cfg.raw_retention_days > 0 {
         let cutoff = now.saturating_sub(cfg.raw_retention_days as u64 * 86_400_000);
         let freed = geos.retain(cutoff)?;
-        metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .bytes_freed
+            .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
         if freed > 0 {
             tracing::info!("retention: freed {} bytes of geo rollups", freed);
         }
     }
     if cfg.max_bytes > 0 {
         let freed = disk_cap(flows, rollups, hourly, geos, cfg.max_bytes)?;
-        metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .bytes_freed
+            .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
         if freed > 0 {
             tracing::info!("disk cap: evicted oldest segments, freed {} bytes", freed);
         }
@@ -479,7 +534,9 @@ fn retention(
     // fs_guard always runs: it samples bgflow_disk_free_bytes every
     // sweep and only evicts when a free-space floor is configured.
     let freed = fs_guard(flows, rollups, hourly, geos, cfg, metrics)?;
-    metrics.bytes_freed.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .bytes_freed
+        .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
     if freed > 0 {
         tracing::info!("fs guard: evicted oldest segments, freed {} bytes", freed);
     }
@@ -552,11 +609,13 @@ fn fs_guard(
     let mut freed = 0u64;
     let mut min_free = u64::MAX;
     for (tag, root) in &roots {
-        let Some((free, total)) = fs_free(root) else { continue };
+        let Some((free, total)) = fs_free(root) else {
+            continue;
+        };
         min_free = min_free.min(free);
-        let floor = cfg.min_free_bytes.max(
-            total.saturating_mul(cfg.min_free_pct.min(99) as u64) / 100,
-        );
+        let floor = cfg
+            .min_free_bytes
+            .max(total.saturating_mul(cfg.min_free_pct.min(99) as u64) / 100);
         if free >= floor {
             continue;
         }
@@ -590,7 +649,8 @@ fn disk_cap(
     geos: &mut Dataset<GeoRecord>,
     cap: u64,
 ) -> anyhow::Result<u64> {
-    let total = flows.total_bytes() + rollups.total_bytes() + hourly.total_bytes() + geos.total_bytes();
+    let total =
+        flows.total_bytes() + rollups.total_bytes() + hourly.total_bytes() + geos.total_bytes();
     if total <= cap {
         return Ok(0);
     }
@@ -652,7 +712,9 @@ fn publish(
     *shared.rollup_index.write().unwrap() = Arc::new(rollups.segment_snapshot());
     *shared.hourly_index.write().unwrap() = Arc::new(hourly.segment_snapshot());
     *shared.geo_index.write().unwrap() = Arc::new(geos.segment_snapshot());
-    update_status(shared, flows, rollups, hourly, geos, agg, coarse_agg, geo_agg, started);
+    update_status(
+        shared, flows, rollups, hourly, geos, agg, coarse_agg, geo_agg, started,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -674,7 +736,10 @@ fn update_status(
     s.uptime_secs = now_ms().saturating_sub(s.started_ms) / 1000;
     s.writer_alive = true;
     s.last_flush_ms = now_ms();
-    s.buffered_rows = flows.buffered_rows() + rollups.buffered_rows() + hourly.buffered_rows() + geos.buffered_rows();
+    s.buffered_rows = flows.buffered_rows()
+        + rollups.buffered_rows()
+        + hourly.buffered_rows()
+        + geos.buffered_rows();
     s.flow_segments = flows.segment_count();
     s.flow_rows = flows.total_rows();
     s.flow_bytes = flows.total_bytes();

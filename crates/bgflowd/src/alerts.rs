@@ -7,9 +7,7 @@
 use crate::config::{AlertConfig, AlertsConfig};
 use crate::metrics::{now_ms, Metrics};
 use crate::query::{self, Ctx, RollupFilter, RollupSet};
-use bgflow_types::ip_to_u128;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,9 +71,14 @@ fn alert_filter(ctx: &Ctx, a: &AlertConfig) -> Result<RollupFilter, String> {
         f.dst_country = Some(bgflow_types::country_pack(s));
     }
     if let Some(s) = &a.exporter {
+        // Same resolution as the query API: IPs, "name (ip)", or
+        // configured exporter names — not just raw IP literals.
+        let names = ctx.exporter_names.read().unwrap();
         for part in s.split(',') {
-            let ip: IpAddr = part.trim().parse().map_err(|_| "bad exporter")?;
-            f.exporters.push(ip_to_u128(&ip));
+            match names.resolve(part) {
+                Some(u) => f.exporters.push(u),
+                None => return Err(format!("bad exporter '{}'", part.trim())),
+            }
         }
     }
     if let Some(s) = &a.label {
@@ -202,10 +205,18 @@ async fn evaluate(
             n2.push(mcol);
             n2.sort_unstable();
             n2.dedup();
-            eval_alert(ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &n2, a, idx, cfg, metrics, rt, client).await;
+            eval_alert(
+                ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &n2, a, idx, cfg,
+                metrics, rt, client,
+            )
+            .await;
             continue;
         }
-        eval_alert(ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &needed, a, idx, cfg, metrics, rt, client).await;
+        eval_alert(
+            ctx, set, from, now, window_ms, &f, dims, group_dim, mcol, &needed, a, idx, cfg,
+            metrics, rt, client,
+        )
+        .await;
     }
 }
 
@@ -293,7 +304,9 @@ async fn eval_alert(
             continue;
         }
         rt.fired.lock().unwrap().insert(fkey, now);
-        metrics.alerts_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .alerts_fired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let key_json = group_dim
             .map(|d| query::format_key(ctx, d, key))
@@ -335,7 +348,12 @@ async fn eval_alert(
                     }
                     match c.post(&u).json(&body).send().await {
                         Ok(r) if r.status().is_success() => {
-                            rt2.hooks.lock().unwrap().entry(name.clone()).or_default().last_ok_ms = now_ms();
+                            rt2.hooks
+                                .lock()
+                                .unwrap()
+                                .entry(name.clone())
+                                .or_default()
+                                .last_ok_ms = now_ms();
                             return;
                         }
                         Ok(r) => last_err = format!("HTTP {}", r.status()),

@@ -239,7 +239,11 @@ pub(super) async fn auth_login(
                 "bgflow_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
                 token,
                 st.auth.session_ttl()
-            ) + if st.auth.secure_cookie { "; Secure" } else { "" };
+            ) + if st.auth.secure_cookie {
+                "; Secure"
+            } else {
+                ""
+            };
             (
                 StatusCode::OK,
                 [
@@ -271,7 +275,11 @@ pub(super) async fn auth_logout(State(st): State<Arc<AppState>>, headers: Header
     }
     let cookie = format!(
         "bgflow_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
-        if st.auth.secure_cookie { "; Secure" } else { "" }
+        if st.auth.secure_cookie {
+            "; Secure"
+        } else {
+            ""
+        }
     );
     (
         StatusCode::OK,
@@ -292,16 +300,15 @@ pub(super) async fn auth_me(
     if st.auth.is_open() {
         return Json(serde_json::json!({"auth": false, "open": true})).into_response();
     }
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok());
+    let cookie = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
     let authz = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let api_key = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok());
-    match st.auth.identity_from_headers(peer.ip(), cookie, authz, api_key) {
+    let api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    match st
+        .auth
+        .identity_from_headers(peer.ip(), cookie, authz, api_key)
+    {
         Some((user, role)) => Json(serde_json::json!({
             "user": user, "role": role.as_str(), "auth": true,
         }))
@@ -328,6 +335,7 @@ fn reload_and_rebuild_hot(st: &AppState) -> crate::admin::ReloadReport {
     let before = sig(&st.config.read().unwrap());
     let rep = st.admin.reload();
     if rep.ok {
+        st.metrics.bump_config_gen();
         let after = sig(&st.config.read().unwrap());
         if before != after {
             {
@@ -388,7 +396,8 @@ const RESTART_KEYS: &[&str] = &[
 /// and restored from the live config when a PUT echoes the marker back.
 const SECRET_PATHS: &[&str] = &[
     "/snmp/community",
-    "/session_secret",
+    "/server/session_secret",
+    "/server/auth",
     "/alerts/webhook_url",
 ];
 
@@ -407,6 +416,12 @@ pub(super) fn redact_secrets(v: &mut serde_json::Value) {
         for u in users.iter_mut() {
             if let Some(o) = u.as_object_mut() {
                 o.insert("password_hash".into(), serde_json::json!(REDACTED));
+                // API keys are bearer credentials — never leave the process.
+                if let Some(keys) = o.get_mut("api_keys").and_then(|k| k.as_array_mut()) {
+                    for k in keys.iter_mut() {
+                        *k = serde_json::json!(REDACTED);
+                    }
+                }
             }
         }
     }
@@ -451,7 +466,11 @@ pub(super) fn restore_secrets(body: &mut serde_json::Value, merged: &serde_json:
         return;
     };
     for b in bb.iter_mut() {
-        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let name = b
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
         let Some(m) = mb
             .iter()
             .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
@@ -472,6 +491,205 @@ pub(super) fn restore_secrets(body: &mut serde_json::Value, merged: &serde_json:
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// API mutation policy — keep PUT /admin/settings from becoming an SSRF or
+// arbitrary-file pivot. Outbound URLs may not target loopback / link-local /
+// metadata hosts, and filesystem paths may not escape the data dir, unless
+// the identical value was already declared in bgflow.toml/env (which is
+// file-trusted configuration the operator controls directly).
+// ---------------------------------------------------------------------------
+
+/// Lexically normalize a path (`.`/`..`) without touching the filesystem —
+/// candidate files may not exist yet.
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when the URL targets a host an API write must never reach:
+/// loopback, link-local (incl. cloud metadata 169.254.0.0/16), or
+/// unspecified. RFC1918 stays allowed — internal enrichers/webhooks are
+/// a legitimate use case; file-declared values bypass this entirely.
+fn api_url_blocked(url: &str) -> bool {
+    // Templates carry {ip}/{prefix} placeholders — substitute before parse.
+    let probe = url
+        .replace("{ip}", "192.0.2.1")
+        .replace("{prefix}", "192.0.2.0/24");
+    let Ok(u) = reqwest::Url::parse(probe.trim()) else {
+        return true; // unparseable → fail closed
+    };
+    let Some(host) = u.host_str() else {
+        return true;
+    };
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() || h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    let Ok(ip) = h.parse::<std::net::IpAddr>() else {
+        return false; // DNS name — resolution happens at fetch time
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 0 || o[0] == 127 || (o[0] == 169 && o[1] == 254)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified() || v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Enforce the API mutation policy on a fully merged candidate config.
+/// `base` is the file-declared config (toml + env, no settings overlay).
+fn validate_api_settings(
+    cfg: &crate::config::Config,
+    base: &crate::config::Config,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    // Values the operator already declared in bgflow.toml/env are trusted
+    // verbatim — they had filesystem access anyway.
+    let mut trusted_urls: HashSet<&str> = HashSet::new();
+    let mut trusted_paths: HashSet<PathBuf> = HashSet::new();
+    for e in &base.enrichers {
+        if !e.url.is_empty() {
+            trusted_urls.insert(e.url.as_str());
+        }
+        if let Some(p) = &e.path {
+            if p.starts_with("http://") || p.starts_with("https://") {
+                trusted_urls.insert(p.as_str());
+            } else {
+                trusted_paths.insert(normalize_path(Path::new(p)));
+            }
+        }
+    }
+    if let Some(u) = &base.alerts.webhook_url {
+        trusted_urls.insert(u.as_str());
+    }
+    if !base.geoip.update_dir.is_empty() {
+        trusted_paths.insert(normalize_path(Path::new(&base.geoip.update_dir)));
+    }
+    for d in [
+        base.storage.flows_dir.as_ref(),
+        base.storage.rollups_dir.as_ref(),
+        base.storage.hourly_dir.as_ref(),
+        base.storage.geo_dir.as_ref(),
+        base.storage.backup_dir.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        trusted_paths.insert(normalize_path(d));
+    }
+
+    let data_dir = &cfg.storage.data_dir;
+
+    let check_url = |url: &str, what: &str| -> Result<(), String> {
+        if trusted_urls.contains(url) || !api_url_blocked(url) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} targets a loopback/link-local/metadata host — \
+                 declare it in bgflow.toml to allow",
+                what
+            ))
+        }
+    };
+    let check_path = |p: &str, what: &str| -> Result<(), String> {
+        if trusted_paths.contains(&normalize_path(Path::new(p))) {
+            return Ok(());
+        }
+        let path = Path::new(p);
+        let cand = if path.is_absolute() {
+            normalize_path(path)
+        } else {
+            normalize_path(&data_dir.join(path))
+        };
+        if cand.starts_with(normalize_path(data_dir)) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} path '{}' escapes the data dir — \
+                 declare it in bgflow.toml to allow",
+                what, p
+            ))
+        }
+    };
+
+    // The dataset root may move via the API, but not into system dirs —
+    // bgflowd writes segment files wherever it points.
+    if cfg.storage.data_dir != base.storage.data_dir {
+        const SYSTEM_DIRS: &[&str] = &[
+            "/etc",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/boot",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/var/lib/systemd",
+            "/var/log",
+        ];
+        let nd = normalize_path(&cfg.storage.data_dir);
+        for sd in SYSTEM_DIRS {
+            if nd.starts_with(sd) {
+                return Err(format!(
+                    "storage.data_dir may not be relocated under {} via the API — \
+                     edit bgflow.toml",
+                    sd
+                ));
+            }
+        }
+    }
+
+    for e in &cfg.enrichers {
+        let what = format!("enricher '{}'", e.name);
+        if !e.url.is_empty() {
+            check_url(&e.url, &format!("{} url", what))?;
+        }
+        if let Some(p) = &e.path {
+            if p.starts_with("http://") || p.starts_with("https://") {
+                check_url(p, &format!("{} path", what))?;
+            } else {
+                check_path(p, &format!("{} path", what))?;
+            }
+        }
+    }
+    if let Some(u) = &cfg.alerts.webhook_url {
+        check_url(u, "alerts.webhook_url")?;
+    }
+    if !cfg.geoip.update_dir.is_empty() {
+        check_path(&cfg.geoip.update_dir, "geoip.update_dir")?;
+    }
+    for (name, d) in [
+        ("storage.flows_dir", &cfg.storage.flows_dir),
+        ("storage.rollups_dir", &cfg.storage.rollups_dir),
+        ("storage.hourly_dir", &cfg.storage.hourly_dir),
+        ("storage.geo_dir", &cfg.storage.geo_dir),
+        ("storage.backup_dir", &cfg.storage.backup_dir),
+    ] {
+        if let Some(d) = d {
+            check_path(&d.to_string_lossy(), name)?;
+        }
+    }
+    Ok(())
 }
 
 /// GET /api/v1/admin/settings — effective config (bgflow.toml +
@@ -510,35 +728,62 @@ pub(super) async fn admin_settings_put(
                     );
                 }
             }
-            if o.get("password_hash").and_then(|h| h.as_str()) == Some(REDACTED) {
-                let name = o.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let old = merged
+            let name = o
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let old_user = || {
+                merged
                     .get("users")
                     .and_then(|us| us.as_array())
                     .and_then(|us| {
-                        us.iter().find(|x| {
-                            x.get("name").and_then(|n| n.as_str()) == Some(name)
-                        })
+                        us.iter()
+                            .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
                     })
-                    .and_then(|x| x.get("password_hash"))
-                    .cloned();
-                if let Some(h) = old {
+                    .cloned()
+            };
+            if o.get("password_hash").and_then(|h| h.as_str()) == Some(REDACTED) {
+                if let Some(h) = old_user().and_then(|x| x.get("password_hash").cloned()) {
                     o.insert("password_hash".into(), h);
                 }
+            }
+            // api_keys: each redacted marker restores the key at the same
+            // position from the live user; real values pass through.
+            if let Some(keys) = o.get_mut("api_keys").and_then(|k| k.as_array_mut()) {
+                let old_keys = old_user()
+                    .and_then(|x| x.get("api_keys").and_then(|k| k.as_array().cloned()))
+                    .unwrap_or_default();
+                for (i, k) in keys.iter_mut().enumerate() {
+                    if k.as_str() == Some(REDACTED) {
+                        match old_keys.get(i) {
+                            Some(real) => *k = real.clone(),
+                            None => *k = serde_json::Value::Null,
+                        }
+                    }
+                }
+                keys.retain(|k| !k.is_null());
             }
         }
     }
     restore_secrets(&mut body, &merged);
     crate::config::deep_merge(&mut merged, body);
     // Validate the merged result before touching disk.
-    serde_json::from_value::<crate::config::Config>(merged.clone())
+    let new_cfg = serde_json::from_value::<crate::config::Config>(merged.clone())
         .map_err(|e| err(format!("invalid settings: {}", e)))?;
+    // SSRF / filesystem policy: API writes may not point outbound URLs at
+    // internal/metadata hosts or redirect file paths outside the data dir
+    // unless the same value was already file-declared.
+    let base_cfg = crate::config::load_base(st.admin.config_path.as_ref())
+        .map_err(|e| err(format!("cannot load base config: {}", e)))?;
+    validate_api_settings(&new_cfg, &base_cfg).map_err(|e| err(e))?;
     // Write where config::load will look on the next boot — resolved
     // from the pre-overlay data_dir, not the (possibly overridden) live one.
     let path = crate::config::settings_path(st.admin.config_path.as_ref());
     let text = serde_json::to_string_pretty(&merged).map_err(|e| err(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| err(format!("cannot write {}: {}", tmp.display(), e)))?;
+    std::fs::write(&tmp, &text)
+        .map_err(|e| err(format!("cannot write {}: {}", tmp.display(), e)))?;
     // settings.json carries password hashes + secrets — owner-only.
     #[cfg(unix)]
     {

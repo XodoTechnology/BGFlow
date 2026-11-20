@@ -6,7 +6,9 @@
 //! sequenceNumber(4) observationDomainId(4). All integers big-endian.
 
 use crate::cursor::Cursor;
-use crate::netflow_v9::{DomainTemplates, TemplateKey};
+use crate::netflow_v9::{
+    DomainTemplates, TemplateKey, MAX_TEMPLATES_PER_DOMAIN, MAX_TEMPLATE_DOMAINS,
+};
 use crate::template::{
     decode_record, ip_u128, parse_template_fields, record_is_meaningful, FlowBuilder, TimeCtx,
 };
@@ -24,10 +26,20 @@ pub struct BootEstimator {
     map: HashMap<(u128, u32), i64>,
 }
 
+/// Cap on cached (exporter, domain) boot estimates — same untrusted-input
+/// bound as the template caches.
+const MAX_BOOT_DOMAINS: usize = 4096;
+
 impl BootEstimator {
     /// Update the estimate with this packet's max sysUpTime and return the
     /// boot epoch ms to use for timestamp resolution.
-    pub fn observe(&mut self, exporter: &IpAddr, domain: u32, export_ms: u64, pkt_sysup_max: u64) -> i64 {
+    pub fn observe(
+        &mut self,
+        exporter: &IpAddr,
+        domain: u32,
+        export_ms: u64,
+        pkt_sysup_max: u64,
+    ) -> i64 {
         if pkt_sysup_max == 0 {
             // No sysUpTime fields in this packet; return existing estimate
             // (or a sane default) without updating.
@@ -39,6 +51,10 @@ impl BootEstimator {
         }
         let cand = export_ms as i64 - pkt_sysup_max as i64;
         let key = (ip_u128(exporter), domain);
+        if !self.map.contains_key(&key) && self.map.len() >= MAX_BOOT_DOMAINS {
+            // Cache full — use the candidate without storing it.
+            return cand;
+        }
         let entry = self.map.entry(key).or_insert(cand);
         // Resync if drift > 2 minutes (reboot, NTP step, first contact).
         if (*entry - cand).abs() > 120_000 {
@@ -96,7 +112,13 @@ pub fn parse(
 
     // Template namespace: (exporter ip, obs domain, version=10 for IPFIX).
     let key = (ip_u128(&exporter), obs_domain, 10u8);
-    let domain = templates.entry(key).or_default();
+    if !templates.contains_key(&key) {
+        if templates.len() >= MAX_TEMPLATE_DOMAINS {
+            return Vec::new();
+        }
+        templates.insert(key, DomainTemplates::new());
+    }
+    let domain = templates.get_mut(&key).expect("domain inserted above");
 
     let mut builders: Vec<FlowBuilder> = Vec::new();
     let mut pkt_sysup_max = 0u64;
@@ -155,7 +177,9 @@ fn parse_template_set(body: &[u8], domain: &mut DomainTemplates) {
         };
         match parse_template_fields(&mut cur, field_count, true) {
             Ok(fields) => {
-                domain.insert(template_id, crate::template::Template { fields });
+                if domain.len() < MAX_TEMPLATES_PER_DOMAIN || domain.contains_key(&template_id) {
+                    domain.insert(template_id, crate::template::Template { fields });
+                }
             }
             Err(_) => return,
         }

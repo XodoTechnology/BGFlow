@@ -194,40 +194,82 @@ pub fn encode_column(def: &ColumnDef, raw: &[u8], nrows: usize) -> EncodedChunk 
 
     let raw_len = plain_chunk.len();
     let (codec, data) = maybe_compress(plain_chunk);
-    EncodedChunk { encoding, codec, raw_len, data }
+    EncodedChunk {
+        encoding,
+        codec,
+        raw_len,
+        data,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // decoders
 // ---------------------------------------------------------------------------
 
-fn decompress(codec: Codec, data: &[u8]) -> Result<Vec<u8>> {
+/// Upper bound on bytes a single decompressed chunk may occupy.
+/// Legit chunks are ~nrows*width (dict adds uniques+indices, still
+/// <2x); the multiplier is generous headroom, the 512MiB ceiling stops
+/// a corrupt header from forcing a giant allocation.
+fn max_raw_bytes(nrows: usize, width: usize) -> u64 {
+    (nrows as u64)
+        .saturating_mul(width as u64)
+        .saturating_mul(16)
+        .saturating_add(1 << 20)
+        .min(512 << 20)
+}
+
+fn decompress(codec: Codec, data: &[u8], max_raw: u64) -> Result<Vec<u8>> {
     match codec {
-        Codec::None => Ok(data.to_vec()),
-        Codec::Zstd => Ok(zstd::stream::decode_all(data)?),
+        Codec::None => {
+            if data.len() as u64 > max_raw {
+                bail!(
+                    "uncompressed chunk {} bytes exceeds bound {}",
+                    data.len(),
+                    max_raw
+                );
+            }
+            Ok(data.to_vec())
+        }
+        Codec::Zstd => {
+            use std::io::Read;
+            // take(max+1) lets us distinguish "exactly max" from
+            // "stream had more" — overflow is a corrupt segment.
+            let mut out = Vec::new();
+            zstd::stream::read::Decoder::new(data)?
+                .take(max_raw + 1)
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > max_raw {
+                bail!("decompressed chunk exceeds bound {} bytes", max_raw);
+            }
+            Ok(out)
+        }
     }
 }
 
 fn decode_plain(def: &ColumnDef, raw: &[u8], nrows: usize) -> Result<ColumnData> {
     let width = def.ty.width();
-    if raw.len() < nrows * width {
-        bail!("plain chunk too short: {} < {}", raw.len(), nrows * width);
+    let need = nrows
+        .checked_mul(width)
+        .ok_or_else(|| anyhow::anyhow!("plain chunk size overflow"))?;
+    if raw.len() < need {
+        bail!("plain chunk too short: {} < {}", raw.len(), need);
     }
-    let rows = raw[..nrows * width].chunks_exact(width);
+    let rows = raw[..need].chunks_exact(width);
     Ok(match def.ty {
         ColType::U8 => ColumnData::U8(rows.map(|c| c[0]).collect()),
         ColType::U16 => ColumnData::U16(
-            rows.map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect(),
+            rows.map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
         ),
         ColType::U32 => ColumnData::U32(
-            rows.map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(),
+            rows.map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
         ),
         ColType::U64 => ColumnData::U64(
-            rows.map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(),
+            rows.map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
         ),
-        ColType::U128 => ColumnData::U128(
-            rows.map(|c| read_u128_le(c, 16)).collect(),
-        ),
+        ColType::U128 => ColumnData::U128(rows.map(|c| read_u128_le(c, 16)).collect()),
     })
 }
 
@@ -242,10 +284,18 @@ fn decode_dict(def: &ColumnDef, raw: &[u8], nrows: usize) -> Result<ColumnData> 
         bail!("bad dict index width {}", idx_width);
     }
     let uniques_start = 5;
-    let uniques_end = uniques_start + nunique * width;
+    let uniques_len = nunique
+        .checked_mul(width)
+        .ok_or_else(|| anyhow::anyhow!("dict uniques size overflow"))?;
+    let uniques_end = uniques_start + uniques_len;
     let indices_start = uniques_end;
-    let indices_len = nrows * idx_width;
-    if raw.len() < indices_start + indices_len {
+    let indices_len = nrows
+        .checked_mul(idx_width)
+        .ok_or_else(|| anyhow::anyhow!("dict indices size overflow"))?;
+    let indices_end = indices_start
+        .checked_add(indices_len)
+        .ok_or_else(|| anyhow::anyhow!("dict chunk size overflow"))?;
+    if raw.len() < indices_end {
         bail!("dict chunk truncated");
     }
 
@@ -254,21 +304,22 @@ fn decode_dict(def: &ColumnDef, raw: &[u8], nrows: usize) -> Result<ColumnData> 
         uniques.push(read_u128_le(chunk, width));
     }
 
-    let indices = &raw[indices_start..indices_start + indices_len];
-    let lookup = |i: usize| -> u128 {
-        if idx_width == 2 {
-            let idx = u16::from_le_bytes(indices[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
-            uniques[idx]
+    let indices = &raw[indices_start..indices_end];
+    let lookup = |i: usize| -> Option<u128> {
+        let idx = if idx_width == 2 {
+            u16::from_le_bytes(indices[i * 2..i * 2 + 2].try_into().unwrap()) as usize
         } else {
-            let idx = u32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
-            uniques[idx]
-        }
+            u32::from_le_bytes(indices[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+        };
+        uniques.get(idx).copied()
     };
 
     // Expand through plain path by materializing values then decoding.
     let mut buf = Vec::with_capacity(nrows * width);
     for i in 0..nrows {
-        put_u128_le(&mut buf, lookup(i), width);
+        let v =
+            lookup(i).ok_or_else(|| anyhow::anyhow!("dict index out of bounds at row {}", i))?;
+        put_u128_le(&mut buf, v, width);
     }
     decode_plain(def, &buf, nrows)
 }
@@ -303,7 +354,7 @@ pub fn decode_column(
     data: &[u8],
     nrows: usize,
 ) -> Result<ColumnData> {
-    let raw = decompress(codec, data)?;
+    let raw = decompress(codec, data, max_raw_bytes(nrows, def.ty.width()))?;
     match encoding {
         Encoding::Plain => decode_plain(def, &raw, nrows),
         Encoding::Dict => decode_dict(def, &raw, nrows),

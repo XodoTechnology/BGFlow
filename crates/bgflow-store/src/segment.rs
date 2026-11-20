@@ -8,7 +8,7 @@
 //! [..)        column chunks back-to-back (encoded + optionally zstd)
 //! ```
 
-use crate::encode::{decode_column, ColumnData, Codec, EncodedChunk};
+use crate::encode::{decode_column, Codec, ColumnData, EncodedChunk};
 use crate::schema::{schema_by_id, ColType, Encoding, Schema};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
@@ -104,7 +104,11 @@ pub fn write_segment(
     created_ms: u64,
 ) -> Result<()> {
     if chunks.len() != schema.columns.len() {
-        bail!("chunk count {} != schema columns {}", chunks.len(), schema.columns.len());
+        bail!(
+            "chunk count {} != schema columns {}",
+            chunks.len(),
+            schema.columns.len()
+        );
     }
 
     let ncols = schema.columns.len() as u16;
@@ -208,6 +212,7 @@ pub fn read_header(path: &Path) -> Result<SegmentHeader> {
 /// Full read access to one segment.
 pub struct SegmentReader {
     file: File,
+    file_len: u64,
     pub header: SegmentHeader,
     pub schema: &'static Schema,
     dir: Vec<ColDir>,
@@ -239,7 +244,14 @@ impl SegmentReader {
             )?);
         }
 
-        Ok(SegmentReader { file, header, schema, dir })
+        let file_len = file.metadata()?.len();
+        Ok(SegmentReader {
+            file,
+            file_len,
+            header,
+            schema,
+            dir,
+        })
     }
 
     /// Decode every column.
@@ -258,25 +270,34 @@ impl SegmentReader {
             // read missing columns as 0.
             let Some(d) = self.dir.get(ci) else { continue };
             let def = &self.schema.columns[ci];
-            let encoding = Encoding::from_id(d.encoding)
-                .context("bad encoding id")?;
+            let encoding = Encoding::from_id(d.encoding).context("bad encoding id")?;
             let codec = Codec::from_id(d.codec).context("bad codec id")?;
             let ty = ColType::from_id(d.ty).context("bad column type id")?;
             if ty != def.ty {
                 bail!("segment column {} type mismatch", ci);
             }
 
+            // Validate the chunk extent against the real file size before
+            // allocating — a corrupt dir entry could claim exabytes.
+            let chunk_end = d
+                .offset
+                .checked_add(d.comp_len)
+                .ok_or_else(|| anyhow::anyhow!("column {} chunk offset overflow", ci))?;
+            if chunk_end > self.file_len {
+                bail!(
+                    "column {} chunk (offset {} + {} bytes) exceeds file size {}",
+                    ci,
+                    d.offset,
+                    d.comp_len,
+                    self.file_len
+                );
+            }
+
             buf.clear();
             buf.resize(d.comp_len as usize, 0);
             self.file.read_exact_at(&mut buf, d.offset)?;
 
-            let data = decode_column(
-                def,
-                encoding,
-                codec,
-                &buf,
-                self.header.row_count as usize,
-            )?;
+            let data = decode_column(def, encoding, codec, &buf, self.header.row_count as usize)?;
             out.push((ci, data));
         }
         Ok(out)

@@ -21,19 +21,15 @@ pub(super) fn agg_add(a: &mut Agg, b: &Agg) {
 /// shard's local top-`limit` — collecting per-shard candidates and
 /// re-sorting yields the exact global top-`limit` without materializing
 /// or sorting the full key space.
-pub(super) fn shard_top<K>(
-    shards: Vec<query::ShardMap<K, Agg>>,
-    limit: usize,
-) -> Vec<(K, Agg)>
+pub(super) fn shard_top<K>(shards: Vec<query::ShardMap<K, Agg>>, limit: usize) -> Vec<(K, Agg)>
 where
     K: Send,
 {
     if limit == 0 {
         return Vec::new();
     }
-    let cmp = |a: &(K, Agg), b: &(K, Agg)| {
-        b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
-    };
+    let cmp =
+        |a: &(K, Agg), b: &(K, Agg)| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows));
     // Per-shard select+truncate+sort in parallel — each shard's candidate
     // list is independent.
     let per_shard: Vec<Vec<(K, Agg)>> = std::thread::scope(|s| {
@@ -198,7 +194,14 @@ pub(super) async fn overview(
     raw: RawQuery,
     Query(q): Query<Q>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let key = raw.0.unwrap_or_default();
+    // Config generation in the key — renames/reloads invalidate instantly.
+    let key = format!(
+        "{}#g{}",
+        raw.0.unwrap_or_default(),
+        st.metrics
+            .config_gen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
     {
         let g = st.ov_cache.lock().unwrap();
         if let Some((k, at, v)) = g.as_ref() {
@@ -225,7 +228,12 @@ pub(super) async fn overview(
     if let Some(resp) = hot_overview(&st, &f, &q, set, from, to, size, limit) {
         return Ok(resp);
     }
-    let needed = query::rollup_needed(&f, &["proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]);
+    let needed = query::rollup_needed(
+        &f,
+        &[
+            "proto", "src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port",
+        ],
+    );
     let local_asns = Arc::new(st.ctx.local_asns.read().unwrap().clone());
 
     // One sharded scan: bounded state (totals/proto/series) accumulates
@@ -320,7 +328,11 @@ pub(super) async fn overview(
     };
     let start = (from / size) * size;
     let end = (to / size) * size;
-    let n_pts = if end >= start { (end - start) / size + 1 } else { 0 };
+    let n_pts = if end >= start {
+        (end - start) / size + 1
+    } else {
+        0
+    };
     let mut ts_rows: Vec<serde_json::Value> = Vec::new();
     if n_pts <= 8192 {
         let mut keys: Vec<u64> = series.keys().copied().collect();
@@ -348,8 +360,7 @@ pub(super) async fn overview(
 
     // Partition shard entries by dimension index, then exact top-N per
     // dim via select_nth (no full sort of the IP-sized key spaces).
-    let mut dim_rows: Vec<Vec<(u128, Agg)>> =
-        (0..TOP_DIMS_OV.len()).map(|_| Vec::new()).collect();
+    let mut dim_rows: Vec<Vec<(u128, Agg)>> = (0..TOP_DIMS_OV.len()).map(|_| Vec::new()).collect();
     for map in shards {
         for ((di, k), a) in map {
             dim_rows[di as usize].push((k, a));
@@ -482,7 +493,11 @@ fn hot_overview(
     };
     let start = (from / esize) * esize;
     let end = (to / esize) * esize;
-    let n_pts = if end >= start { (end - start) / esize + 1 } else { 0 };
+    let n_pts = if end >= start {
+        (end - start) / esize + 1
+    } else {
+        0
+    };
     let mut ts_rows: Vec<serde_json::Value> = Vec::new();
     if n_pts <= 8192 {
         let zero = SeriesPt::default();
@@ -503,7 +518,10 @@ fn hot_overview(
         b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
     };
     let mut top_out = serde_json::Map::new();
-    for (i, d) in ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"].iter().enumerate() {
+    for (i, d) in ["src_ip", "dst_ip", "src_asn", "dst_asn", "dst_port"]
+        .iter()
+        .enumerate()
+    {
         let mut rows: Vec<(u128, Agg)> = std::mem::take(&mut v.tops[i]).into_iter().collect();
         if limit > 0 {
             if rows.len() > limit {
@@ -542,8 +560,18 @@ fn hot_overview(
 /// Pair aggregation for the flow-map view: groups rollups by (src_dim, dst_dim).
 /// IP/exporter dims are excluded — pair cardinality would explode.
 const MATRIX_DIMS: &[&str] = &[
-    "src_ipver", "dst_ipver", "src_asn", "dst_asn", "src_org", "dst_org",
-    "src_country", "dst_country", "proto", "label", "src_port", "dst_port",
+    "src_ipver",
+    "dst_ipver",
+    "src_asn",
+    "dst_asn",
+    "src_org",
+    "dst_org",
+    "src_country",
+    "dst_country",
+    "proto",
+    "label",
+    "src_port",
+    "dst_port",
 ];
 
 pub(super) async fn matrix(
@@ -554,8 +582,14 @@ pub(super) async fn matrix(
     let f = rollup_filter(&q, &st.ctx)?;
     let set = auto_rollup_set(&q, from, to, &f);
     // NB: params are src_dim/dst_dim — bare `src`/`dst` are flow-filter aliases.
-    let sd = q.get("src_dim").map(|s| s.as_str()).unwrap_or("src_country");
-    let dd = q.get("dst_dim").map(|s| s.as_str()).unwrap_or("dst_country");
+    let sd = q
+        .get("src_dim")
+        .map(|s| s.as_str())
+        .unwrap_or("src_country");
+    let dd = q
+        .get("dst_dim")
+        .map(|s| s.as_str())
+        .unwrap_or("dst_country");
     if !MATRIX_DIMS.contains(&sd) || !MATRIX_DIMS.contains(&dd) {
         return Err(err(format!(
             "bad matrix dim; src/dst must be one of {}",
@@ -659,31 +693,33 @@ pub(super) async fn timeseries(
             })
             .collect();
         rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
-        return Ok(Json(serde_json::json!({"bucket_ms": hsize, "series": rows, "set": "hot"})));
+        return Ok(Json(
+            serde_json::json!({"bucket_ms": hsize, "series": rows, "set": "hot"}),
+        ));
     }
     let needed = query::rollup_needed(&f, &[]);
     let buckets: HashMap<u64, Agg> = {
         let _scan = scan_permit(&st.ctx).await;
         query::rollup_scan_par::<HashMap<u64, Agg>>(
-        &st.ctx,
-        set,
-        from,
-        to,
-        &needed,
-        Default::default,
-        |buckets, r| {
-            if !f.matches(r) {
-                return;
-            }
-            let b = (r.bucket_ms() / size) * size;
-            let a = buckets.entry(b).or_default();
-            a.bytes += r.bytes();
-            a.packets += r.packets();
-            a.flows += r.flows();
-        },
-        |a, b| merge_agg_map(a, b),
-    )
-    .map_err(|e| err(e.to_string()))?
+            &st.ctx,
+            set,
+            from,
+            to,
+            &needed,
+            Default::default,
+            |buckets, r| {
+                if !f.matches(r) {
+                    return;
+                }
+                let b = (r.bucket_ms() / size) * size;
+                let a = buckets.entry(b).or_default();
+                a.bytes += r.bytes();
+                a.packets += r.packets();
+                a.flows += r.flows();
+            },
+            |a, b| merge_agg_map(a, b),
+        )
+        .map_err(|e| err(e.to_string()))?
     };
 
     let mut rows: Vec<_> = buckets
@@ -696,14 +732,30 @@ pub(super) async fn timeseries(
         })
         .collect();
     rows.sort_by_key(|v| v["t"].as_u64().unwrap_or(0));
-    Ok(Json(serde_json::json!({"bucket_ms": size, "series": rows, "set": set_name(set)})))
+    Ok(Json(
+        serde_json::json!({"bucket_ms": size, "series": rows, "set": set_name(set)}),
+    ))
 }
 
 const TOP_DIMS: &[&str] = &[
-    "src_ip", "dst_ip", "src_ipver", "dst_ipver", "src_asn", "dst_asn",
-    "src_org", "dst_org", "src_port", "dst_port", "proto",
-    "exporter", "src_country", "dst_country", "label", "vlan",
-    "ingress_if", "egress_if",
+    "src_ip",
+    "dst_ip",
+    "src_ipver",
+    "dst_ipver",
+    "src_asn",
+    "dst_asn",
+    "src_org",
+    "dst_org",
+    "src_port",
+    "dst_port",
+    "proto",
+    "exporter",
+    "src_country",
+    "dst_country",
+    "label",
+    "vlan",
+    "ingress_if",
+    "egress_if",
 ];
 
 pub(super) async fn top(
@@ -712,7 +764,11 @@ pub(super) async fn top(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let by = q.get("by").map(|s| s.as_str()).unwrap_or("src_ip");
     if !TOP_DIMS.contains(&by) {
-        return Err(err(format!("unknown dimension '{}'; valid: {}", by, TOP_DIMS.join(", "))));
+        return Err(err(format!(
+            "unknown dimension '{}'; valid: {}",
+            by,
+            TOP_DIMS.join(", ")
+        )));
     }
     let (from, to) = range(&q);
     let f = rollup_filter(&q, &st.ctx)?;
@@ -724,7 +780,11 @@ pub(super) async fn top(
     } else {
         auto_rollup_set(&q, from, to, &f)
     };
-    let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(1000);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .min(1000);
 
     // Hot tier serves the dims it tracks; everything else scans.
     if let Some(di) = crate::hot::hot_dim_idx(by) {
@@ -736,9 +796,7 @@ pub(super) async fn top(
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-            rows.sort_by(|a, b| {
-                b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows))
-            });
+            rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(b.1.flows.cmp(&a.1.flows)));
             rows.truncate(limit);
             let out: Vec<_> = rows
                 .into_iter()
@@ -799,10 +857,12 @@ pub(super) async fn top(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({"by": by, "set": set_name(set), "items": out,
-        // Hourly rows mask IPs to /24·/48 — IP-dim top lists are approximate.
-        "approximate": set == RollupSet::Hourly && matches!(by, "src_ip" | "dst_ip"),
-    })))
+    Ok(Json(
+        serde_json::json!({"by": by, "set": set_name(set), "items": out,
+            // Hourly rows mask IPs to /24·/48 — IP-dim top lists are approximate.
+            "approximate": set == RollupSet::Hourly && matches!(by, "src_ip" | "dst_ip"),
+        }),
+    ))
 }
 
 pub(super) async fn conversations(
@@ -812,7 +872,11 @@ pub(super) async fn conversations(
     let (from, to) = range(&q);
     let f = rollup_filter(&q, &st.ctx)?;
     let set = auto_rollup_set(&q, from, to, &f);
-    let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20).min(500);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+        .min(500);
     // Conversation keys are near-unique per flow — millions of entries.
     // Key-sharded parallel aggregation: each key lives in exactly one
     // shard, so memory equals a single map (not one per worker).
@@ -880,7 +944,6 @@ pub(super) async fn conversations(
     })))
 }
 
-
 /// Anomaly detection: per-key bytes-per-bucket series over the window;
 /// flags buckets whose value exceeds mean + `sigma`·stddev of the series.
 pub(super) async fn anomalies(
@@ -895,7 +958,11 @@ pub(super) async fn anomalies(
         return Err(err(format!("unknown dimension '{}'", by)));
     }
     let sigma: f64 = q.get("sigma").and_then(|s| s.parse().ok()).unwrap_or(3.0);
-    let top_n: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10).min(100);
+    let top_n: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .min(100);
     let needed = query::rollup_needed(&f, &[by]);
 
     // key -> bucket -> bytes. Flattened to (key, bucket) pairs so the
@@ -988,7 +1055,12 @@ pub(super) async fn anomalies(
         for (b, bytes) in buckets {
             let z = (*bytes as f64 - mean) / std;
             if z >= sigma {
-                out.push(Anom { key: *k, bucket: *b, bytes: *bytes, z });
+                out.push(Anom {
+                    key: *k,
+                    bucket: *b,
+                    bytes: *bytes,
+                    z,
+                });
             }
         }
     }
@@ -1030,25 +1102,25 @@ pub(super) async fn label_stats(
     let map: HashMap<u128, Agg> = {
         let _scan = scan_permit(&st.ctx).await;
         query::rollup_scan_par::<HashMap<u128, Agg>>(
-        &st.ctx,
-        set,
-        from,
-        to,
-        &needed,
-        Default::default,
-        |map, r| {
-            if !f.matches(r) {
-                return;
-            }
-            let k = r.label_id() as u128;
-            let a = map.entry(k).or_default();
-            a.bytes += r.bytes();
-            a.packets += r.packets();
-            a.flows += r.flows();
-        },
-        |a, b| merge_agg_map(a, b),
-    )
-    .map_err(|e| err(e.to_string()))?
+            &st.ctx,
+            set,
+            from,
+            to,
+            &needed,
+            Default::default,
+            |map, r| {
+                if !f.matches(r) {
+                    return;
+                }
+                let k = r.label_id() as u128;
+                let a = map.entry(k).or_default();
+                a.bytes += r.bytes();
+                a.packets += r.packets();
+                a.flows += r.flows();
+            },
+            |a, b| merge_agg_map(a, b),
+        )
+        .map_err(|e| err(e.to_string()))?
     };
     let mut rows: Vec<(u128, Agg)> = map.into_iter().collect();
     rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
@@ -1062,6 +1134,7 @@ pub(super) async fn label_stats(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({"items": items, "set": set_name(set)})))
+    Ok(Json(
+        serde_json::json!({"items": items, "set": set_name(set)}),
+    ))
 }
-

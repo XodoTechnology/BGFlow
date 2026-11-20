@@ -45,7 +45,9 @@ fn read_xdr_address(cur: &mut Cursor) -> Result<u128> {
     match t {
         1 => {
             let b = cur.slice(4)?;
-            Ok(ip_u128(&IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))))
+            Ok(ip_u128(&IpAddr::V4(std::net::Ipv4Addr::new(
+                b[0], b[1], b[2], b[3],
+            ))))
         }
         2 => {
             let b = cur.slice(16)?;
@@ -66,7 +68,7 @@ fn read_xdr_opaque<'a>(cur: &mut Cursor<'a>) -> Result<&'a [u8]> {
     Ok(data)
 }
 
-pub fn parse(payload: &[u8], _exporter: IpAddr, now_ms: u64) -> Vec<FlowRecord> {
+pub fn parse(payload: &[u8], exporter: IpAddr, now_ms: u64) -> Vec<FlowRecord> {
     let mut cur = Cursor::new(payload);
     let version = match cur.u32() {
         Ok(v) => v,
@@ -124,7 +126,7 @@ pub fn parse(payload: &[u8], _exporter: IpAddr, now_ms: u64) -> Vec<FlowRecord> 
         }
         match fmt {
             SAMPLE_FLOW | SAMPLE_EXPANDED_FLOW | SAMPLE_DROP => {
-                parse_flow_sample(body, fmt, agent, now_ms, &mut out);
+                parse_flow_sample(body, fmt, agent, exporter, now_ms, &mut out);
             }
             _ => {} // counter/gauge samples ignored
         }
@@ -136,6 +138,7 @@ fn parse_flow_sample(
     body: &[u8],
     fmt: u32,
     agent: u128,
+    exporter: IpAddr,
     now_ms: u64,
     out: &mut Vec<FlowRecord>,
 ) {
@@ -192,7 +195,11 @@ fn parse_flow_sample(
         _ => unreachable!(),
     };
 
-    let rate = if sampling_rate == 0 { 1 } else { sampling_rate as u64 };
+    let rate = if sampling_rate == 0 {
+        1
+    } else {
+        sampling_rate as u64
+    };
     let mut current: Option<FlowBuilder> = None;
 
     for _ in 0..records_count.min(1000) {
@@ -232,7 +239,9 @@ fn parse_flow_sample(
                 };
                 // Emit previous pending record, start new one if header parses.
                 if let Some(b) = current.take() {
-                    out.push(finalize(b, agent, input_if, output_if, rate, now_ms));
+                    out.push(finalize(
+                        b, agent, exporter, input_if, output_if, rate, now_ms,
+                    ));
                 }
                 if let Some(pkt) = parse_l2_packet(hdr, hdr_proto) {
                     let mut b = FlowBuilder::default();
@@ -278,7 +287,9 @@ fn parse_flow_sample(
                 // tos/priority — not stored
 
                 if let Some(b) = current.take() {
-                    out.push(finalize(b, agent, input_if, output_if, rate, now_ms));
+                    out.push(finalize(
+                        b, agent, exporter, input_if, output_if, rate, now_ms,
+                    ));
                 }
                 let mut b = FlowBuilder::default();
                 b.src_ip = src;
@@ -352,7 +363,9 @@ fn parse_flow_sample(
     }
 
     if let Some(b) = current.take() {
-        out.push(finalize(b, agent, input_if, output_if, rate, now_ms));
+        out.push(finalize(
+            b, agent, exporter, input_if, output_if, rate, now_ms,
+        ));
     }
 }
 
@@ -361,6 +374,7 @@ fn parse_flow_sample(
 fn finalize(
     mut b: FlowBuilder,
     agent: u128,
+    exporter: IpAddr,
     input_if: u32,
     output_if: u32,
     rate: u64,
@@ -375,12 +389,19 @@ fn finalize(
     if b.egress_if == 0 {
         b.egress_if = output_if & 0x7fff_ffff;
     }
-    // finish() resolves ts from export_ms fallback and sets exporter.
+    // Exporter identity = the UDP packet's source IP, consistent with
+    // NetFlow v5/v9/IPFIX and with exporter allowlists/metrics. The sFlow
+    // agent address is only a fallback for unspecified sources.
     let ctx = crate::template::TimeCtx {
         export_ms: now_ms,
         boot_ms: None,
     };
-    b.finish(&ctx, now_ms as i64, bgflow_types::u128_to_ip(agent))
+    let exp = if exporter.is_unspecified() {
+        bgflow_types::u128_to_ip(agent)
+    } else {
+        exporter
+    };
+    b.finish(&ctx, now_ms as i64, exp)
 }
 
 /// Parsed packet header fields from an sFlow raw sample.
@@ -538,8 +559,12 @@ fn parse_ipv4(p: &[u8]) -> Option<ParsedPacket> {
     let total_len = be16(p, 2) as u32;
     let frag = be16(p, 6);
     let proto = p[9];
-    let src = ip_u128(&IpAddr::V4(std::net::Ipv4Addr::new(p[12], p[13], p[14], p[15])));
-    let dst = ip_u128(&IpAddr::V4(std::net::Ipv4Addr::new(p[16], p[17], p[18], p[19])));
+    let src = ip_u128(&IpAddr::V4(std::net::Ipv4Addr::new(
+        p[12], p[13], p[14], p[15],
+    )));
+    let dst = ip_u128(&IpAddr::V4(std::net::Ipv4Addr::new(
+        p[16], p[17], p[18], p[19],
+    )));
 
     let mut pkt = ParsedPacket {
         src_ip: src,

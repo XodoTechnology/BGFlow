@@ -116,21 +116,18 @@ pub(super) async fn exporter_rename(
     let u = bgflow_types::ip_to_u128(&ip);
     let effective = match &name {
         Some(n) => Some(n.clone()),
-        None => st
-            .config
-            .read()
-            .unwrap()
-            .exporter_names
-            .get(&ip_s)
-            .cloned(),
+        None => st.config.read().unwrap().exporter_names.get(&ip_s).cloned(),
     };
     st.ctx
         .exporter_names
         .write()
         .unwrap()
         .set_name(u, effective);
+    st.metrics.bump_config_gen();
     tracing::info!("exporter {} renamed to {:?}", ip, name);
-    Ok(Json(serde_json::json!({"ok": true, "ip": ip_s, "name": name})))
+    Ok(Json(
+        serde_json::json!({"ok": true, "ip": ip_s, "name": name}),
+    ))
 }
 
 /// POST /api/v1/exporters/{ip}/vlans — {"vlans": {"250": "Cogent"}}
@@ -146,9 +143,7 @@ pub(super) async fn exporter_vlans(
     let mut map = std::collections::BTreeMap::new();
     if let Some(obj) = body.get("vlans").and_then(|v| v.as_object()) {
         for (k, v) in obj.iter().take(1024) {
-            let vid: u16 = k
-                .parse()
-                .map_err(|_| err(format!("bad vlan id: {}", k)))?;
+            let vid: u16 = k.parse().map_err(|_| err(format!("bad vlan id: {}", k)))?;
             if let Some(name) = v.as_str() {
                 let name = name.trim();
                 if !name.is_empty() && name.len() <= 64 {
@@ -159,7 +154,10 @@ pub(super) async fn exporter_vlans(
     }
     let now = crate::metrics::now_ms();
     st.exporter_policy.set_vlans(ip, map.clone(), now);
-    Ok(Json(serde_json::json!({"ok": true, "ip": ip_s, "vlans": map})))
+    st.metrics.bump_config_gen();
+    Ok(Json(
+        serde_json::json!({"ok": true, "ip": ip_s, "vlans": map}),
+    ))
 }
 
 /// POST /api/v1/exporters/{ip}/interfaces — {"interfaces": {"1": "xe-0/0/0"}}
@@ -175,9 +173,7 @@ pub(super) async fn exporter_interfaces(
     let mut map = std::collections::BTreeMap::new();
     if let Some(obj) = body.get("interfaces").and_then(|v| v.as_object()) {
         for (k, v) in obj.iter().take(1024) {
-            let idx: u32 = k
-                .parse()
-                .map_err(|_| err(format!("bad ifindex: {}", k)))?;
+            let idx: u32 = k.parse().map_err(|_| err(format!("bad ifindex: {}", k)))?;
             if let Some(name) = v.as_str() {
                 let name = name.trim();
                 if !name.is_empty() && name.len() <= 64 {
@@ -188,6 +184,7 @@ pub(super) async fn exporter_interfaces(
     }
     let now = crate::metrics::now_ms();
     st.exporter_policy.set_interfaces(ip, map.clone(), now);
+    st.metrics.bump_config_gen();
     Ok(Json(
         serde_json::json!({"ok": true, "ip": ip_s, "interfaces": map}),
     ))
@@ -238,15 +235,14 @@ pub(super) async fn exporter_snmp(
         None => cur_port,
     };
     let disabled = match body.get("disabled") {
-        Some(v) => v
-            .as_bool()
-            .ok_or_else(|| err("disabled must be a bool"))?,
+        Some(v) => v.as_bool().ok_or_else(|| err("disabled must be a bool"))?,
         None => cur_dis,
     };
     let comm_set = community.as_ref().is_some_and(|c| !c.is_empty());
     let now = crate::metrics::now_ms();
     st.exporter_policy
         .set_snmp(ip, community, port, disabled, now);
+    st.metrics.bump_config_gen();
     Ok(Json(serde_json::json!({
         "ok": true,
         "ip": ip_s,
@@ -268,15 +264,23 @@ pub(super) async fn exporter_action(
         .map_err(|_| err(format!("bad exporter ip: {}", ip_s)))?;
     let now = crate::metrics::now_ms();
     let st_out = match action.as_str() {
-        "approve" => st.exporter_policy.set_state(ip, ExporterState::Approved, now, None),
-        "suspend" => st.exporter_policy.set_state(ip, ExporterState::Suspended, now, None),
-        "reject" => st.exporter_policy.set_state(ip, ExporterState::Rejected, now, None),
+        "approve" => st
+            .exporter_policy
+            .set_state(ip, ExporterState::Approved, now, None),
+        "suspend" => st
+            .exporter_policy
+            .set_state(ip, ExporterState::Suspended, now, None),
+        "reject" => st
+            .exporter_policy
+            .set_state(ip, ExporterState::Rejected, now, None),
         "remove" => {
             let removed = st.exporter_policy.remove(ip);
+            st.metrics.bump_config_gen();
             return Ok(Json(serde_json::json!({"ok": removed, "ip": ip_s})));
         }
         _ => return Err(err("action must be approve|suspend|reject|remove")),
     };
+    st.metrics.bump_config_gen();
     tracing::info!("exporter {} -> {}", ip, st_out.as_str());
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -298,7 +302,11 @@ pub(super) fn merge_unanimous<V: Ord + Clone>(
         Default::default();
     for m in per_exporter {
         for (k, n) in m {
-            *votes.entry(k.clone()).or_default().entry(n.clone()).or_default() += 1;
+            *votes
+                .entry(k.clone())
+                .or_default()
+                .entry(n.clone())
+                .or_default() += 1;
         }
     }
     for (k, names) in votes {
@@ -537,45 +545,9 @@ pub(super) async fn alerts_status(State(st): State<Arc<AppState>>) -> Json<serde
     }))
 }
 
-
 /// Effective config for the UI settings view — secrets redacted.
+/// Shares adminapi::redact_secrets so /api/v1/config and
+/// /api/v1/admin/settings can never diverge on what is hidden.
 pub(super) async fn config_view(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let mut v = serde_json::to_value(&*st.config.read().unwrap()).unwrap_or(serde_json::json!({}));
-    if let Some(srv) = v.get_mut("server").and_then(|s| s.as_object_mut()) {
-        if srv.contains_key("auth") {
-            srv.insert("auth".into(), serde_json::json!("***"));
-        }
-        if srv.contains_key("session_secret") {
-            srv.insert("session_secret".into(), serde_json::json!("***"));
-        }
-    }
-    // [[users]] password hashes must never leave the process.
-    if let Some(users) = v.get_mut("users").and_then(|u| u.as_array_mut()) {
-        for u in users.iter_mut() {
-            if let Some(o) = u.as_object_mut() {
-                if o.contains_key("password_hash") {
-                    o.insert("password_hash".into(), serde_json::json!("***"));
-                }
-            }
-        }
-    }
-    // Alert webhook URLs can embed tokens.
-    if let Some(url) = v
-        .get_mut("alerts")
-        .and_then(|a| a.get_mut("webhook_url"))
-    {
-        if !url.is_null() {
-            *url = serde_json::json!("***");
-        }
-    }
-    if let Some(arr) = v.get_mut("enrichers").and_then(|e| e.as_array_mut()) {
-        for e in arr.iter_mut() {
-            if let Some(o) = e.as_object_mut() {
-                if let Some(h) = o.get_mut("headers") {
-                    *h = serde_json::json!("***");
-                }
-            }
-        }
-    }
-    Json(v)
+    Json(adminapi::effective_settings(&st))
 }

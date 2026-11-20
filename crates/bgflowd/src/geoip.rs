@@ -72,12 +72,31 @@ async fn fetch_gunzip(client: &reqwest::Client, t: &Target, dir: &Path) -> Resul
         .send()
         .await
         .with_context(|| format!("download {}", t.url))?;
-    let resp = resp.error_for_status()?;
-    let gz = resp.bytes().await?;
-    let mut dec = flate2::read::GzDecoder::new(&gz[..]);
-    let mut mmdb = Vec::with_capacity(gz.len() * 2);
-    dec.read_to_end(&mut mmdb)
+    let mut resp = resp.error_for_status()?;
+    // Bound both the compressed download and the gunzipped output — a
+    // corrupted or malicious mirror must not exhaust memory. Real MMDBs
+    // are tens of MiB; 512MiB is generous headroom.
+    const MAX_DOWNLOAD: u64 = 512 << 20;
+    const MAX_MMDB: u64 = 512 << 20;
+    let mut gz = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if gz.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD {
+            bail!(
+                "geoip download from {} exceeds {} MiB cap",
+                t.url,
+                MAX_DOWNLOAD >> 20
+            );
+        }
+        gz.extend_from_slice(&chunk);
+    }
+    let dec = flate2::read::GzDecoder::new(&gz[..]);
+    let mut mmdb = Vec::new();
+    dec.take(MAX_MMDB + 1)
+        .read_to_end(&mut mmdb)
         .context("gunzip mmdb payload")?;
+    if mmdb.len() as u64 > MAX_MMDB {
+        bail!("decompressed mmdb exceeds {} MiB cap", MAX_MMDB >> 20);
+    }
     let out = dir.join(&t.name);
     let tmp = out.with_extension("mmdb.tmp");
     std::fs::write(&tmp, &mmdb)?;
@@ -108,7 +127,11 @@ pub async fn download(source: &str, dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// `bgflowd geoip-update [--source dbip|github] [--dir PATH]`
 pub async fn run(source: &str, dir: &Path) -> Result<()> {
-    println!("geoip-update: downloading {} file(s) → {}", plan(source)?.len(), dir.display());
+    println!(
+        "geoip-update: downloading {} file(s) → {}",
+        plan(source)?.len(),
+        dir.display()
+    );
     let outs = download(source, dir).await?;
     for p in &outs {
         println!("  {}", p.display());
@@ -135,8 +158,10 @@ pub async fn run(source: &str, dir: &Path) -> Result<()> {
         ),
         _ => {}
     }
-    println!("The daemon picks up changed files automatically (~60s); \
-              kill -HUP <bgflowd pid> applies instantly.");
+    println!(
+        "The daemon picks up changed files automatically (~60s); \
+              kill -HUP <bgflowd pid> applies instantly."
+    );
     Ok(())
 }
 
@@ -243,12 +268,10 @@ fn resolve_update_dir(g: &crate::config::GeoIpConfig) -> Option<PathBuf> {
     if !explicit.is_empty() {
         return Some(PathBuf::from(explicit));
     }
-    g.all_db_paths()
-        .into_iter()
-        .find_map(|p| {
-            p.parent()
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.to_path_buf())
-                .or_else(|| Some(PathBuf::from(".")))
-        })
+    g.all_db_paths().into_iter().find_map(|p| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(|d| d.to_path_buf())
+            .or_else(|| Some(PathBuf::from(".")))
+    })
 }

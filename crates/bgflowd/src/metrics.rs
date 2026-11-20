@@ -65,6 +65,10 @@ pub struct Metrics {
     /// "udp/0.0.0.0:2055"): starting → up, or "failed: <err>" /
     /// "skipped". Written by ingest tasks, read by /status + /metrics.
     pub input_state: Mutex<BTreeMap<String, String>>,
+    /// Bumped on every successful config reload or naming/policy
+    /// mutation — query caches fold it into their keys so stale
+    /// pre-change responses are never served afterwards.
+    pub config_gen: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -75,10 +79,17 @@ pub struct HttpStat {
 }
 
 impl Metrics {
+    /// Invalidate query/overview caches: anything that changes what a
+    /// cached response would contain (config reload, renames, policy).
+    pub fn bump_config_gen(&self) {
+        self.config_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn note_datagram(&self, src: IpAddr, payload_len: usize, records: usize) {
         self.datagrams.fetch_add(1, Ordering::Relaxed);
         self.records.fetch_add(records as u64, Ordering::Relaxed);
-        self.bytes_in.fetch_add(payload_len as u64, Ordering::Relaxed);
+        self.bytes_in
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
         let mut map = self.exporters.lock().unwrap();
         // Bound per-exporter cardinality: spoofed UDP sources must not grow
         // this map (and the /metrics label set) without limit.
@@ -114,37 +125,85 @@ impl Metrics {
         s.push_str("# HELP bgflow_bytes_in_total Payload bytes received\n# TYPE bgflow_bytes_in_total counter\n");
         s.push_str(&format!("bgflow_bytes_in_total {}\n", g(&self.bytes_in)));
         s.push_str("# HELP bgflow_parse_errors_total Undecodable datagrams\n# TYPE bgflow_parse_errors_total counter\n");
-        s.push_str(&format!("bgflow_parse_errors_total {}\n", g(&self.parse_errors)));
+        s.push_str(&format!(
+            "bgflow_parse_errors_total {}\n",
+            g(&self.parse_errors)
+        ));
         s.push_str("# HELP bgflow_channel_dropped_total Records dropped (channel full)\n# TYPE bgflow_channel_dropped_total counter\n");
-        s.push_str(&format!("bgflow_channel_dropped_total {}\n", g(&self.channel_dropped)));
+        s.push_str(&format!(
+            "bgflow_channel_dropped_total {}\n",
+            g(&self.channel_dropped)
+        ));
         s.push_str("# HELP bgflow_write_errors_total Storage write/flush errors (writer keeps running)\n# TYPE bgflow_write_errors_total counter\n");
-        s.push_str(&format!("bgflow_write_errors_total {}\n", g(&self.write_errors)));
+        s.push_str(&format!(
+            "bgflow_write_errors_total {}\n",
+            g(&self.write_errors)
+        ));
         s.push_str("# HELP bgflow_unknown_proto_total Datagrams with unknown protocol\n# TYPE bgflow_unknown_proto_total counter\n");
-        s.push_str(&format!("bgflow_unknown_proto_total {}\n", g(&self.unknown_proto)));
+        s.push_str(&format!(
+            "bgflow_unknown_proto_total {}\n",
+            g(&self.unknown_proto)
+        ));
         s.push_str("# HELP bgflow_exporter_drops_total Datagrams dropped by exporter policy\n# TYPE bgflow_exporter_drops_total counter\n");
-        s.push_str(&format!("bgflow_exporter_drops_total {}\n", g(&self.exporter_drops)));
+        s.push_str(&format!(
+            "bgflow_exporter_drops_total {}\n",
+            g(&self.exporter_drops)
+        ));
         s.push_str("# HELP bgflow_enrich_http_lookups_total HTTP enrichment lookups\n# TYPE bgflow_enrich_http_lookups_total counter\n");
-        s.push_str(&format!("bgflow_enrich_http_lookups_total {}\n", g(&self.http_lookups)));
+        s.push_str(&format!(
+            "bgflow_enrich_http_lookups_total {}\n",
+            g(&self.http_lookups)
+        ));
         s.push_str("# HELP bgflow_enrich_http_errors_total HTTP enrichment errors\n# TYPE bgflow_enrich_http_errors_total counter\n");
-        s.push_str(&format!("bgflow_enrich_http_errors_total {}\n", g(&self.http_errors)));
+        s.push_str(&format!(
+            "bgflow_enrich_http_errors_total {}\n",
+            g(&self.http_errors)
+        ));
         s.push_str("# HELP bgflow_enrich_table_hits_total Table-enricher cache hits\n# TYPE bgflow_enrich_table_hits_total counter\n");
-        s.push_str(&format!("bgflow_enrich_table_hits_total {}\n", g(&self.table_hits)));
+        s.push_str(&format!(
+            "bgflow_enrich_table_hits_total {}\n",
+            g(&self.table_hits)
+        ));
         s.push_str("# HELP bgflow_alerts_fired_total Alert rule fires\n# TYPE bgflow_alerts_fired_total counter\n");
-        s.push_str(&format!("bgflow_alerts_fired_total {}\n", g(&self.alerts_fired)));
+        s.push_str(&format!(
+            "bgflow_alerts_fired_total {}\n",
+            g(&self.alerts_fired)
+        ));
         s.push_str("# HELP bgflow_qcache_hit_total Query-cache fresh hits\n# TYPE bgflow_qcache_hit_total counter\n");
-        s.push_str(&format!("bgflow_qcache_hit_total {}\n", g(&self.qcache_hit)));
+        s.push_str(&format!(
+            "bgflow_qcache_hit_total {}\n",
+            g(&self.qcache_hit)
+        ));
         s.push_str("# HELP bgflow_qcache_stale_total Query-cache stale serves (refresh spawned)\n# TYPE bgflow_qcache_stale_total counter\n");
-        s.push_str(&format!("bgflow_qcache_stale_total {}\n", g(&self.qcache_stale)));
+        s.push_str(&format!(
+            "bgflow_qcache_stale_total {}\n",
+            g(&self.qcache_stale)
+        ));
         s.push_str("# HELP bgflow_qcache_miss_total Query-cache misses\n# TYPE bgflow_qcache_miss_total counter\n");
-        s.push_str(&format!("bgflow_qcache_miss_total {}\n", g(&self.qcache_miss)));
+        s.push_str(&format!(
+            "bgflow_qcache_miss_total {}\n",
+            g(&self.qcache_miss)
+        ));
         s.push_str("# HELP bgflow_export_flows_total Flow records exported\n# TYPE bgflow_export_flows_total counter\n");
-        s.push_str(&format!("bgflow_export_flows_total {}\n", g(&self.export_flows)));
+        s.push_str(&format!(
+            "bgflow_export_flows_total {}\n",
+            g(&self.export_flows)
+        ));
         s.push_str("# HELP bgflow_export_datagrams_total Export datagrams sent\n# TYPE bgflow_export_datagrams_total counter\n");
-        s.push_str(&format!("bgflow_export_datagrams_total {}\n", g(&self.export_datagrams)));
+        s.push_str(&format!(
+            "bgflow_export_datagrams_total {}\n",
+            g(&self.export_datagrams)
+        ));
         s.push_str("# HELP bgflow_export_errors_total Export send errors\n# TYPE bgflow_export_errors_total counter\n");
-        s.push_str(&format!("bgflow_export_errors_total {}\n", g(&self.export_errors)));
+        s.push_str(&format!(
+            "bgflow_export_errors_total {}\n",
+            g(&self.export_errors)
+        ));
         s.push_str("# HELP bgflow_export_dropped_total Flow batches dropped (export queue full)\n# TYPE bgflow_export_dropped_total counter\n");
-        s.push_str(&format!("bgflow_export_dropped_total {}\n", g(&self.export_dropped)));
+        s.push_str(&format!(
+            "bgflow_export_dropped_total {}\n",
+            g(&self.export_dropped)
+        ));
         {
             let http = self.http.lock().unwrap();
             s.push_str("# HELP bgflow_http_requests_total HTTP requests by path\n# TYPE bgflow_http_requests_total counter\n");
@@ -170,13 +229,25 @@ impl Metrics {
             }
         }
         s.push_str("# HELP bgflow_stored_bytes_total Bytes flushed to segments\n# TYPE bgflow_stored_bytes_total counter\n");
-        s.push_str(&format!("bgflow_stored_bytes_total {}\n", g(&self.bytes_stored)));
+        s.push_str(&format!(
+            "bgflow_stored_bytes_total {}\n",
+            g(&self.bytes_stored)
+        ));
         s.push_str("# HELP bgflow_stored_rows_total Rows flushed to segments\n# TYPE bgflow_stored_rows_total counter\n");
-        s.push_str(&format!("bgflow_stored_rows_total {}\n", g(&self.rows_stored)));
+        s.push_str(&format!(
+            "bgflow_stored_rows_total {}\n",
+            g(&self.rows_stored)
+        ));
         s.push_str("# HELP bgflow_retention_freed_bytes_total Bytes freed by retention\n# TYPE bgflow_retention_freed_bytes_total counter\n");
-        s.push_str(&format!("bgflow_retention_freed_bytes_total {}\n", g(&self.bytes_freed)));
+        s.push_str(&format!(
+            "bgflow_retention_freed_bytes_total {}\n",
+            g(&self.bytes_freed)
+        ));
         s.push_str("# HELP bgflow_disk_free_bytes Free bytes on the data filesystem\n# TYPE bgflow_disk_free_bytes gauge\n");
-        s.push_str(&format!("bgflow_disk_free_bytes {}\n", g(&self.disk_free_bytes)));
+        s.push_str(&format!(
+            "bgflow_disk_free_bytes {}\n",
+            g(&self.disk_free_bytes)
+        ));
         {
             let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
             let inputs = self.input_state.lock().unwrap();
@@ -228,7 +299,11 @@ mod tests {
         m.qcache_miss.store(7, Ordering::Relaxed);
         m.http.lock().unwrap().insert(
             "/api/v1/top".to_string(),
-            HttpStat { count: 2, total_ms: 50, err5xx: 1 },
+            HttpStat {
+                count: 2,
+                total_ms: 50,
+                err5xx: 1,
+            },
         );
         let s = m.render();
         assert!(s.contains("bgflow_qcache_hit_total 3"));

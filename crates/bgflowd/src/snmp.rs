@@ -57,12 +57,29 @@ const SYS_UPTIME: &[u64] = &[1, 3, 6, 1, 2, 1, 1, 3, 0];
 
 /// Poll loop: every `interval_secs`, SNMP-poll approved+pending
 /// exporters in one blocking task (sync socket API) and refresh the
-/// shared store the API/UI reads.
-pub async fn run(store: SnmpStore, policy: Arc<ExporterPolicy>, cfg: SnmpConfig) {
-    let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs.max(60)));
-    tick.tick().await; // skip the immediate first tick — give exporters a moment
+/// shared store the API/UI reads. Always spawned — the live config is
+/// re-read each cycle so `[snmp]` edits via settings/SIGHUP apply
+/// without a restart; disabled just idles the loop.
+pub async fn run(
+    store: SnmpStore,
+    policy: Arc<ExporterPolicy>,
+    live_config: Arc<RwLock<crate::config::Config>>,
+) {
+    let mut warned_empty = false;
     loop {
-        tick.tick().await;
+        let cfg = live_config.read().unwrap().snmp.clone();
+        tokio::time::sleep(Duration::from_secs(cfg.interval_secs.max(60))).await;
+        if !cfg.enabled {
+            continue;
+        }
+        if cfg.community.is_empty() {
+            if !warned_empty {
+                tracing::warn!("[snmp] enabled but community is empty — SNMP disabled");
+                warned_empty = true;
+            }
+            continue;
+        }
+        warned_empty = false;
         // Resolve credentials per exporter: entry overrides win over the
         // global [snmp] community/port; snmp_disabled opts out entirely.
         let targets: Vec<(IpAddr, String, u16)> = policy
